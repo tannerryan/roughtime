@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Package main implements a Roughtime server that listens for UDP requests and
+// Command roughtime is a UDP Roughtime server that listens for requests and
 // responds with signed timestamps. The server automatically refreshes its
 // online signing certificate before expiry. See the protocol package for
 // supported versions.
@@ -9,17 +9,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
@@ -86,8 +88,13 @@ var bufPool = sync.Pool{
 	},
 }
 
+// main provisions the initial certificate and starts the UDP server.
 func main() {
 	flag.Parse()
+	if *rootKeySeedHexFile == "" {
+		fmt.Fprintf(os.Stderr, "usage: roughtime -root-key <path> [-port <port>]\n")
+		os.Exit(1)
+	}
 
 	cert, expiry, err := provisionCertificateKey()
 	if err != nil {
@@ -99,7 +106,10 @@ func main() {
 	state.Store(&certState{cert: cert, expiry: expiry})
 	go refreshLoop(state)
 
-	if err := listen(state); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := listen(ctx, state); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}
@@ -112,17 +122,17 @@ func main() {
 func provisionCertificateKey() (*protocol.Certificate, time.Time, error) {
 	rootKeySeedHex, err := os.ReadFile(*rootKeySeedHexFile)
 	if err != nil {
-		return nil, time.Time{}, errors.New("failed to open root signing key file: " + err.Error())
+		return nil, time.Time{}, fmt.Errorf("opening root signing key file: %w", err)
 	}
 	rootKeySeed, err := hex.DecodeString(string(bytes.TrimSpace(rootKeySeedHex)))
 	if err != nil {
-		return nil, time.Time{}, errors.New("failed to decode root signing key seed: " + err.Error())
+		return nil, time.Time{}, fmt.Errorf("decoding root signing key seed: %w", err)
 	}
 	rootSK := ed25519.NewKeyFromSeed(rootKeySeed)
 
 	_, onlineSK, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, time.Time{}, errors.New("failed to generate online signing key: " + err.Error())
+		return nil, time.Time{}, fmt.Errorf("generating online signing key: %w", err)
 	}
 
 	now := time.Now()
@@ -131,7 +141,7 @@ func provisionCertificateKey() (*protocol.Certificate, time.Time, error) {
 
 	cert, err := protocol.NewCertificate(startTime, endTime, onlineSK, rootSK)
 	if err != nil {
-		return nil, time.Time{}, errors.New("failed to generate online certificate: " + err.Error())
+		return nil, time.Time{}, fmt.Errorf("generating online certificate: %w", err)
 	}
 	return cert, endTime, nil
 }
@@ -166,24 +176,36 @@ func refreshLoop(state *atomic.Pointer[certState]) {
 
 // listen starts the UDP server, spawns a fixed worker pool sized to the number
 // of CPUs, and dispatches incoming requests. If workers cannot keep up, excess
-// requests are dropped to maintain throughput.
-func listen(state *atomic.Pointer[certState]) error {
+// requests are dropped to maintain throughput. It shuts down gracefully when
+// ctx is cancelled, draining in-flight requests before returning.
+func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
 	if err != nil {
-		return errors.New("failed to start UDP server: " + err.Error())
+		return fmt.Errorf("starting UDP server: %w", err)
 	}
 	_ = conn.SetReadBuffer(socketRecvBuffer)
 
 	work := make(chan request, workerQueueSize)
+	var wg sync.WaitGroup
 	for range runtime.NumCPU() {
-		go worker(conn, state, work)
+		wg.Go(func() { worker(conn, state, work) })
 	}
+
+	fmt.Printf("listening on :%d\n", *port)
+
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
 
 	for {
 		bufPtr := bufPool.Get().(*[]byte)
 		reqLen, peer, err := conn.ReadFromUDP(*bufPtr)
 		if err != nil {
 			bufPool.Put(bufPtr)
+			if ctx.Err() != nil {
+				break
+			}
 			continue
 		}
 		select {
@@ -192,6 +214,10 @@ func listen(state *atomic.Pointer[certState]) error {
 			bufPool.Put(bufPtr)
 		}
 	}
+
+	close(work)
+	wg.Wait()
+	return nil
 }
 
 // worker drains the work channel and processes each request for the lifetime of
