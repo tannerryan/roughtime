@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,19 +58,12 @@ func main() {
 	}
 }
 
-// probeVersions lists one representative from each wire-format group, ordered
-// newest first so the first successful probe is the highest supported version.
-var probeVersions = []protocol.Version{
-	protocol.VersionDraft12, // Draft 12 group (drafts 12–19)
-	protocol.VersionDraft10, // Draft 10 group (drafts 10–11)
-	protocol.VersionDraft08, // Draft 08 group (drafts 08–09)
-	protocol.VersionDraft07, // Draft 07 group
-	protocol.VersionDraft05, // Draft 05 group (drafts 05–06)
-	protocol.VersionDraft03, // Draft 03 group (drafts 03–04)
-	protocol.VersionDraft02, // Draft 02 group
-	protocol.VersionDraft01, // Draft 01 group
-	protocol.VersionGoogle,  // Google-Roughtime
-}
+// probeVersions lists every distinct VER value, newest first.
+var probeVersions = func() []protocol.Version {
+	out := slices.Clone(protocol.SupportedVersions())
+	slices.Reverse(out)
+	return append(out, protocol.VersionGoogle)
+}()
 
 // run probes all versions and prints diagnostics for the best one.
 func run() error {
