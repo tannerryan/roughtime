@@ -7,15 +7,15 @@
 //
 // Single server:
 //
-//	go run ./client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+//	go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 //
 // Multiple servers:
 //
-//	go run ./client -servers ecosystem.json
+//	go run client/main.go -servers ecosystem.json
 //
 // Single server from a JSON list:
 //
-//	go run ./client -servers ecosystem.json -name time.txryan.com
+//	go run client/main.go -servers ecosystem.json -name time.txryan.com
 package main
 
 import (
@@ -59,6 +59,7 @@ type serverList struct {
 // result holds the outcome of querying a single server.
 type result struct {
 	Name     string
+	Address  string
 	Midpoint time.Time
 	Radius   time.Duration
 	RTT      time.Duration
@@ -66,11 +67,22 @@ type result struct {
 	Err      error
 }
 
+// inSync reports whether the local clock falls within the server's uncertainty
+// window. The bound is radius + RTT/2 because the server's observation could
+// have happened anywhere during the round trip.
+func (r result) inSync(localNow time.Time) bool {
+	drift := r.Midpoint.Sub(localNow)
+	if drift < 0 {
+		drift = -drift
+	}
+	return drift <= r.Radius+r.RTT/2
+}
+
 // main parses flags and runs the client.
 func main() {
 	flag.Parse()
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		fmt.Fprintf(os.Stderr, "client: %s\n", err)
 		os.Exit(1)
 	}
 }
@@ -87,14 +99,7 @@ func run() error {
 		if r.Err != nil {
 			return fmt.Errorf("%s: %w", r.Name, r.Err)
 		}
-		localNow := time.Now()
-		fmt.Printf("Server:    %s\n", r.Name)
-		fmt.Printf("Version:   %s\n", r.Version)
-		fmt.Printf("Midpoint:  %s\n", r.Midpoint.UTC().Format(time.RFC3339))
-		fmt.Printf("Radius:    %s\n", r.Radius)
-		fmt.Printf("RTT:       %s\n", r.RTT.Round(time.Millisecond))
-		fmt.Printf("Local:     %s\n", localNow.UTC().Format(time.RFC3339Nano))
-		fmt.Printf("Drift:     %s\n", r.Midpoint.Sub(localNow).Round(time.Millisecond))
+		printSingleResult(r)
 		return nil
 	}
 
@@ -106,32 +111,100 @@ func run() error {
 		}(srv)
 	}
 
+	const rowFmt = "%-30s  %-30s  %-14s  %-20s  %-8s  %-10s  %-12s  %s\n"
+	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
+
+	var drifts []time.Duration
 	var succeeded, failed int
 	for range servers {
 		r := <-ch
 		if r.Err != nil {
-			fmt.Printf("%-30s  error: %s\n", r.Name, r.Err)
+			fmt.Printf("%-30s  %-30s  error: %s\n", r.Name, r.Address, r.Err)
 			failed++
 			continue
 		}
 		localNow := time.Now()
 		drift := r.Midpoint.Sub(localNow)
-		fmt.Printf("%-30s  %-14s  %s  ±%-6s  rtt=%-8s  drift=%s\n",
+		drifts = append(drifts, drift)
+		status := "out-of-sync"
+		if r.inSync(localNow) {
+			status = "in-sync"
+		}
+		fmt.Printf(rowFmt,
 			r.Name,
+			r.Address,
 			r.Version.ShortString(),
 			r.Midpoint.UTC().Format(time.RFC3339),
-			r.Radius,
-			r.RTT.Round(time.Millisecond),
-			drift.Round(time.Millisecond),
+			"±"+r.Radius.String(),
+			r.RTT.Round(time.Millisecond).String(),
+			drift.Round(time.Millisecond).String(),
+			status,
 		)
 		succeeded++
 	}
 
 	fmt.Printf("\n%d/%d servers responded\n", succeeded, succeeded+failed)
+	printConsensus(drifts)
 	if succeeded == 0 {
 		return fmt.Errorf("no servers responded")
 	}
 	return nil
+}
+
+// printSingleResult prints a verbose vertical summary of a single verified
+// server response.
+func printSingleResult(r result) {
+	localNow := time.Now()
+	windowStart := r.Midpoint.Add(-r.Radius).UTC().Format(time.RFC3339)
+	windowEnd := r.Midpoint.Add(r.Radius).UTC().Format(time.RFC3339)
+	status := "out-of-sync"
+	if r.inSync(localNow) {
+		status = "in-sync"
+	}
+	// In -addr mode Name and Address are identical; skip the redundant line.
+	if r.Name != r.Address {
+		fmt.Printf("Server:    %s\n", r.Name)
+	}
+	fmt.Printf("Address:   %s\n", r.Address)
+	fmt.Printf("Version:   %s\n", r.Version)
+	fmt.Printf("Midpoint:  %s\n", r.Midpoint.UTC().Format(time.RFC3339))
+	fmt.Printf("Radius:    %s\n", r.Radius)
+	fmt.Printf("Window:    [%s, %s]\n", windowStart, windowEnd)
+	fmt.Printf("RTT:       %s\n", r.RTT.Round(time.Millisecond))
+	fmt.Printf("Local:     %s\n", localNow.UTC().Format(time.RFC3339Nano))
+	fmt.Printf("Drift:     %s\n", r.Midpoint.Sub(localNow).Round(time.Millisecond))
+	fmt.Printf("Status:    %s\n", status)
+}
+
+// printConsensus prints the median drift, derived consensus midpoint, and drift
+// spread across a set of per-server samples. No-op when empty.
+func printConsensus(drifts []time.Duration) {
+	if len(drifts) == 0 {
+		return
+	}
+	median := medianDuration(drifts)
+	lo, hi := slices.Min(drifts), slices.Max(drifts)
+	consensus := time.Now().Add(median).UTC().Format(time.RFC3339)
+	fmt.Printf("Consensus drift:    %s (median of %d samples)\n",
+		median.Round(time.Millisecond), len(drifts))
+	fmt.Printf("Consensus midpoint: %s\n", consensus)
+	fmt.Printf("Drift spread:       %s (min=%s, max=%s)\n",
+		(hi - lo).Round(time.Millisecond),
+		lo.Round(time.Millisecond),
+		hi.Round(time.Millisecond),
+	)
+}
+
+// medianDuration returns the median of a slice of durations without mutating
+// the input. For an even count it averages the two middle values.
+func medianDuration(d []time.Duration) time.Duration {
+	s := slices.Clone(d)
+	slices.Sort(s)
+	n := len(s)
+	if n%2 == 1 {
+		return s[n/2]
+	}
+	return (s[n/2-1] + s[n/2]) / 2
 }
 
 // loadServers returns the server list from flags.
@@ -202,7 +275,7 @@ func queryServer(srv serverConfig) result {
 		r.Err = fmt.Errorf("no addresses")
 		return r
 	}
-	address := srv.Addresses[0].Address
+	r.Address = srv.Addresses[0].Address
 
 	rootPK, err := base64.StdEncoding.DecodeString(srv.PublicKey)
 	if err != nil {
@@ -211,15 +284,15 @@ func queryServer(srv serverConfig) result {
 	}
 
 	if srv.Version == "Google-Roughtime" {
-		return queryOnce(srv.Name, address, rootPK, []protocol.Version{protocol.VersionGoogle}, *timeout)
+		return queryOnce(srv.Name, r.Address, rootPK, []protocol.Version{protocol.VersionGoogle}, *timeout)
 	}
 
-	return queryOnce(srv.Name, address, rootPK, ietfVersions, *timeout)
+	return queryOnce(srv.Name, r.Address, rootPK, ietfVersions, *timeout)
 }
 
 // queryOnce sends a single Roughtime request and verifies the response.
 func queryOnce(name, address string, rootPK []byte, versions []protocol.Version, timeout time.Duration) result {
-	r := result{Name: name}
+	r := result{Name: name, Address: address}
 
 	nonce, request, err := protocol.CreateRequest(versions, rand.Reader)
 	if err != nil {

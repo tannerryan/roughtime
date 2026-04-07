@@ -7,8 +7,8 @@
 //
 // Usage:
 //
-//	go run ./debug -addr time.txryan.com:2002 \
-//	              -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+//	go run debug/main.go -addr time.txryan.com:2002 \
+//	                     -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 package main
 
 import (
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
@@ -33,14 +34,14 @@ var (
 
 // probeResult holds the outcome of a single version probe.
 type probeResult struct {
-	Version  protocol.Version
-	Midpoint time.Time
-	Radius   time.Duration
-	RTT      time.Duration
-	Request  []byte
-	Reply    []byte
-	Nonce    []byte
-	Err      error
+	version  protocol.Version
+	midpoint time.Time
+	radius   time.Duration
+	rtt      time.Duration
+	request  []byte
+	reply    []byte
+	nonce    []byte
+	err      error
 }
 
 // main parses flags and runs the debug probe.
@@ -51,22 +52,23 @@ func main() {
 		os.Exit(1)
 	}
 	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %s\n", err)
+		fmt.Fprintf(os.Stderr, "debug: %s: %s\n", *addr, err)
 		os.Exit(1)
 	}
 }
 
-// probeVersions lists every distinct wire-group representative to probe.
+// probeVersions lists one representative from each wire-format group, ordered
+// newest first so the first successful probe is the highest supported version.
 var probeVersions = []protocol.Version{
-	protocol.VersionDraft12,
-	protocol.VersionDraft11,
-	protocol.VersionDraft10,
-	protocol.VersionDraft08,
-	protocol.VersionDraft07,
-	protocol.VersionDraft06,
-	protocol.VersionDraft05,
-	protocol.VersionDraft01,
-	protocol.VersionGoogle,
+	protocol.VersionDraft12, // Draft 12 group (drafts 12–19)
+	protocol.VersionDraft10, // Draft 10 group (drafts 10–11)
+	protocol.VersionDraft08, // Draft 08 group (drafts 08–09)
+	protocol.VersionDraft07, // Draft 07 group
+	protocol.VersionDraft05, // Draft 05 group (drafts 05–06)
+	protocol.VersionDraft03, // Draft 03 group (drafts 03–04)
+	protocol.VersionDraft02, // Draft 02 group
+	protocol.VersionDraft01, // Draft 01 group
+	protocol.VersionGoogle,  // Google-Roughtime
 }
 
 // run probes all versions and prints diagnostics for the best one.
@@ -83,16 +85,18 @@ func run() error {
 	for _, ver := range probeVersions {
 		r := probe(rootPK, ver)
 		status := "OK"
-		if r.Err != nil {
-			status = r.Err.Error()
+		if r.err != nil {
+			status = r.err.Error()
 		}
 		fmt.Printf("  %-40s %s\n", ver.String(), status)
 
-		if r.Err == nil {
-			supported = append(supported, ver)
-			if best == nil {
-				best = &r
-			}
+		if r.err != nil {
+			continue
+		}
+		supported = append(supported, ver)
+		// probeVersions is ordered newest-first, so the first OK is the best.
+		if best == nil {
+			best = &r
 		}
 	}
 
@@ -101,15 +105,12 @@ func run() error {
 		return fmt.Errorf("no supported versions found")
 	}
 
-	fmt.Printf("Supported versions: ")
+	shorts := make([]string, len(supported))
 	for i, v := range supported {
-		if i > 0 {
-			fmt.Printf(", ")
-		}
-		fmt.Printf("%s", v.ShortString())
+		shorts[i] = v.ShortString()
 	}
-	fmt.Println()
-	fmt.Printf("Negotiated:         %s\n", best.Version)
+	fmt.Printf("Supported versions: %s\n", strings.Join(shorts, ", "))
+	fmt.Printf("Negotiated:         %s\n", best.version)
 	fmt.Println()
 
 	printDiagnostic(*best)
@@ -119,26 +120,26 @@ func run() error {
 // probe sends a single Roughtime request for a specific version and verifies
 // the response.
 func probe(rootPK []byte, ver protocol.Version) probeResult {
-	r := probeResult{Version: ver}
+	r := probeResult{version: ver}
 	versions := []protocol.Version{ver}
 
 	nonce, request, err := protocol.CreateRequest(versions, rand.Reader)
 	if err != nil {
-		r.Err = fmt.Errorf("request: %w", err)
+		r.err = fmt.Errorf("request: %w", err)
 		return r
 	}
-	r.Nonce = nonce
-	r.Request = request
+	r.nonce = nonce
+	r.request = request
 
 	raddr, err := net.ResolveUDPAddr("udp", *addr)
 	if err != nil {
-		r.Err = fmt.Errorf("resolve: %w", err)
+		r.err = fmt.Errorf("resolve: %w", err)
 		return r
 	}
 
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		r.Err = fmt.Errorf("dial: %w", err)
+		r.err = fmt.Errorf("dial: %w", err)
 		return r
 	}
 	defer conn.Close()
@@ -146,7 +147,7 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 	_ = conn.SetWriteDeadline(time.Now().Add(*timeout))
 	start := time.Now()
 	if _, err := conn.Write(request); err != nil {
-		r.Err = fmt.Errorf("send: %w", err)
+		r.err = fmt.Errorf("send: %w", err)
 		return r
 	}
 
@@ -154,20 +155,20 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
 	if err != nil {
-		r.Err = fmt.Errorf("read: %w", err)
+		r.err = fmt.Errorf("read: %w", err)
 		return r
 	}
-	r.RTT = time.Since(start)
-	r.Reply = buf[:n]
+	r.rtt = time.Since(start)
+	r.reply = buf[:n]
 
-	midpoint, radius, err := protocol.VerifyReply(versions, r.Reply, rootPK, nonce, request)
+	midpoint, radius, err := protocol.VerifyReply(versions, r.reply, rootPK, nonce, request)
 	if err != nil {
-		r.Err = err
+		r.err = fmt.Errorf("verify: %w", err)
 		return r
 	}
 
-	r.Midpoint = midpoint
-	r.Radius = radius
+	r.midpoint = midpoint
+	r.radius = radius
 	return r
 }
 
@@ -197,8 +198,8 @@ func decode(data []byte) map[uint32][]byte {
 // It decodes the request and response once and passes the parsed tags to each
 // output section.
 func printDiagnostic(r probeResult) {
-	reqTags := decode(msgBody(r.Request))
-	respTags := decode(msgBody(r.Reply))
+	reqTags := decode(msgBody(r.request))
+	respTags := decode(msgBody(r.reply))
 
 	printRequest(r, reqTags)
 	printResponse(r, respTags)
@@ -211,8 +212,8 @@ func printDiagnostic(r probeResult) {
 // printRequest prints request size, hex dump, and parsed tags.
 func printRequest(r probeResult, tags map[uint32][]byte) {
 	fmt.Printf("=== Request ===\n")
-	fmt.Printf("Size: %d bytes\n", len(r.Request))
-	hexDump(r.Request)
+	fmt.Printf("Size: %d bytes\n", len(r.request))
+	hexDump(r.request)
 
 	if tags == nil {
 		return
@@ -235,8 +236,8 @@ func printRequest(r probeResult, tags map[uint32][]byte) {
 // printResponse prints response size, hex dump, and parsed tags.
 func printResponse(r probeResult, tags map[uint32][]byte) {
 	fmt.Printf("=== Response ===\n")
-	fmt.Printf("Size: %d bytes\n", len(r.Reply))
-	hexDump(r.Reply)
+	fmt.Printf("Size: %d bytes\n", len(r.reply))
+	hexDump(r.reply)
 
 	if tags == nil {
 		return
@@ -266,15 +267,21 @@ func printResponse(r probeResult, tags map[uint32][]byte) {
 	fmt.Println()
 }
 
-// printVerified prints the verified result summary.
+// printVerified prints the verified result summary, including the amplification
+// check that Roughtime requires of every server response.
 func printVerified(r probeResult) {
 	localNow := time.Now()
 	fmt.Printf("=== Verified Result ===\n")
-	fmt.Printf("Round-trip time: %s\n", r.RTT)
-	fmt.Printf("Midpoint:        %s\n", r.Midpoint.UTC().Format(time.RFC3339))
-	fmt.Printf("Radius:          %s\n", r.Radius)
-	fmt.Printf("Local time:      %s\n", localNow.UTC().Format("2006-01-02T15:04:05.000000Z"))
-	fmt.Printf("Clock drift:     %s\n", r.Midpoint.Sub(localNow).Round(time.Millisecond))
+	fmt.Printf("Round-trip time: %s\n", r.rtt)
+	fmt.Printf("Midpoint:        %s\n", r.midpoint.UTC().Format(time.RFC3339))
+	fmt.Printf("Radius:          %s\n", r.radius)
+	fmt.Printf("Local time:      %s\n", localNow.UTC().Format(time.RFC3339Nano))
+	fmt.Printf("Clock drift:     %s\n", r.midpoint.Sub(localNow).Round(time.Millisecond))
+	if len(r.reply) <= len(r.request) {
+		fmt.Printf("Amplification:   ok (reply %d ≤ request %d)\n", len(r.reply), len(r.request))
+	} else {
+		fmt.Printf("Amplification:   VIOLATED (reply %d > request %d)\n", len(r.reply), len(r.request))
+	}
 	fmt.Println()
 }
 
@@ -288,7 +295,7 @@ func printResponseDetail(r probeResult, tags map[uint32][]byte) {
 	if vb, ok := tags[protocol.TagVER]; ok && len(vb) >= 4 {
 		v := binary.LittleEndian.Uint32(vb)
 		fmt.Printf("Version:         0x%08x (%s)\n", v, protocol.Version(v))
-	} else if r.Version == protocol.VersionGoogle {
+	} else if r.version == protocol.VersionGoogle {
 		fmt.Printf("Version:         (none) (%s)\n", protocol.VersionGoogle)
 	}
 	if sig, ok := tags[protocol.TagSIG]; ok {
@@ -302,7 +309,7 @@ func printResponseDetail(r probeResult, tags map[uint32][]byte) {
 	}
 	if path, ok := tags[protocol.TagPATH]; ok {
 		hs := 32
-		if len(r.Nonce) == 64 {
+		if len(r.nonce) == 64 {
 			hs = 64
 		}
 		fmt.Printf("Merkle path:     %d node(s)\n", len(path)/hs)
@@ -330,7 +337,7 @@ func printSREP(r probeResult, tags map[uint32][]byte) {
 	}
 	if midp, ok := srep[protocol.TagMIDP]; ok && len(midp) == 8 {
 		raw := binary.LittleEndian.Uint64(midp)
-		ts, _ := protocol.DecodeTimestamp(r.Version, midp)
+		ts, _ := protocol.DecodeTimestamp(r.version, midp)
 		fmt.Printf("Midpoint (raw):  %d (%s)\n", raw, ts.UTC().Format(time.RFC3339))
 	}
 	if radi, ok := srep[protocol.TagRADI]; ok && len(radi) == 4 {
@@ -354,7 +361,8 @@ func printSREP(r probeResult, tags map[uint32][]byte) {
 	fmt.Println()
 }
 
-// printCert parses and prints the delegation certificate.
+// printCert parses and prints the delegation certificate, then checks whether
+// the response midpoint falls within the certificate's validity window.
 func printCert(r probeResult, tags map[uint32][]byte) {
 	if tags == nil {
 		return
@@ -385,17 +393,30 @@ func printCert(r probeResult, tags map[uint32][]byte) {
 	if pk, ok := dele[protocol.TagPUBK]; ok {
 		fmt.Printf("Online key:      %s\n", hex.EncodeToString(pk))
 	}
+
+	var mintTime, maxtTime time.Time
+	var haveMint, haveMaxt bool
 	if mint, ok := dele[protocol.TagMINT]; ok && len(mint) == 8 {
-		ts, _ := protocol.DecodeTimestamp(r.Version, mint)
-		fmt.Printf("Not before:      %s\n", ts.UTC().Format(time.RFC3339))
+		mintTime, _ = protocol.DecodeTimestamp(r.version, mint)
+		haveMint = true
+		fmt.Printf("Not before:      %s\n", mintTime.UTC().Format(time.RFC3339))
 	}
 	if maxt, ok := dele[protocol.TagMAXT]; ok && len(maxt) == 8 {
-		ts, _ := protocol.DecodeTimestamp(r.Version, maxt)
-		fmt.Printf("Not after:       %s\n", ts.UTC().Format(time.RFC3339))
-		if remaining := time.Until(ts); remaining > 0 {
+		maxtTime, _ = protocol.DecodeTimestamp(r.version, maxt)
+		haveMaxt = true
+		fmt.Printf("Not after:       %s\n", maxtTime.UTC().Format(time.RFC3339))
+		if remaining := time.Until(maxtTime); remaining > 0 {
 			fmt.Printf("Expires in:      %s\n", remaining.Round(time.Second))
 		} else {
 			fmt.Printf("Expired:         %s ago\n", (-remaining).Round(time.Second))
+		}
+	}
+
+	if haveMint && haveMaxt {
+		if !r.midpoint.Before(mintTime) && !r.midpoint.After(maxtTime) {
+			fmt.Printf("Cert validity:   ok (midpoint within window)\n")
+		} else {
+			fmt.Printf("Cert validity:   INVALID (midpoint outside [mint, maxt])\n")
 		}
 	}
 }
@@ -419,10 +440,7 @@ func hexDump(data []byte) {
 		end := min(off+16, len(data))
 		line := data[off:end]
 
-		// Offset
 		fmt.Printf("%08x  ", off)
-
-		// Hex bytes in two groups of 8
 		for i := range 16 {
 			if i < len(line) {
 				fmt.Printf("%02x ", line[i])
@@ -434,7 +452,6 @@ func hexDump(data []byte) {
 			}
 		}
 
-		// ASCII
 		fmt.Printf(" |")
 		for _, b := range line {
 			if b >= 0x20 && b <= 0x7e {

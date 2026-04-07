@@ -10,6 +10,9 @@ synchronization, providing cryptographically signed timestamps with proof of
 server authenticity. This implementation covers Google-Roughtime and IETF drafts
 01–19.
 
+Interoperability testing is available at
+[ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
+
 ## Protocol
 
 The `protocol` package implements the Roughtime wire format for both server and
@@ -67,14 +70,17 @@ key seed from disk, generates online delegation certificates, and automatically
 refreshes them before expiry.
 
 ```
-roughtime -root-key /path/to/seed.hex [-port 2002]
+roughtime -root-key /path/to/seed.hex [-port 2002] [-log-level info]
 ```
 
 The server uses a fixed worker pool sized to the CPU count, a `sync.Pool` for
 read buffers, and atomic certificate swaps for lock-free request handling.
 Responses that would exceed the request size are dropped per the amplification
 protection requirement. The server shuts down gracefully on SIGINT/SIGTERM,
-draining in-flight requests before exiting.
+draining in-flight requests before exiting. Operational telemetry is emitted as
+structured JSON via [zap](https://github.com/uber-go/zap), including a
+per-minute stats line with received, responded, and dropped counters. Set
+`-log-level debug` to enable per-request logging during troubleshooting.
 
 ## Client
 
@@ -84,8 +90,8 @@ multi-server mode via a JSON server list. IETF servers receive all supported
 versions in a single VER tag, letting the server pick the best match.
 
 ```
-go run ./client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
-go run ./client -servers ecosystem.json
+go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+go run client/main.go -servers client/ecosystem.json
 ```
 
 ## Debug
@@ -95,7 +101,7 @@ versions and prints a full diagnostic dump of the request, response, signatures,
 and delegation certificate.
 
 ```
-go run ./debug -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 ```
 
 ## Public Server
@@ -129,13 +135,34 @@ go test -race ./protocol/
 
 ### Client
 
+Single server:
+
+```
+$ go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+Address:   time.txryan.com:2002
+Version:   draft-ietf-ntp-roughtime-12
+Midpoint:  2026-04-07T03:19:21Z
+Radius:    3s
+Window:    [2026-04-07T03:19:18Z, 2026-04-07T03:19:24Z]
+RTT:       44ms
+Local:     2026-04-07T03:19:21.11307Z
+Drift:     -113ms
+Status:    in-sync
+```
+
+Multiple servers:
+
 ```
 $ go run client/main.go -servers client/ecosystem.json
-Cloudflare-Roughtime-2          draft-11        2026-04-06T05:54:04Z  ±1s      rtt=10ms      drift=-317ms
-time.txryan.com                 draft-12        2026-04-06T05:54:04Z  ±3s      rtt=47ms      drift=-354ms
-roughtime.se                    draft-12        2026-04-06T05:54:04Z  ±1s      rtt=144ms     drift=-451ms
+NAME                            ADDRESS                         VERSION         MIDPOINT              RADIUS    RTT         DRIFT         STATUS
+Cloudflare-Roughtime-2          roughtime.cloudflare.com:2003   draft-11        2026-04-07T03:19:23Z  ±1s       19ms        -168ms        in-sync
+time.txryan.com                 time.txryan.com:2002            draft-12        2026-04-07T03:19:23Z  ±3s       45ms        -194ms        in-sync
+roughtime.se                    roughtime.se:2002               draft-12        2026-04-07T03:19:23Z  ±1s       141ms       -291ms        in-sync
 
 3/3 servers responded
+Consensus drift:    -194ms (median of 3 samples)
+Consensus midpoint: 2026-04-07T03:19:23Z
+Drift spread:       122ms (min=-291ms, max=-168ms)
 ```
 
 ### Debug
@@ -144,16 +171,16 @@ roughtime.se                    draft-12        2026-04-06T05:54:04Z  ±1s      
 $ go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 === Version Probe: time.txryan.com:2002 ===
   draft-ietf-ntp-roughtime-12              OK
-  draft-ietf-ntp-roughtime-11              OK
   draft-ietf-ntp-roughtime-10              OK
   draft-ietf-ntp-roughtime-08              OK
   draft-ietf-ntp-roughtime-07              OK
-  draft-ietf-ntp-roughtime-06              OK
   draft-ietf-ntp-roughtime-05              OK
+  draft-ietf-ntp-roughtime-03              OK
+  draft-ietf-ntp-roughtime-02              OK
   draft-ietf-ntp-roughtime-01              OK
   Google-Roughtime                         OK
 
-Supported versions: draft-12, draft-11, draft-10, draft-08, draft-07, draft-06, draft-05, draft-01, Google
+Supported versions: draft-12, draft-10, draft-08, draft-07, draft-05, draft-03, draft-02, draft-01, Google
 Negotiated:         draft-ietf-ntp-roughtime-12
 
 === Request ===
@@ -161,14 +188,14 @@ Size: 1024 bytes
 00000000  52 4f 55 47 48 54 49 4d  f4 03 00 00 04 00 00 00  |ROUGHTIM........|
 00000010  04 00 00 00 24 00 00 00  28 00 00 00 56 45 52 00  |....$...(...VER.|
 00000020  4e 4f 4e 43 54 59 50 45  5a 5a 5a 5a 0c 00 00 80  |NONCTYPEZZZZ....|
-00000030  cf df 6a 2b 3c 7f 0d b3  f4 a9 4e 82 81 94 45 6d  |..j+<.....N...Em|
-00000040  7e 4f 25 67 e7 12 56 29  b4 bc 16 51 47 af 8a e7  |~O%g..V)...QG...|
+00000030  14 b7 2d f3 2f 0e 30 d3  ba 1d 97 ef 44 e3 34 85  |..-./.0.....D.4.|
+00000040  b3 88 87 47 1f bb c0 1c  40 ec 0f f3 1b dc 9e d8  |...G....@.......|
 00000050  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
 ...
 
 --- Request Tags ---
   VER: 0c000080
-  NONC: cfdf6a2b3c7f0db3f4a94e828194456d7e4f2567e7125629b4bc165147af8ae7
+  NONC: 14b72df32f0e30d3ba1d97ef44e33485b38887471fbbc01c40ec0ff31bdc9ed8
   TYPE: 00000000
   ZZZZ: (940 bytes of padding)
 
@@ -178,14 +205,14 @@ Size: 472 bytes
 00000010  40 00 00 00 44 00 00 00  64 00 00 00 68 00 00 00  |@...D...d...h...|
 00000020  68 00 00 00 f0 00 00 00  88 01 00 00 53 49 47 00  |h...........SIG.|
 00000030  56 45 52 00 4e 4f 4e 43  54 59 50 45 50 41 54 48  |VER.NONCTYPEPATH|
-00000040  53 52 45 50 43 45 52 54  49 4e 44 58 14 19 30 43  |SREPCERTINDX..0C|
-00000050  c4 50 2e dd ab 83 58 6e  34 65 61 33 e4 66 42 18  |.P....Xn4ea3.fB.|
+00000040  53 52 45 50 43 45 52 54  49 4e 44 58 9d 4d 38 a9  |SREPCERTINDX.M8.|
+00000050  44 82 3a ad de 29 d2 f7  c4 39 c4 fa 30 1e 70 2a  |D.:..)...9..0.p*|
 ...
 
 --- Response Tags ---
-  SIG: 14193043c4502edd...d205753d499b5df1d06c240b
+  SIG: 9d4d38a944823aadde29d2f7c439c4fa301e702a1e82dff2ec5b4706f20ba203cc293c0c4e596552afe5347d271b2f6bd5946987c78cc984f9765b5a2c277d07
   VER: 0c000080
-  NONC: cfdf6a2b3c7f0db3f4a94e828194456d7e4f2567e7125629b4bc165147af8ae7
+  NONC: 14b72df32f0e30d3ba1d97ef44e33485b38887471fbbc01c40ec0ff31bdc9ed8
   PATH: (empty)
   SREP: (136 bytes)
   CERT: (152 bytes)
@@ -193,32 +220,34 @@ Size: 472 bytes
   TYPE: 01000000
 
 === Verified Result ===
-Round-trip time: 45.260875ms
-Midpoint:        2026-04-06T05:54:08Z
+Round-trip time: 45.450542ms
+Midpoint:        2026-04-07T03:19:25Z
 Radius:          3s
-Local time:      2026-04-06T05:54:09.320258Z
-Clock drift:     -1.32s
+Local time:      2026-04-07T03:19:25.489584Z
+Clock drift:     -490ms
+Amplification:   ok (reply 472 ≤ request 1024)
 
 === Response Details ===
 Version:         0x8000000c (draft-ietf-ntp-roughtime-12)
-Signature:       14193043c4502edd...d205753d499b5df1d06c240b
-Nonce:           cfdf6a2b3c7f0db3f4a94e828194456d7e4f2567e7125629b4bc165147af8ae7
+Signature:       9d4d38a944823aadde29d2f7c439c4fa301e702a1e82dff2ec5b4706f20ba203cc293c0c4e596552afe5347d271b2f6bd5946987c78cc984f9765b5a2c277d07
+Nonce:           14b72df32f0e30d3ba1d97ef44e33485b38887471fbbc01c40ec0ff31bdc9ed8
 Merkle index:    0
 Merkle path:     0 node(s)
 
 === Signed Response (SREP) ===
-Merkle root:     7ce214773d8658f45ebf06268b53eb669a365ae4c761198d5ec14fe3ec196672
-Midpoint (raw):  1775454848 (2026-04-06T05:54:08Z)
+Merkle root:     ef921db6451f2da5ee90c186e39a0cf508fdfdd8c0e3616bdd3c4a2750c22c8b
+Midpoint (raw):  1775531965 (2026-04-07T03:19:25Z)
 Radius (raw):    3
 VER in SREP:     0x8000000c (draft-ietf-ntp-roughtime-12)
-VERS in SREP:    draft-01, ..., draft-12
+VERS in SREP:    draft-01, draft-02, draft-03, draft-04, draft-05, draft-06, draft-07, draft-08, draft-09, draft-10, draft-11, draft-12
 
 === Certificate ===
-Signature:       d7c29a2d28346a15...a1d8d002
+Signature:       d7c29a2d28346a15a776597b39bd192a79af88746f1f569f140932b5e9d0fe28148b7807f107c9f08297040f1cda1296956b5167722a4dcd4181855ba1d8d002
 Online key:      94a5cd8e2cdabb62dbd92d760e8dd177a27a2e42fc7d068744358d52bac05ed8
 Not before:      2026-03-30T05:53:29Z
 Not after:       2026-05-18T05:53:29Z
-Expires in:      1007h59m20s
+Expires in:      986h34m4s
+Cert validity:   ok (midpoint within window)
 ```
 
 ## License
