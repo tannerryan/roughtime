@@ -2,31 +2,8 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Package protocol implements the Roughtime wire protocol for both server and
-// client use.
-//
-// Supported versions:
-//
-//	Google-Roughtime                        (no version number)
-//	draft-ietf-ntp-roughtime-00             (unsupported; predates VER)
-//	draft-ietf-ntp-roughtime-01             0x80000001
-//	draft-ietf-ntp-roughtime-02             0x80000002
-//	draft-ietf-ntp-roughtime-03             0x80000003
-//	draft-ietf-ntp-roughtime-04             0x80000004
-//	draft-ietf-ntp-roughtime-05             0x80000005
-//	draft-ietf-ntp-roughtime-06             0x80000006
-//	draft-ietf-ntp-roughtime-07             0x80000007
-//	draft-ietf-ntp-roughtime-08             0x80000008
-//	draft-ietf-ntp-roughtime-09             0x80000009
-//	draft-ietf-ntp-roughtime-10             0x8000000a
-//	draft-ietf-ntp-roughtime-11             0x8000000b
-//	draft-ietf-ntp-roughtime-12             0x8000000c
-//	draft-ietf-ntp-roughtime-13             0x8000000c
-//	draft-ietf-ntp-roughtime-14             0x8000000c
-//	draft-ietf-ntp-roughtime-15             0x8000000c
-//	draft-ietf-ntp-roughtime-16             0x8000000c
-//	draft-ietf-ntp-roughtime-17             0x8000000c
-//	draft-ietf-ntp-roughtime-18             0x8000000c
-//	draft-ietf-ntp-roughtime-19             0x8000000c
+// client use. It supports Google-Roughtime and IETF drafts 01-19 (drafts 12-19
+// share wire version 0x8000000c).
 package protocol
 
 import (
@@ -62,11 +39,8 @@ const (
 	VersionDraft12 Version = 0x8000000c // draft-ietf-ntp-roughtime-12 through 19
 )
 
-// String returns the IETF draft name for known versions (e.g.
-// "draft-ietf-ntp-roughtime-08") or a hex representation for unknown values.
-// Drafts 12–19 share wire version 0x8000000c; String reports
-// "draft-ietf-ntp-roughtime-12" since the wire format cannot distinguish later
-// revisions.
+// String returns the IETF draft name (e.g. "draft-ietf-ntp-roughtime-08") or a
+// hex representation for unknown values. Drafts 12–19 all report draft-12.
 func (v Version) String() string {
 	switch v {
 	case VersionGoogle:
@@ -120,16 +94,16 @@ func (v Version) ShortString() string {
 type wireGroup int
 
 const (
-	groupGoogle wireGroup = iota // Google-Roughtime
-	groupD01                     // Draft 01 (NONC in SREP, SHA-512/32B)
-	groupD02                     // Draft 02 (NONC in SREP, SHA-512/256)
-	groupD03                     // Drafts 03–04 (NONC at top-level, SHA-512/32B)
-	groupD05                     // Drafts 05–06 (32B nonce)
+	groupGoogle wireGroup = iota // Google-Roughtime (no header, no VER)
+	groupD01                     // Draft 01 (SHA-512, NONC in SREP, 64B nonce)
+	groupD02                     // Draft 02 (SHA-512/256, NONC in SREP, 64B nonce)
+	groupD03                     // Drafts 03–04 (NONC at top-level, 64B nonce)
+	groupD05                     // Drafts 05–06 (32B nonce, MJD-µs)
 	groupD07                     // Draft 07 (SHA-512/256, delegation ctx without hyphens)
 	groupD08                     // Drafts 08–09 (Unix seconds, ZZZZ padding)
 	groupD10                     // Drafts 10–11 (RADI ≥ 3, SRV tag)
-	groupD12                     // Drafts 12–13 (0x8000000c, no TYPE)
-	groupD14                     // Drafts 14–19 (0x8000000c, TYPE present)
+	groupD12                     // Drafts 12–13 (full-packet leaf, VERS in SREP)
+	groupD14                     // Drafts 14–19 (TYPE tag in request and response)
 )
 
 // wireGroupOf returns the wire format group for a version and TYPE presence.
@@ -185,6 +159,16 @@ const (
 	tagPADIETF uint32 = 0x00444150 // PAD\0 (client padding, drafts 01–07)
 )
 
+// Wire-format limits. maxMessageSize bounds adversarial input fed to [Decode];
+// maxEncodeTags / maxDecodeTags bound the tag count; maxVersionList bounds the
+// VER list a client may advertise (drafts 14+ require ≤ 32).
+const (
+	maxMessageSize = 65535
+	maxEncodeTags  = 512
+	maxDecodeTags  = 512
+	maxVersionList = 32
+)
+
 // packetMagic is the 8-byte ROUGHTIM header present in all IETF draft packets.
 var packetMagic = [8]byte{'R', 'O', 'U', 'G', 'H', 'T', 'I', 'M'}
 
@@ -198,7 +182,9 @@ func hashSize(g wireGroup) int {
 }
 
 // usesRoughtimHeader reports whether packets use the 12-byte ROUGHTIM header.
-func usesRoughtimHeader(g wireGroup) bool { return g != groupGoogle }
+// The header is required by every IETF draft (drafts 01–19, §5/§6 "Roughtime
+// Packet Format"). Google-Roughtime sends a bare message with no envelope.
+func usesRoughtimHeader(g wireGroup) bool { return g >= groupD01 }
 
 // usesMJDMicroseconds reports whether timestamps use MJD microsecond encoding
 // (drafts 01–07). Google uses plain Unix microseconds; drafts 08+ use Unix
@@ -214,7 +200,9 @@ func usesFullPacketLeaf(g wireGroup) bool { return g >= groupD12 }
 func noncInSREP(g wireGroup) bool { return g == groupD01 || g == groupD02 }
 
 // hasResponseVER reports whether the response includes a top-level VER tag.
-func hasResponseVER(g wireGroup) bool { return g >= groupD01 }
+// Drafts 01–11 carry VER at the top level; drafts 12+ moved VER inside SREP
+// (Figure 3 in those drafts) and MUST NOT include it at the top level.
+func hasResponseVER(g wireGroup) bool { return g >= groupD01 && g < groupD12 }
 
 // hasResponseNONC reports whether the response includes a top-level NONC echo
 // (drafts 03+).
@@ -235,12 +223,6 @@ func nonceSize(g wireGroup) int {
 		return 64
 	}
 	return 32
-}
-
-// NonceSize returns the nonce length in bytes for a version: 64 for
-// Google-Roughtime and drafts 01–04, 32 for drafts 05+.
-func NonceSize(ver Version) int {
-	return nonceSize(wireGroupOf(ver, false))
 }
 
 // Signature context strings
@@ -358,19 +340,10 @@ func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 	return time.Duration(v) * time.Second, nil
 }
 
-// DecodeTimestamp converts an 8-byte wire-format timestamp to a [time.Time]
-// using the encoding rules for the given version: Unix microseconds for
-// Google-Roughtime, MJD microseconds for drafts 01–07, or Unix seconds for
-// drafts 08+.
+// DecodeTimestamp decodes an 8-byte wire-format timestamp using the encoding
+// rules for the given version.
 func DecodeTimestamp(ver Version, buf []byte) (time.Time, error) {
 	return decodeTimestamp(buf, wireGroupOf(ver, false))
-}
-
-// DecodeRadius converts a 4-byte wire-format RADI value to a [time.Duration]
-// using the encoding rules for the given version: microseconds for
-// Google-Roughtime and drafts 01–07, or seconds for drafts 08+.
-func DecodeRadius(ver Version, buf []byte) (time.Duration, error) {
-	return decodeRadius(buf, wireGroupOf(ver, false))
 }
 
 // newHasher returns the hash function for a wire group: SHA-512/256 for drafts
@@ -403,14 +376,9 @@ func nodeHash(g wireGroup, left, right []byte) []byte {
 	return h.Sum(nil)[:hashSize(g)]
 }
 
-// maxEncodeTags limits the tag count accepted by [Encode] to prevent integer
-// overflow in header length calculations and excessive memory allocation.
-const maxEncodeTags = 512
-
-// Encode serializes a tag-value map into a Roughtime message. All values must
-// have lengths that are multiples of 4 bytes. Tags are emitted in ascending
-// numeric order as required by the wire format.
-func Encode(msg map[uint32][]byte) ([]byte, error) {
+// encode serializes a tag-value map into a Roughtime message. All value lengths
+// must be multiples of 4 bytes; tags are emitted in ascending order.
+func encode(msg map[uint32][]byte) ([]byte, error) {
 	if len(msg) == 0 {
 		return nil, errors.New("protocol: empty message")
 	}
@@ -464,16 +432,14 @@ func Encode(msg map[uint32][]byte) ([]byte, error) {
 	return out, nil
 }
 
-// maxDecodeTags limits the tag count accepted by [Decode] to prevent integer
-// overflow in header length calculations and excessive memory allocation from
-// untrusted input.
-const maxDecodeTags = 512
-
-// Decode parses a Roughtime message into a tag-value map. The returned byte
-// slices are sub-slices of data and share its underlying memory.
+// Decode parses a Roughtime message into a tag-value map. The returned slices
+// alias data.
 func Decode(data []byte) (map[uint32][]byte, error) {
 	if len(data) < 4 {
 		return nil, errors.New("protocol: message too short")
+	}
+	if len(data) > maxMessageSize {
+		return nil, fmt.Errorf("protocol: message exceeds %d bytes", maxMessageSize)
 	}
 	n := binary.LittleEndian.Uint32(data[0:4])
 	if n == 0 {
@@ -537,9 +503,8 @@ func decodeValues(data []byte, tags, offsets []uint32, headerLen uint32) (map[ui
 	return msg, nil
 }
 
-// WrapPacket prepends the 12-byte ROUGHTIM header (8-byte magic + 4-byte
-// message length).
-func WrapPacket(message []byte) []byte {
+// wrapPacket prepends the 12-byte ROUGHTIM header.
+func wrapPacket(message []byte) []byte {
 	pkt := make([]byte, 12+len(message))
 	copy(pkt[0:8], packetMagic[:])
 	binary.LittleEndian.PutUint32(pkt[8:12], uint32(len(message)))
@@ -547,8 +512,8 @@ func WrapPacket(message []byte) []byte {
 	return pkt
 }
 
-// UnwrapPacket validates and strips the 12-byte ROUGHTIM header.
-func UnwrapPacket(pkt []byte) ([]byte, error) {
+// unwrapPacket validates and strips the 12-byte ROUGHTIM header.
+func unwrapPacket(pkt []byte) ([]byte, error) {
 	if len(pkt) < 12 {
 		return nil, errors.New("protocol: packet too short")
 	}
@@ -594,7 +559,9 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, fmt.Errorf("protocol: bad nonce length %d", len(nonce))
 	}
 	req.Nonce = nonce
-	parseOptionalTags(req, msg)
+	if err := parseOptionalTags(req, msg); err != nil {
+		return nil, err
+	}
 
 	return req, nil
 }
@@ -602,24 +569,52 @@ func ParseRequest(raw []byte) (*Request, error) {
 // unwrapRequest strips the ROUGHTIM header if present, otherwise returns raw.
 func unwrapRequest(raw []byte) ([]byte, error) {
 	if len(raw) >= 12 && bytes.Equal(raw[:8], packetMagic[:]) {
-		return UnwrapPacket(raw)
+		return unwrapPacket(raw)
 	}
 	return raw, nil
 }
 
 // parseOptionalTags extracts VER, SRV, and TYPE from a decoded message.
-func parseOptionalTags(req *Request, msg map[uint32][]byte) {
-	if vb, ok := msg[TagVER]; ok && len(vb) >= 4 && len(vb)%4 == 0 {
+func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
+	if vb, ok := msg[TagVER]; ok {
+		if len(vb) == 0 || len(vb)%4 != 0 {
+			return errors.New("protocol: VER tag length invalid")
+		}
+		count := len(vb) / 4
+		if count > maxVersionList {
+			return fmt.Errorf("protocol: VER tag has %d entries (max %d)", count, maxVersionList)
+		}
+		req.Versions = make([]Version, 0, count)
 		for i := 0; i < len(vb); i += 4 {
 			req.Versions = append(req.Versions, Version(binary.LittleEndian.Uint32(vb[i:i+4])))
 		}
+		// Drafts 13+ §5.1.2: VER MUST be sorted ascending and non-repeating.
+		// Earlier drafts have no explicit ordering rule; enforce defensively.
+		for i := 1; i < len(req.Versions); i++ {
+			if req.Versions[i] <= req.Versions[i-1] {
+				return errors.New("protocol: VER list not strictly ascending")
+			}
+		}
 	}
 	if srv, ok := msg[TagSRV]; ok {
+		// Drafts 10+ define SRV as H(0xff || pubkey) truncated to 32 bytes.
+		// Reject obviously malformed lengths but accept anything ≤ 64 bytes for
+		// forward compatibility with older drafts that left SRV undefined.
+		if len(srv) == 0 || len(srv) > 64 {
+			return fmt.Errorf("protocol: SRV tag length %d invalid", len(srv))
+		}
 		req.SRV = srv
 	}
-	if tb, ok := msg[TagTYPE]; ok && len(tb) == 4 && binary.LittleEndian.Uint32(tb) == 0 {
+	if tb, ok := msg[TagTYPE]; ok {
+		if len(tb) != 4 {
+			return errors.New("protocol: TYPE tag must be 4 bytes")
+		}
+		if v := binary.LittleEndian.Uint32(tb); v != 0 {
+			return fmt.Errorf("protocol: TYPE=%d in request (must be 0)", v)
+		}
 		req.HasType = true
 	}
+	return nil
 }
 
 // serverPreference lists versions in descending preference for negotiation.
@@ -657,6 +652,19 @@ func init() {
 // SupportedVersions returns all IETF version numbers in ascending order.
 func SupportedVersions() []Version {
 	return supportedVersions
+}
+
+// ComputeSRV returns the SRV tag value for a server's long-term Ed25519 public
+// key as defined in draft-ietf-ntp-roughtime-13 §5.1.4 and later: the first 32
+// bytes of SHA-512(0xff || pubkey).
+func ComputeSRV(rootPK ed25519.PublicKey) []byte {
+	if len(rootPK) != ed25519.PublicKeySize {
+		return nil
+	}
+	h := sha512.New()
+	_, _ = h.Write([]byte{0xff})
+	_, _ = h.Write(rootPK)
+	return h.Sum(nil)[:32]
 }
 
 // SelectVersion picks the best mutually supported version. For Google-Roughtime
@@ -741,9 +749,15 @@ func (c *Certificate) cacheKeyFor(g wireGroup) certCacheKey {
 	}
 }
 
-// certBytes returns the pre-built CERT for a wire group.
+// certBytes returns the pre-built CERT for a wire group. It panics if the cache
+// lacks an entry for g, which would indicate a programming error in
+// NewCertificate's pre-computation loop rather than runtime input.
 func (c *Certificate) certBytes(g wireGroup) []byte {
-	return c.cache[c.cacheKeyFor(g)]
+	b, ok := c.cache[c.cacheKeyFor(g)]
+	if !ok {
+		panic(fmt.Sprintf("protocol: certificate cache miss for wire group %d", g))
+	}
+	return b
 }
 
 // buildCERT constructs the CERT message for a wire group.
@@ -751,7 +765,7 @@ func (c *Certificate) buildCERT(g wireGroup, rootSK ed25519.PrivateKey) ([]byte,
 	mintBuf := encodeTimestamp(c.mint, g)
 	maxtBuf := encodeTimestamp(c.maxt, g)
 
-	dele, err := Encode(map[uint32][]byte{
+	dele, err := encode(map[uint32][]byte{
 		TagPUBK: []byte(c.onlinePK),
 		TagMINT: mintBuf[:],
 		TagMAXT: maxtBuf[:],
@@ -766,7 +780,7 @@ func (c *Certificate) buildCERT(g wireGroup, rootSK ed25519.PrivateKey) ([]byte,
 	copy(toSign[len(ctx):], dele)
 	sig := ed25519.Sign(rootSK, toSign)
 
-	return Encode(map[uint32][]byte{TagSIG: sig, TagDELE: dele})
+	return encode(map[uint32][]byte{TagSIG: sig, TagDELE: dele})
 }
 
 // merkleTree holds the pre-computed root and per-leaf paths for a batch of
@@ -776,13 +790,8 @@ type merkleTree struct {
 	paths    [][][]byte // paths[i] = sibling hashes from leaf i to root
 }
 
-// newMerkleTree builds the Merkle tree and extracts the root and all paths in a
-// single pass. Client verification walks INDX bits from LSB: if bit is 0, hash
-// = H(0x01 || hash || node); otherwise hash = H(0x01 || node || hash).
-//
-// IETF drafts 12–15 described the opposite operand order (bit 0 → H(0x01 ||
-// node || hash)), but all known implementations followed the order used here.
-// Draft 16 corrected the spec text to match: bit 0 → H(0x01 || h || node).
+// newMerkleTree builds the Merkle tree and per-leaf paths in one bottom-up
+// pass. Verification walks INDX bits from LSB: bit 0 → H(0x01 || h || node).
 func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 	n := len(leafInputs)
 	hs := hashSize(g)
@@ -843,6 +852,14 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 
 	g := wireGroupOf(ver, requests[0].HasType)
 
+	// Drafts 01–02 place NONC inside the signed SREP, which is shared by every
+	// reply in a batch. That construction only admits a single nonce, so reject
+	// multi-request batches for those wire groups instead of silently producing
+	// a non-compliant response that omits NONC.
+	if noncInSREP(g) && len(requests) > 1 {
+		return nil, errors.New("protocol: drafts 01–02 do not support batched responses")
+	}
+
 	// Build Merkle tree
 	leafData := make([][]byte, len(requests))
 	for i := range requests {
@@ -895,8 +912,9 @@ func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time,
 		TagMIDP: midpBuf[:],
 		TagROOT: rootHash,
 	}
-	// Drafts 01–02 place NONC inside SREP (single-request batches only)
-	if noncInSREP(g) && len(requests) == 1 {
+	// Drafts 01–02 place NONC inside SREP. CreateReplies rejects multi-request
+	// batches for these groups, so requests[0] is the only nonce here.
+	if noncInSREP(g) {
 		srepTags[TagNONC] = requests[0].Nonce
 	}
 	if hasSREPVERS(g) {
@@ -906,7 +924,7 @@ func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time,
 		srepTags[TagVERS] = supportedVersionsBytes
 	}
 
-	b, err := Encode(srepTags)
+	b, err := encode(srepTags)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: encode SREP: %w", err)
 	}
@@ -946,12 +964,12 @@ func buildReply(ver Version, g wireGroup, req Request, i int, tree *merkleTree, 
 		resp[TagTYPE] = tBuf[:]
 	}
 
-	replyMsg, err := Encode(resp)
+	replyMsg, err := encode(resp)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: encode reply %d: %w", i, err)
 	}
 	if usesRoughtimHeader(g) {
-		replyMsg = WrapPacket(replyMsg)
+		replyMsg = wrapPacket(replyMsg)
 	}
 	return replyMsg, nil
 }
@@ -971,12 +989,14 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 }
 
 // CreateRequest builds a Roughtime request for the given version preferences.
-// For Google-Roughtime, pass a single-element slice containing [VersionGoogle].
-// For IETF versions, pass one or more version constants in preference order.
-//
-// The returned nonce is needed to verify the server's reply. The returned
-// request is a complete UDP payload ready to send.
+// The returned nonce is needed to verify the server's reply.
 func CreateRequest(versions []Version, entropy io.Reader) (nonce, request []byte, err error) {
+	return CreateRequestWithSRV(versions, entropy, nil)
+}
+
+// CreateRequestWithSRV is like [CreateRequest] but includes the SRV tag (drafts
+// 10+) computed by [ComputeSRV]. SRV is omitted from Google-Roughtime requests.
+func CreateRequestWithSRV(versions []Version, entropy io.Reader, srv []byte) (nonce, request []byte, err error) {
 	_, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, nil, err
@@ -994,6 +1014,8 @@ func CreateRequest(versions []Version, entropy io.Reader) (nonce, request []byte
 		sorted := make([]Version, len(versions))
 		copy(sorted, versions)
 		slices.Sort(sorted)
+		// Drop duplicates: drafts 14+ require strictly ascending VER values.
+		sorted = slices.Compact(sorted)
 		vb := make([]byte, 4*len(sorted))
 		for i, v := range sorted {
 			binary.LittleEndian.PutUint32(vb[4*i:], uint32(v))
@@ -1003,12 +1025,16 @@ func CreateRequest(versions []Version, entropy io.Reader) (nonce, request []byte
 		if g >= groupD14 {
 			tags[TagTYPE] = make([]byte, 4) // TYPE=0 (request)
 		}
+		if len(srv) > 0 {
+			tags[TagSRV] = srv
+		}
 	}
 
-	// Calculate padding
+	// Drafts 04+ wrap the message in a 12-byte header; pad the inner body to
+	// 1012 so the total wire size is 1024. Earlier wire groups pad to 1024.
 	target := 1024
-	if g != groupGoogle {
-		target = 1012 // message body inside the 12-byte header
+	if usesRoughtimHeader(g) {
+		target = 1012
 	}
 
 	n := uint32(len(tags))
@@ -1030,30 +1056,21 @@ func CreateRequest(versions []Version, entropy io.Reader) (nonce, request []byte
 		tags[padTag] = make([]byte, padLen)
 	}
 
-	msg, err := Encode(tags)
+	msg, err := encode(tags)
 	if err != nil {
 		return nil, nil, fmt.Errorf("protocol: encode request: %w", err)
 	}
 
-	if g != groupGoogle {
-		return nonce, WrapPacket(msg), nil
+	if usesRoughtimHeader(g) {
+		return nonce, wrapPacket(msg), nil
 	}
 	return nonce, msg, nil
 }
 
-// VerifyReply authenticates a server response and returns the midpoint time and
-// uncertainty radius. It verifies the delegation certificate against rootPK,
-// verifies the signed response against the online key, checks the Merkle proof
-// for nonce inclusion, and validates that the midpoint falls within the
-// delegation window.
-//
-// The versions slice must contain the same preferences used in [CreateRequest].
-// For Google-Roughtime, pass [VersionGoogle].
-//
-// For drafts 12+, the Merkle tree leaf is computed over the full request packet
-// rather than just the nonce. Pass the complete request bytes (as returned by
-// CreateRequest) as requestBytes. For earlier versions, requestBytes is ignored
-// and may be nil.
+// VerifyReply authenticates a server response and returns the midpoint and
+// uncertainty radius. The versions slice must match the one passed to
+// [CreateRequest]. For drafts 12+, requestBytes must be the complete request
+// packet (Merkle leaves cover the full packet); earlier versions may pass nil.
 func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) (midpoint time.Time, radius time.Duration, err error) {
 	if len(rootPK) != ed25519.PublicKeySize {
 		return time.Time{}, 0, errors.New("protocol: invalid public key size")
@@ -1099,25 +1116,71 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 		return time.Time{}, 0, err
 	}
 
+	// Drafts 12+ §5.2.5: SREP signs the server's VERS list. Verify the
+	// negotiated version is the highest common version to detect downgrades.
+	if g >= groupD12 {
+		if err := verifyNoVersionDowngrade(resp, versions); err != nil {
+			return time.Time{}, 0, err
+		}
+	}
+
 	return validateDelegationWindow(midpoint, radius, mintBuf, maxtBuf, g)
 }
 
-// extractResponseVER looks for the negotiated version in a decoded response. It
-// checks the top-level VER tag first (used by this codebase and some
-// implementations), then falls back to VER inside SREP (the canonical location
-// in drafts 12+).
-func extractResponseVER(resp map[uint32][]byte) (Version, bool) {
-	// Top-level VER (single uint32)
-	if vb, ok := resp[TagVER]; ok && len(vb) == 4 {
-		return Version(binary.LittleEndian.Uint32(vb)), true
+// verifyNoVersionDowngrade decodes the signed VERS list inside SREP and
+// confirms the chosen version (also inside SREP) is the highest mutually
+// supported version. Drafts 12+ only.
+func verifyNoVersionDowngrade(resp map[uint32][]byte, clientVersions []Version) error {
+	srepBytes, ok := resp[TagSREP]
+	if !ok {
+		return errors.New("protocol: missing SREP for downgrade check")
 	}
-	// Fall back to VER inside SREP (drafts 12+)
+	srep, err := Decode(srepBytes)
+	if err != nil {
+		return fmt.Errorf("protocol: decode SREP for downgrade check: %w", err)
+	}
+	verBytes, ok := srep[TagVER]
+	if !ok || len(verBytes) != 4 {
+		return errors.New("protocol: missing VER in SREP")
+	}
+	chosen := Version(binary.LittleEndian.Uint32(verBytes))
+	versBytes, ok := srep[TagVERS]
+	if !ok || len(versBytes) == 0 || len(versBytes)%4 != 0 {
+		return errors.New("protocol: missing or malformed VERS in SREP")
+	}
+	serverSupports := make(map[Version]bool, len(versBytes)/4)
+	for i := 0; i < len(versBytes); i += 4 {
+		serverSupports[Version(binary.LittleEndian.Uint32(versBytes[i:i+4]))] = true
+	}
+	var best Version
+	var found bool
+	for _, v := range clientVersions {
+		if serverSupports[v] && (!found || v > best) {
+			best, found = v, true
+		}
+	}
+	if !found {
+		return errors.New("protocol: no mutually supported version (VERS check)")
+	}
+	if chosen != best {
+		return fmt.Errorf("protocol: version downgrade detected: server chose %s, expected %s", chosen, best)
+	}
+	return nil
+}
+
+// extractResponseVER looks for the negotiated version in a decoded response. It
+// prefers signed VER inside SREP (canonical for drafts 12+) over the unsigned
+// top-level VER (drafts 01-11), closing a downgrade vector.
+func extractResponseVER(resp map[uint32][]byte) (Version, bool) {
 	if srepBytes, ok := resp[TagSREP]; ok {
 		if srep, err := Decode(srepBytes); err == nil {
 			if vb, ok := srep[TagVER]; ok && len(vb) == 4 {
 				return Version(binary.LittleEndian.Uint32(vb)), true
 			}
 		}
+	}
+	if vb, ok := resp[TagVER]; ok && len(vb) == 4 {
+		return Version(binary.LittleEndian.Uint32(vb)), true
 	}
 	return 0, false
 }
@@ -1126,7 +1189,7 @@ func extractResponseVER(resp map[uint32][]byte) (Version, bool) {
 func ExtractVersion(reply []byte) (Version, bool) {
 	msg := reply
 	if len(reply) >= 12 {
-		if inner, err := UnwrapPacket(reply); err == nil {
+		if inner, err := unwrapPacket(reply); err == nil {
 			msg = inner
 		}
 	}
@@ -1146,7 +1209,7 @@ func versionOffered(ver Version, versions []Version) bool {
 // absence for Google-Roughtime.
 func unwrapReply(reply []byte, g wireGroup) ([]byte, error) {
 	if usesRoughtimHeader(g) {
-		return UnwrapPacket(reply)
+		return unwrapPacket(reply)
 	}
 	if len(reply) >= 8 && bytes.Equal(reply[:8], packetMagic[:]) {
 		return nil, errors.New("protocol: unexpected ROUGHTIM header for Google-Roughtime")
@@ -1154,10 +1217,8 @@ func unwrapReply(reply []byte, g wireGroup) ([]byte, error) {
 	return reply, nil
 }
 
-// verifyReplySigs extracts CERT and SIG from a decoded response, verifies the
-// delegation certificate against rootPK, and verifies the SREP signature
-// against the online key. It returns the online public key and raw MINT/MAXT
-// bytes from DELE.
+// verifyReplySigs verifies CERT against rootPK and SREP against the online key,
+// returning the online key and raw MINT/MAXT from DELE.
 func verifyReplySigs(resp map[uint32][]byte, rootPK ed25519.PublicKey, g wireGroup) (ed25519.PublicKey, []byte, []byte, error) {
 	srepBytes, ok := resp[TagSREP]
 	if !ok {

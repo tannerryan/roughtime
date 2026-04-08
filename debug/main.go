@@ -24,13 +24,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tannerryan/roughtime/internal/version"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
 var (
-	addr    = flag.String("addr", "", "host:port of the Roughtime server")
-	pubkey  = flag.String("pubkey", "", "base64-encoded Ed25519 root public key")
-	timeout = flag.Duration("timeout", 2*time.Second, "per-version probe timeout")
+	addr        = flag.String("addr", "", "host:port of the Roughtime server")
+	pubkey      = flag.String("pubkey", "", "base64-encoded Ed25519 root public key")
+	timeout     = flag.Duration("timeout", 2*time.Second, "per-version probe timeout")
+	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
 // probeResult holds the outcome of a single version probe.
@@ -48,6 +50,10 @@ type probeResult struct {
 // main parses flags and runs the debug probe.
 func main() {
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("roughtime-debug", version.Version)
+		return
+	}
 	if *addr == "" || *pubkey == "" {
 		fmt.Fprintf(os.Stderr, "usage: debug -addr <host:port> -pubkey <base64>\n")
 		os.Exit(1)
@@ -138,15 +144,21 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 	}
 	defer conn.Close()
 
-	_ = conn.SetWriteDeadline(time.Now().Add(*timeout))
+	if err := conn.SetWriteDeadline(time.Now().Add(*timeout)); err != nil {
+		r.err = fmt.Errorf("set write deadline: %w", err)
+		return r
+	}
 	start := time.Now()
 	if _, err := conn.Write(request); err != nil {
 		r.err = fmt.Errorf("send: %w", err)
 		return r
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(*timeout))
-	buf := make([]byte, 4096)
+	if err := conn.SetReadDeadline(time.Now().Add(*timeout)); err != nil {
+		r.err = fmt.Errorf("set read deadline: %w", err)
+		return r
+	}
+	buf := make([]byte, 65535)
 	n, err := conn.Read(buf)
 	if err != nil {
 		r.err = fmt.Errorf("read: %w", err)
@@ -179,10 +191,12 @@ func msgBody(pkt []byte) []byte {
 	return pkt
 }
 
-// decode is a safe wrapper around [protocol.Decode].
+// decode is a safe wrapper around [protocol.Decode] that prints decode errors
+// to stderr instead of silently dropping malformed input.
 func decode(data []byte) map[uint32][]byte {
 	tags, err := protocol.Decode(data)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "debug: decode: %s\n", err)
 		return nil
 	}
 	return tags
