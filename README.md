@@ -23,7 +23,7 @@ client use. Ten wire format groups handle all version differences:
 | Google     | Google-Roughtime       | 64B nonce, SHA-512 (64B), Unix µs, no header                  |
 | Draft 01   | 01                     | ROUGHTIM header, SHA-512/32B, MJD µs, 64B nonce, NONC in SREP |
 | Draft 02   | 02                     | SHA-512/256 (distinct algorithm), NONC in SREP                |
-| Draft 03   | 03, 04                 | NONC moved to top-level response, SHA-512/32B                 |
+| Draft 03   | 03, 04                 | NONC moved to top-level response                              |
 | Draft 05   | 05, 06                 | 32B nonce                                                     |
 | Draft 07   | 07                     | SHA-512/256, delegation context without trailing hyphens      |
 | Draft 08   | 08, 09                 | Unix seconds, ZZZZ padding                                    |
@@ -71,16 +71,19 @@ refreshes them before expiry.
 
 ```
 roughtime -root-key /path/to/seed.hex [-port 2002] [-log-level info]
+roughtime -version
 ```
 
-The server uses a fixed worker pool sized to the CPU count, a `sync.Pool` for
-read buffers, and atomic certificate swaps for lock-free request handling.
-Responses that would exceed the request size are dropped per the amplification
-protection requirement. The server shuts down gracefully on SIGINT/SIGTERM,
-draining in-flight requests before exiting. Operational telemetry is emitted as
-structured JSON via [zap](https://github.com/uber-go/zap), including a
-per-minute stats line with received, responded, and dropped counters. Set
-`-log-level debug` to enable per-request logging during troubleshooting.
+The root key file must be mode `0600` or stricter; the server refuses to start
+otherwise. The server uses a fixed worker pool sized to the CPU count, a
+`sync.Pool` for read buffers, and atomic certificate swaps for lock-free request
+handling. Responses that would exceed the request size are dropped per the
+amplification protection requirement. The server shuts down gracefully on
+SIGINT/SIGTERM, draining in-flight requests before exiting. Operational
+telemetry is emitted as structured JSON via
+[zap](https://github.com/uber-go/zap), including a per-minute stats line with
+received, responded, and dropped counters. Set `-log-level debug` to enable
+per-request logging during troubleshooting.
 
 ## Client
 
@@ -92,6 +95,7 @@ versions in a single VER tag, letting the server pick the best match.
 ```
 go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 go run client/main.go -servers client/ecosystem.json
+go run client/main.go -version
 ```
 
 ## Debug
@@ -102,6 +106,7 @@ and delegation certificate.
 
 ```
 go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+go run debug/main.go -version
 ```
 
 ## Public Server
@@ -141,12 +146,12 @@ Single server:
 $ go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 Address:   time.txryan.com:2002
 Version:   draft-ietf-ntp-roughtime-12
-Midpoint:  2026-04-07T03:19:21Z
+Midpoint:  2026-04-08T05:29:59Z
 Radius:    3s
-Window:    [2026-04-07T03:19:18Z, 2026-04-07T03:19:24Z]
-RTT:       44ms
-Local:     2026-04-07T03:19:21.11307Z
-Drift:     -113ms
+Window:    [2026-04-08T05:29:56Z, 2026-04-08T05:30:02Z]
+RTT:       45ms
+Local:     2026-04-08T05:29:59.050326Z
+Drift:     -50ms
 Status:    in-sync
 ```
 
@@ -155,14 +160,14 @@ Multiple servers:
 ```
 $ go run client/main.go -servers client/ecosystem.json
 NAME                            ADDRESS                         VERSION         MIDPOINT              RADIUS    RTT         DRIFT         STATUS
-Cloudflare-Roughtime-2          roughtime.cloudflare.com:2003   draft-11        2026-04-07T03:19:23Z  ±1s       19ms        -168ms        in-sync
-time.txryan.com                 time.txryan.com:2002            draft-12        2026-04-07T03:19:23Z  ±3s       45ms        -194ms        in-sync
-roughtime.se                    roughtime.se:2002               draft-12        2026-04-07T03:19:23Z  ±1s       141ms       -291ms        in-sync
+Cloudflare-Roughtime-2          roughtime.cloudflare.com:2003   draft-11        2026-04-08T05:30:05Z  ±1s       18ms        -560ms        in-sync
+time.txryan.com                 time.txryan.com:2002            draft-12        2026-04-08T05:30:05Z  ±3s       46ms        -565ms        in-sync
+roughtime.se                    roughtime.se:2002               draft-12        2026-04-08T05:30:05Z  ±1s       202ms       -1.077s       in-sync
 
 3/3 servers responded
-Consensus drift:    -194ms (median of 3 samples)
-Consensus midpoint: 2026-04-07T03:19:23Z
-Drift spread:       122ms (min=-291ms, max=-168ms)
+Consensus drift:    -565ms (median of 3 samples)
+Consensus midpoint: 2026-04-08T05:30:05Z
+Drift spread:       517ms (min=-1.077s, max=-560ms)
 ```
 
 ### Debug
@@ -171,16 +176,20 @@ Drift spread:       122ms (min=-291ms, max=-168ms)
 $ go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 === Version Probe: time.txryan.com:2002 ===
   draft-ietf-ntp-roughtime-12              OK
+  draft-ietf-ntp-roughtime-11              OK
   draft-ietf-ntp-roughtime-10              OK
+  draft-ietf-ntp-roughtime-09              OK
   draft-ietf-ntp-roughtime-08              OK
   draft-ietf-ntp-roughtime-07              OK
+  draft-ietf-ntp-roughtime-06              OK
   draft-ietf-ntp-roughtime-05              OK
+  draft-ietf-ntp-roughtime-04              OK
   draft-ietf-ntp-roughtime-03              OK
   draft-ietf-ntp-roughtime-02              OK
   draft-ietf-ntp-roughtime-01              OK
   Google-Roughtime                         OK
 
-Supported versions: draft-12, draft-10, draft-08, draft-07, draft-05, draft-03, draft-02, draft-01, Google
+Supported versions: draft-12, draft-11, draft-10, draft-09, draft-08, draft-07, draft-06, draft-05, draft-04, draft-03, draft-02, draft-01, Google
 Negotiated:         draft-ietf-ntp-roughtime-12
 
 === Request ===
@@ -188,31 +197,30 @@ Size: 1024 bytes
 00000000  52 4f 55 47 48 54 49 4d  f4 03 00 00 04 00 00 00  |ROUGHTIM........|
 00000010  04 00 00 00 24 00 00 00  28 00 00 00 56 45 52 00  |....$...(...VER.|
 00000020  4e 4f 4e 43 54 59 50 45  5a 5a 5a 5a 0c 00 00 80  |NONCTYPEZZZZ....|
-00000030  14 b7 2d f3 2f 0e 30 d3  ba 1d 97 ef 44 e3 34 85  |..-./.0.....D.4.|
-00000040  b3 88 87 47 1f bb c0 1c  40 ec 0f f3 1b dc 9e d8  |...G....@.......|
+00000030  d2 9f ab f3 7d bd 26 7c  bc 62 fa 02 92 99 24 86  |....}.&|.b....$.|
+00000040  fa d8 6e c9 b0 63 52 27  8f bb b0 c5 4c b2 57 52  |..n..cR'....L.WR|
 00000050  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
 ...
 
 --- Request Tags ---
   VER: 0c000080
-  NONC: 14b72df32f0e30d3ba1d97ef44e33485b38887471fbbc01c40ec0ff31bdc9ed8
+  NONC: d29fabf37dbd267cbc62fa0292992486fad86ec9b06352278fbbb0c54cb25752
   TYPE: 00000000
   ZZZZ: (940 bytes of padding)
 
 === Response ===
-Size: 472 bytes
-00000000  52 4f 55 47 48 54 49 4d  cc 01 00 00 08 00 00 00  |ROUGHTIM........|
-00000010  40 00 00 00 44 00 00 00  64 00 00 00 68 00 00 00  |@...D...d...h...|
-00000020  68 00 00 00 f0 00 00 00  88 01 00 00 53 49 47 00  |h...........SIG.|
-00000030  56 45 52 00 4e 4f 4e 43  54 59 50 45 50 41 54 48  |VER.NONCTYPEPATH|
-00000040  53 52 45 50 43 45 52 54  49 4e 44 58 9d 4d 38 a9  |SREPCERTINDX.M8.|
-00000050  44 82 3a ad de 29 d2 f7  c4 39 c4 fa 30 1e 70 2a  |D.:..)...9..0.p*|
+Size: 460 bytes
+00000000  52 4f 55 47 48 54 49 4d  c0 01 00 00 07 00 00 00  |ROUGHTIM........|
+00000010  40 00 00 00 60 00 00 00  64 00 00 00 64 00 00 00  |@...`...d...d...|
+00000020  ec 00 00 00 84 01 00 00  53 49 47 00 4e 4f 4e 43  |........SIG.NONC|
+00000030  54 59 50 45 50 41 54 48  53 52 45 50 43 45 52 54  |TYPEPATHSREPCERT|
+00000040  49 4e 44 58 85 25 49 33  3d 2b eb b6 4b e6 04 bc  |INDX.%I3=+..K...|
+00000050  e7 f1 fb 72 b2 b9 58 e3  99 0c 26 f7 f6 35 df d8  |...r..X...&..5..|
 ...
 
 --- Response Tags ---
-  SIG: 9d4d38a944823aadde29d2f7c439c4fa301e702a1e82dff2ec5b4706f20ba203cc293c0c4e596552afe5347d271b2f6bd5946987c78cc984f9765b5a2c277d07
-  VER: 0c000080
-  NONC: 14b72df32f0e30d3ba1d97ef44e33485b38887471fbbc01c40ec0ff31bdc9ed8
+  SIG: 852549333d2bebb64be604bce7f1fb72b2b958e3990c26f7f635dfd863abc4f08d3179497ad94f60b94da6f7ae38d833afd6ff251160c922382f742211d50803
+  NONC: d29fabf37dbd267cbc62fa0292992486fad86ec9b06352278fbbb0c54cb25752
   PATH: (empty)
   SREP: (136 bytes)
   CERT: (152 bytes)
@@ -220,33 +228,32 @@ Size: 472 bytes
   TYPE: 01000000
 
 === Verified Result ===
-Round-trip time: 45.450542ms
-Midpoint:        2026-04-07T03:19:25Z
+Round-trip time: 44.5795ms
+Midpoint:        2026-04-08T05:30:08Z
 Radius:          3s
-Local time:      2026-04-07T03:19:25.489584Z
-Clock drift:     -490ms
-Amplification:   ok (reply 472 ≤ request 1024)
+Local time:      2026-04-08T05:30:09.538986Z
+Clock drift:     -1.539s
+Amplification:   ok (reply 460 ≤ request 1024)
 
 === Response Details ===
-Version:         0x8000000c (draft-ietf-ntp-roughtime-12)
-Signature:       9d4d38a944823aadde29d2f7c439c4fa301e702a1e82dff2ec5b4706f20ba203cc293c0c4e596552afe5347d271b2f6bd5946987c78cc984f9765b5a2c277d07
-Nonce:           14b72df32f0e30d3ba1d97ef44e33485b38887471fbbc01c40ec0ff31bdc9ed8
+Signature:       852549333d2bebb64be604bce7f1fb72b2b958e3990c26f7f635dfd863abc4f08d3179497ad94f60b94da6f7ae38d833afd6ff251160c922382f742211d50803
+Nonce:           d29fabf37dbd267cbc62fa0292992486fad86ec9b06352278fbbb0c54cb25752
 Merkle index:    0
 Merkle path:     0 node(s)
 
 === Signed Response (SREP) ===
-Merkle root:     ef921db6451f2da5ee90c186e39a0cf508fdfdd8c0e3616bdd3c4a2750c22c8b
-Midpoint (raw):  1775531965 (2026-04-07T03:19:25Z)
+Merkle root:     e3fdbea2c883f1852b1a9d55a0fecb07a74517d6e9a6c5528e2c5b9a1c8fe050
+Midpoint (raw):  1775626208 (2026-04-08T05:30:08Z)
 Radius (raw):    3
 VER in SREP:     0x8000000c (draft-ietf-ntp-roughtime-12)
 VERS in SREP:    draft-01, draft-02, draft-03, draft-04, draft-05, draft-06, draft-07, draft-08, draft-09, draft-10, draft-11, draft-12
 
 === Certificate ===
-Signature:       d7c29a2d28346a15a776597b39bd192a79af88746f1f569f140932b5e9d0fe28148b7807f107c9f08297040f1cda1296956b5167722a4dcd4181855ba1d8d002
-Online key:      94a5cd8e2cdabb62dbd92d760e8dd177a27a2e42fc7d068744358d52bac05ed8
-Not before:      2026-03-30T05:53:29Z
-Not after:       2026-05-18T05:53:29Z
-Expires in:      986h34m4s
+Signature:       8aa232956ee7261165ae95809e369cb12feb58e6bbac3224779338e8d025cb02e2ac34792c4048c7bb25c193c0dd756d1183b91b44b7b40aa498179e71681b09
+Online key:      0f6001fb8528d1cf269aaf9e3c4da640ec9a44d64a2c62a18437ee00571f6d3f
+Not before:      2026-04-01T05:29:43Z
+Not after:       2026-05-20T05:29:43Z
+Expires in:      1007h59m33s
 Cert validity:   ok (midpoint within window)
 ```
 

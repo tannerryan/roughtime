@@ -19,16 +19,21 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
+	"github.com/tannerryan/roughtime/internal/version"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
@@ -38,14 +43,16 @@ var (
 	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
 	pubkey      = flag.String("pubkey", "", "base64-encoded Ed25519 root public key (with -addr)")
 	timeout     = flag.Duration("timeout", 5*time.Second, "UDP read/write timeout")
+	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
 // serverConfig matches the JSON schema used by the Roughtime ecosystem.
 type serverConfig struct {
-	Name      string `json:"name"`
-	Version   string `json:"version"`
-	PublicKey string `json:"publicKey"`
-	Addresses []struct {
+	Name          string `json:"name"`
+	Version       string `json:"version"`
+	PublicKeyType string `json:"publicKeyType"`
+	PublicKey     string `json:"publicKey"`
+	Addresses     []struct {
 		Protocol string `json:"protocol"`
 		Address  string `json:"address"`
 	} `json:"addresses"`
@@ -81,6 +88,10 @@ func (r result) inSync(localNow time.Time) bool {
 // main parses flags and runs the client.
 func main() {
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("roughtime-client", version.Version)
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "client: %s\n", err)
 		os.Exit(1)
@@ -237,14 +248,19 @@ func loadServers() ([]serverConfig, error) {
 	return nil, fmt.Errorf("provide -servers <file> or -addr <host:port> -pubkey <base64>")
 }
 
-// loadServersFile reads and parses a JSON server list.
+// loadServersFile reads and parses a JSON server list. The path is operator-
+// supplied via a CLI flag and is normalized with filepath.Clean before reading.
+// Unknown JSON fields are rejected so schema drift fails loudly.
 func loadServersFile(path string) ([]serverConfig, error) {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, fmt.Errorf("reading server list: %w", err)
 	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	dec.DisallowUnknownFields()
 	var list serverList
-	if err := json.Unmarshal(data, &list); err != nil {
+	if err := dec.Decode(&list); err != nil {
 		return nil, fmt.Errorf("parsing server list: %w", err)
 	}
 	if len(list.Servers) == 0 {
@@ -253,21 +269,38 @@ func loadServersFile(path string) ([]serverConfig, error) {
 	return list.Servers, nil
 }
 
-// ietfVersions lists all IETF versions to advertise in the VER tag. The server
-// picks the highest mutually supported version.
-var ietfVersions = []protocol.Version{
-	protocol.VersionDraft12,
-	protocol.VersionDraft11,
-	protocol.VersionDraft10,
-	protocol.VersionDraft08,
-	protocol.VersionDraft07,
-	protocol.VersionDraft06,
-	protocol.VersionDraft05,
-	protocol.VersionDraft01,
+// ietfVersions lists every IETF Roughtime version this client advertises in the
+// VER tag, newest first. It is derived from protocol.SupportedVersions so
+// adding a new draft to the protocol package automatically expands the client.
+var ietfVersions = func() []protocol.Version {
+	all := protocol.SupportedVersions()
+	out := make([]protocol.Version, len(all))
+	for i, v := range all {
+		out[len(all)-1-i] = v
+	}
+	return out
+}()
+
+// decodePubKey accepts an Ed25519 root public key encoded as standard base64,
+// URL base64, or lowercase hex (the three forms used by published Roughtime
+// ecosystem feeds). It returns an error unless the result is exactly 32 bytes.
+func decodePubKey(s string) ([]byte, error) {
+	for _, dec := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+		hex.DecodeString,
+	} {
+		if b, err := dec(s); err == nil && len(b) == ed25519.PublicKeySize {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("public key %q is not 32 bytes of base64 or hex", s)
 }
 
-// queryServer queries a single Roughtime server. For IETF servers it sends all
-// supported versions in one VER tag, letting the server pick the best match.
+// queryServer queries a single Roughtime server. For IETF servers it advertises
+// every supported version in one VER tag and lets the server pick.
 func queryServer(srv serverConfig) result {
 	r := result{Name: srv.Name}
 
@@ -277,24 +310,25 @@ func queryServer(srv serverConfig) result {
 	}
 	r.Address = srv.Addresses[0].Address
 
-	rootPK, err := base64.StdEncoding.DecodeString(srv.PublicKey)
+	rootPK, err := decodePubKey(srv.PublicKey)
 	if err != nil {
 		r.Err = fmt.Errorf("decoding public key: %w", err)
 		return r
 	}
 
-	if srv.Version == "Google-Roughtime" {
+	if strings.EqualFold(srv.Version, "Google-Roughtime") {
 		return queryOnce(srv.Name, r.Address, rootPK, []protocol.Version{protocol.VersionGoogle}, *timeout)
 	}
 
 	return queryOnce(srv.Name, r.Address, rootPK, ietfVersions, *timeout)
 }
 
-// queryOnce sends a single Roughtime request and verifies the response.
+// queryOnce sends one Roughtime request and verifies the response.
 func queryOnce(name, address string, rootPK []byte, versions []protocol.Version, timeout time.Duration) result {
 	r := result{Name: name, Address: address}
 
-	nonce, request, err := protocol.CreateRequest(versions, rand.Reader)
+	srv := protocol.ComputeSRV(rootPK)
+	nonce, request, err := protocol.CreateRequestWithSRV(versions, rand.Reader, srv)
 	if err != nil {
 		r.Err = fmt.Errorf("creating request: %w", err)
 		return r
@@ -313,15 +347,23 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 	}
 	defer conn.Close()
 
-	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		r.Err = fmt.Errorf("set write deadline: %w", err)
+		return r
+	}
 	start := time.Now()
 	if _, err := conn.Write(request); err != nil {
 		r.Err = fmt.Errorf("sending: %w", err)
 		return r
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	buf := make([]byte, 4096)
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		r.Err = fmt.Errorf("set read deadline: %w", err)
+		return r
+	}
+	// 65535 is the maximum UDP datagram payload; using less risks silent
+	// truncation on platforms where Read does not surface the truncation flag.
+	buf := make([]byte, 65535)
 	n, err := conn.Read(buf)
 	if err != nil {
 		r.Err = fmt.Errorf("reading: %w", err)

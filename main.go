@@ -18,12 +18,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/tannerryan/roughtime/internal/version"
 	"github.com/tannerryan/roughtime/protocol"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -36,11 +38,17 @@ var (
 	port               = flag.Int("port", 2002, "port to listen on")
 	rootKeySeedHexFile = flag.String("root-key", "", "hex-encoded private key seed")
 	logLevel           = flag.String("log-level", "info", "log level (debug, info, warn, error)")
+	showVersion        = flag.Bool("version", false, "print version and exit")
 )
 
 const (
-	// radius is the Roughtime uncertainty radius included in responses.
-	radius = time.Second
+	// radius is the Roughtime uncertainty radius. Drafts 10+ require RADI ≥ 3s
+	// in the absence of leap-second info.
+	radius = 3 * time.Second
+
+	// minRequestSize is the minimum on-the-wire request size; all drafts pad
+	// requests to 1024 bytes.
+	minRequestSize = 1024
 
 	// certStartOffset is how far before now the certificate validity begins.
 	certStartOffset = -7 * 24 * time.Hour
@@ -83,11 +91,13 @@ var (
 	statsDropped   atomic.Uint64
 )
 
-// certState holds the current online certificate and its expiry. It is swapped
-// atomically so the request path is lock-free.
+// certState holds the current online certificate, its expiry, and the
+// pre-computed SRV hash of the long-term root key. Swapped atomically so the
+// request path is lock-free.
 type certState struct {
-	cert   *protocol.Certificate
-	expiry time.Time
+	cert    *protocol.Certificate
+	expiry  time.Time
+	srvHash []byte
 }
 
 // request is a unit of work dispatched from the read loop to a worker.
@@ -108,6 +118,10 @@ var bufPool = sync.Pool{
 // main provisions the initial certificate and starts the UDP server.
 func main() {
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("roughtime", version.Version)
+		return
+	}
 	if *rootKeySeedHexFile == "" {
 		fmt.Fprintf(os.Stderr, "usage: roughtime -root-key <path> [-port <port>] [-log-level <level>]\n")
 		os.Exit(1)
@@ -125,10 +139,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "creating logger: %s\n", err)
 		os.Exit(1)
 	}
-	// Sync is wrapped because zap returns an error when stderr/stdout is a
-	// terminal on Unix ("inappropriate ioctl for device", ENOTTY); see
-	// uber-go/zap#328 and uber-go/zap#991. Ignoring the error here is the
-	// least-noisy idiomatic form.
+	// zap.Sync returns ENOTTY on a terminal stderr (uber-go/zap#328); ignore.
 	defer func() { _ = base.Sync() }()
 	logger = base.Named("roughtime")
 
@@ -143,70 +154,98 @@ func main() {
 	)
 
 	certLog := logger.Named("cert")
-	cert, onlinePK, expiry, err := provisionCertificateKey()
+	cert, onlinePK, rootPK, expiry, err := provisionCertificateKey()
 	if err != nil {
 		certLog.Fatal("provisioning initial certificate", zap.Error(err))
 	}
 	certLog.Info("provisioned initial certificate",
 		zap.String("online_pubkey", hex.EncodeToString(onlinePK)),
+		zap.String("root_pubkey", hex.EncodeToString(rootPK)),
 		zap.Time("expiry", expiry),
 		zap.Duration("validity", time.Until(expiry)),
 	)
 
 	state := &atomic.Pointer[certState]{}
-	state.Store(&certState{cert: cert, expiry: expiry})
-	go refreshLoop(certLog, state)
-	go statsLoop(logger.Named("stats"), state)
+	state.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	go refreshLoop(ctx, certLog, state)
+	go statsLoop(ctx, logger.Named("stats"), state)
 
 	if err := listen(ctx, state); err != nil {
 		logger.Fatal("running UDP server", zap.Error(err))
 	}
 }
 
-// provisionCertificateKey reads the root key seed from disk and signs a fresh
-// online delegation valid from certStartOffset to certEndOffset relative to
-// now. It returns the certificate, the online public key (for audit logging),
-// and the expiry.
-func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, time.Time, error) {
-	rootKeySeedHex, err := os.ReadFile(*rootKeySeedHexFile)
+// provisionCertificateKey reads the root key seed from disk, validates it, and
+// signs a fresh online delegation valid from certStartOffset to certEndOffset.
+// The seed buffer and derived private key are zeroized before return.
+func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed25519.PublicKey, time.Time, error) {
+	path := filepath.Clean(*rootKeySeedHexFile)
+
+	info, err := os.Stat(path)
 	if err != nil {
-		return nil, nil, time.Time{}, fmt.Errorf("opening root signing key file: %w", err)
+		return nil, nil, nil, time.Time{}, fmt.Errorf("stat root key file: %w", err)
 	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return nil, nil, nil, time.Time{}, fmt.Errorf("root key file %s has insecure mode %#o (must be 0600 or stricter)", path, mode)
+	}
+
+	rootKeySeedHex, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, nil, time.Time{}, fmt.Errorf("opening root signing key file: %w", err)
+	}
+	defer zeroize(rootKeySeedHex)
+
 	rootKeySeed, err := hex.DecodeString(string(bytes.TrimSpace(rootKeySeedHex)))
 	if err != nil {
-		return nil, nil, time.Time{}, fmt.Errorf("decoding root signing key seed: %w", err)
+		return nil, nil, nil, time.Time{}, fmt.Errorf("decoding root signing key seed: %w", err)
+	}
+	defer zeroize(rootKeySeed)
+	if len(rootKeySeed) != ed25519.SeedSize {
+		return nil, nil, nil, time.Time{}, fmt.Errorf("root key seed has %d bytes, want %d", len(rootKeySeed), ed25519.SeedSize)
 	}
 	rootSK := ed25519.NewKeyFromSeed(rootKeySeed)
+	defer zeroize(rootSK)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
 
 	onlinePK, onlineSK, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, nil, time.Time{}, fmt.Errorf("generating online signing key: %w", err)
+		return nil, nil, nil, time.Time{}, fmt.Errorf("generating online signing key: %w", err)
 	}
 
 	now := time.Now()
-	startTime := now.Add(certStartOffset)
-	endTime := now.Add(certEndOffset)
-
-	cert, err := protocol.NewCertificate(startTime, endTime, onlineSK, rootSK)
+	cert, err := protocol.NewCertificate(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
 	if err != nil {
-		return nil, nil, time.Time{}, fmt.Errorf("generating online certificate: %w", err)
+		return nil, nil, nil, time.Time{}, fmt.Errorf("generating online certificate: %w", err)
 	}
-	return cert, onlinePK, endTime, nil
+	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
 }
 
-// statsLoop emits a periodic Info-level summary of server activity. It runs for
-// the lifetime of the process; the final cumulative totals are emitted by the
-// listener's shutdown log.
-func statsLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
+// zeroize overwrites b with zeros. Used to wipe key material from memory.
+func zeroize(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// statsLoop emits a periodic Info-level summary of server activity until ctx is
+// cancelled.
+func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState]) {
+	defer recoverGoroutine(log, "stats")
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
 	log.Info("stats loop started", zap.Duration("interval", statsInterval))
 
 	var lastReceived, lastResponded, lastDropped uint64
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		r := statsReceived.Load()
 		s := statsResponded.Load()
 		d := statsDropped.Load()
@@ -220,11 +259,22 @@ func statsLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
 	}
 }
 
-// refreshLoop periodically checks whether the certificate is within
-// certRefreshThreshold of expiring and provisions a replacement. On failure it
-// retries no more frequently than refreshRetryCooldown. The supplied logger is
-// expected to be the named "cert" child logger.
-func refreshLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
+// recoverGoroutine logs and absorbs a panic so a single bad request or refresh
+// failure cannot crash the server.
+func recoverGoroutine(log *zap.Logger, where string) {
+	if r := recover(); r != nil {
+		log.Error("goroutine panic recovered",
+			zap.String("where", where),
+			zap.Any("panic", r),
+			zap.Stack("stack"),
+		)
+	}
+}
+
+// refreshLoop replaces the certificate as it approaches expiry, with a cooldown
+// between failed attempts. Exits when ctx is cancelled.
+func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState]) {
+	defer recoverGoroutine(log, "refreshLoop")
 	ticker := time.NewTicker(certCheckInterval)
 	defer ticker.Stop()
 	var lastAttempt time.Time
@@ -235,7 +285,13 @@ func refreshLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
 		zap.Duration("retry_cooldown", refreshRetryCooldown),
 	)
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
 		cur := state.Load()
 		if time.Until(cur.expiry) > certRefreshThreshold {
 			continue
@@ -250,7 +306,7 @@ func refreshLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
 			zap.Time("current_expiry", cur.expiry),
 			zap.Duration("remaining", time.Until(cur.expiry)),
 		)
-		newCert, newOnlinePK, newExpiry, err := provisionCertificateKey()
+		newCert, newOnlinePK, newRootPK, newExpiry, err := provisionCertificateKey()
 		if err != nil {
 			log.Error("certificate refresh failed",
 				zap.Error(err),
@@ -259,7 +315,7 @@ func refreshLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
 			)
 			continue
 		}
-		state.Store(&certState{cert: newCert, expiry: newExpiry})
+		state.Store(&certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)})
 		log.Info("certificate refreshed",
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),
 			zap.Time("previous_expiry", cur.expiry),
@@ -269,10 +325,9 @@ func refreshLoop(log *zap.Logger, state *atomic.Pointer[certState]) {
 	}
 }
 
-// listen starts the UDP server, spawns a fixed worker pool sized to the number
-// of CPUs, and dispatches incoming requests. If workers cannot keep up, excess
-// requests are dropped to maintain throughput. It shuts down gracefully when
-// ctx is cancelled, draining in-flight requests before returning.
+// listen runs the UDP server: a CPU-sized worker pool consumes a bounded queue,
+// excess requests are dropped, and the loop drains in-flight work on ctx
+// cancellation.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
 
@@ -299,10 +354,12 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		zap.Int("port", *port),
 	)
 
+	// On shutdown, set a past read deadline so the read loop unblocks cleanly
+	// without closing the socket from underneath in-flight workers.
 	go func() {
 		<-ctx.Done()
-		listenLog.Info("shutdown initiated, closing socket")
-		conn.Close()
+		listenLog.Info("shutdown initiated, unblocking reads")
+		_ = conn.SetReadDeadline(time.Unix(1, 0))
 	}()
 
 	for {
@@ -317,6 +374,16 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			continue
 		}
 		statsReceived.Add(1)
+		// Drop undersize packets without dispatching: every Roughtime draft
+		// requires client requests to be at least 1024 bytes (§5.1).
+		if reqLen < minRequestSize {
+			bufPool.Put(bufPtr)
+			statsDropped.Add(1)
+			if ce := listenLog.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
+				ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen))
+			}
+			continue
+		}
 		select {
 		case work <- request{bufPtr: bufPtr, len: reqLen, peer: peer}:
 		default:
@@ -333,6 +400,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	drainStart := time.Now()
 	close(work)
 	wg.Wait()
+	_ = conn.Close()
 	listenLog.Info("shutdown complete",
 		zap.Uint64("received_total", statsReceived.Load()),
 		zap.Uint64("responded_total", statsResponded.Load()),
@@ -342,21 +410,23 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	return nil
 }
 
-// worker drains the work channel and processes each request for the lifetime of
-// the server. It returns the read buffer to the pool after each request.
+// worker drains the work channel. A per-request recover absorbs panics so a
+// single bad input cannot kill the worker. handleRequest must not retain
+// req.bufPtr past return — it is returned to the pool here.
 func worker(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], work <-chan request) {
 	for req := range work {
-		handleRequest(log, conn, req.peer, (*req.bufPtr)[:req.len], state.Load().cert)
-		bufPool.Put(req.bufPtr)
+		func() {
+			defer recoverGoroutine(log, "worker")
+			defer bufPool.Put(req.bufPtr)
+			handleRequest(log, conn, req.peer, (*req.bufPtr)[:req.len], state.Load())
+		}()
 	}
 }
 
-// handleRequest parses a Roughtime request, negotiates the protocol version,
-// generates a signed response, and sends it back to the peer. Invalid or
-// unsupported requests are silently discarded, and responses larger than the
-// request are dropped to prevent amplification attacks. Per-request events are
-// emitted at Debug level so they are filtered out in production.
-func handleRequest(log *zap.Logger, conn *net.UDPConn, peer *net.UDPAddr, requestBytes []byte, cert *protocol.Certificate) {
+// handleRequest parses a request, validates SRV, negotiates a version, signs a
+// reply, and sends it. Invalid, unsupported, or amplifying requests are
+// silently discarded.
+func handleRequest(log *zap.Logger, conn *net.UDPConn, peer *net.UDPAddr, requestBytes []byte, st *certState) {
 	req, err := protocol.ParseRequest(requestBytes)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "request parse failed"); ce != nil {
@@ -368,6 +438,14 @@ func handleRequest(log *zap.Logger, conn *net.UDPConn, peer *net.UDPAddr, reques
 		}
 		return
 	}
+	// Drafts 13+ §5.1: if SRV is present, the server MUST ignore the request
+	// when the value does not address one of its long-term keys.
+	if req.SRV != nil && !bytes.Equal(req.SRV, st.srvHash) {
+		if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
+			ce.Write(zap.Stringer("peer", peer))
+		}
+		return
+	}
 	responseVer, err := protocol.SelectVersion(req.Versions, len(req.Nonce))
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "version negotiation failed"); ce != nil {
@@ -375,7 +453,7 @@ func handleRequest(log *zap.Logger, conn *net.UDPConn, peer *net.UDPAddr, reques
 		}
 		return
 	}
-	replies, err := protocol.CreateReplies(responseVer, []protocol.Request{*req}, time.Now(), radius, cert)
+	replies, err := protocol.CreateReplies(responseVer, []protocol.Request{*req}, time.Now(), radius, st.cert)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "creating reply failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
