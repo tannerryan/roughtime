@@ -5,4 +5,4 @@
 package version
 
 // Version is the current release of the roughtime module.
-const Version = "v1.4.0"
+const Version = "v1.4.1"

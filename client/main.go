@@ -122,7 +122,9 @@ func run() error {
 	var results []result
 	var pchain *protocol.Chain
 	if *chain {
-		results, pchain = queryChained(servers)
+		// Section 8.2: repeat the query sequence twice in the same order so
+		// every server is checked against every other in both directions.
+		results, pchain = queryChained(append(servers, servers...))
 	} else {
 		ch := make(chan result, len(servers))
 		for _, srv := range servers {
