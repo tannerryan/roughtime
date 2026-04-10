@@ -732,6 +732,15 @@ func TestDecodeRadiusRejectsShort(t *testing.T) {
 	}
 }
 
+// TestDecodeRadiusRejectsZero verifies that RADI=0 is rejected per §5.2.5.
+func TestDecodeRadiusRejectsZero(t *testing.T) {
+	for _, g := range []wireGroup{groupGoogle, groupD05, groupD10, groupD14} {
+		if _, err := decodeRadius(make([]byte, 4), g); err == nil {
+			t.Fatalf("expected error for RADI=0 with group %d", g)
+		}
+	}
+}
+
 // TestLeafHash verifies H(0x00 || data) for Google (64B) and IETF (32B).
 func TestLeafHash(t *testing.T) {
 	data := []byte("test input")
@@ -2051,6 +2060,19 @@ func TestVerifyMerkleRejectsTrailingINDXBits(t *testing.T) {
 	}
 }
 
+// TestVerifyMerkleRejectsLongPATH verifies that PATH with more than 32 entries
+// is rejected per §5.2.4.
+func TestVerifyMerkleRejectsLongPATH(t *testing.T) {
+	var indx [4]byte
+	resp := map[uint32][]byte{
+		TagINDX: indx[:],
+		TagPATH: make([]byte, 33*32), // 33 entries > max 32
+	}
+	if err := verifyMerkle(resp, make([]byte, 32), make([]byte, 32), groupD12); err == nil {
+		t.Fatal("expected error for PATH exceeding 32 entries")
+	}
+}
+
 // TestVerifyReplySREPRejectsCorruptSREP verifies that verifyReplySREP rejects
 // an un-decodable SREP body.
 func TestVerifyReplySREPRejectsCorruptSREP(t *testing.T) {
@@ -2431,5 +2453,53 @@ func TestVerifyReplyDetectsDowngrade(t *testing.T) {
 	reply := wrapPacket(replyMsg)
 	if _, _, err := VerifyReply(clientVers, reply, rootPK, nonce, req); err == nil {
 		t.Fatal("expected downgrade detection error")
+	}
+}
+
+// TestVerifyReplyRejectsResponseTYPENot1 verifies that a response with TYPE !=
+// 1 is rejected per §5.2.3: "Responses containing a TYPE tag with any other
+// value MUST be ignored by clients."
+func TestVerifyReplyRejectsResponseTYPENot1(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	clientVers := []Version{VersionDraft12}
+	nonce, req, _ := CreateRequest(clientVers, rand.Reader)
+	parsed, _ := ParseRequest(req)
+	g := groupD14
+	tree := newMerkleTree(g, [][]byte{parsed.RawPacket})
+	midpBuf := encodeTimestamp(time.Now(), g)
+	var radiBuf [4]byte
+	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second, g))
+	var verBuf [4]byte
+	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
+	srepTags := map[uint32][]byte{
+		TagRADI: radiBuf[:],
+		TagMIDP: midpBuf[:],
+		TagROOT: tree.rootHash,
+		TagVER:  verBuf[:],
+		TagVERS: supportedVersionsBytes,
+	}
+	srepBytes, _ := encode(srepTags)
+	toSign := make([]byte, len(responseCtx)+len(srepBytes))
+	copy(toSign, responseCtx)
+	copy(toSign[len(responseCtx):], srepBytes)
+	srepSig := ed25519.Sign(cert.onlineSK, toSign)
+	for _, badType := range []uint32{0, 2, 0xFFFFFFFF} {
+		typeBuf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(typeBuf, badType)
+		resp := map[uint32][]byte{
+			TagSIG:  srepSig,
+			TagSREP: srepBytes,
+			TagCERT: cert.certBytes(g),
+			TagPATH: nil,
+			TagINDX: make([]byte, 4),
+			TagNONC: nonce,
+			TagTYPE: typeBuf,
+		}
+		replyMsg, _ := encode(resp)
+		reply := wrapPacket(replyMsg)
+		if _, _, err := VerifyReply(clientVers, reply, rootPK, nonce, req); err == nil {
+			t.Fatalf("expected error for response TYPE=%d", badType)
+		}
 	}
 }

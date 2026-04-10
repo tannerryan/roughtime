@@ -51,18 +51,19 @@ const (
 	minRequestSize = 1024
 
 	// certStartOffset is how far before now the certificate validity begins.
-	certStartOffset = -7 * 24 * time.Hour
+	certStartOffset = -6 * time.Hour
 
-	// certEndOffset is how far after now the certificate validity ends.
-	certEndOffset = 42 * 24 * time.Hour
+	// certEndOffset is how far after now the certificate validity ends. Total
+	// DELE window is 24h (certStartOffset + certEndOffset).
+	certEndOffset = 18 * time.Hour
 
 	// certRefreshThreshold is the remaining validity at which a new certificate
 	// is provisioned.
-	certRefreshThreshold = 14 * 24 * time.Hour
+	certRefreshThreshold = 3 * time.Hour
 
 	// certCheckInterval is how often the refresh loop checks certificate
 	// expiry.
-	certCheckInterval = time.Hour
+	certCheckInterval = 15 * time.Minute
 
 	// refreshRetryCooldown is the minimum delay between failed refresh
 	// attempts.
@@ -89,6 +90,7 @@ var (
 	statsReceived  atomic.Uint64
 	statsResponded atomic.Uint64
 	statsDropped   atomic.Uint64
+	statsPanics    atomic.Uint64
 )
 
 // certState holds the current online certificate, its expiry, and the
@@ -119,14 +121,13 @@ var bufPool = sync.Pool{
 func main() {
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("roughtime", version.Version)
+		fmt.Printf("roughtime %s (github.com/tannerryan/roughtime)\n", version.Version)
 		return
 	}
 	if *rootKeySeedHexFile == "" {
 		fmt.Fprintf(os.Stderr, "usage: roughtime -root-key <path> [-port <port>] [-log-level <level>]\n")
 		os.Exit(1)
 	}
-
 	lvl, err := zapcore.ParseLevel(*logLevel)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "invalid -log-level %q: %s\n", *logLevel, err)
@@ -181,7 +182,7 @@ func main() {
 
 // provisionCertificateKey reads the root key seed from disk, validates it, and
 // signs a fresh online delegation valid from certStartOffset to certEndOffset.
-// The seed buffer and derived private key are zeroized before return.
+// The seed buffer and derived private key are cleared before return.
 func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed25519.PublicKey, time.Time, error) {
 	path := filepath.Clean(*rootKeySeedHexFile)
 
@@ -197,18 +198,18 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("opening root signing key file: %w", err)
 	}
-	defer zeroize(rootKeySeedHex)
+	defer clear(rootKeySeedHex)
 
 	rootKeySeed, err := hex.DecodeString(string(bytes.TrimSpace(rootKeySeedHex)))
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("decoding root signing key seed: %w", err)
 	}
-	defer zeroize(rootKeySeed)
+	defer clear(rootKeySeed)
 	if len(rootKeySeed) != ed25519.SeedSize {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("root key seed has %d bytes, want %d", len(rootKeySeed), ed25519.SeedSize)
 	}
 	rootSK := ed25519.NewKeyFromSeed(rootKeySeed)
-	defer zeroize(rootSK)
+	defer clear(rootSK)
 	rootPK := rootSK.Public().(ed25519.PublicKey)
 
 	onlinePK, onlineSK, err := ed25519.GenerateKey(rand.Reader)
@@ -224,13 +225,6 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
 }
 
-// zeroize overwrites b with zeros. Used to wipe key material from memory.
-func zeroize(b []byte) {
-	for i := range b {
-		b[i] = 0
-	}
-}
-
 // statsLoop emits a periodic Info-level summary of server activity until ctx is
 // cancelled.
 func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState]) {
@@ -239,7 +233,7 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 	defer ticker.Stop()
 	log.Info("stats loop started", zap.Duration("interval", statsInterval))
 
-	var lastReceived, lastResponded, lastDropped uint64
+	var lastReceived, lastResponded, lastDropped, lastPanics uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -249,13 +243,15 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 		r := statsReceived.Load()
 		s := statsResponded.Load()
 		d := statsDropped.Load()
+		p := statsPanics.Load()
 		log.Info("stats",
 			zap.Uint64("received", r-lastReceived),
 			zap.Uint64("responded", s-lastResponded),
 			zap.Uint64("dropped", d-lastDropped),
+			zap.Uint64("panics", p-lastPanics),
 			zap.Duration("cert_remaining", time.Until(state.Load().expiry)),
 		)
-		lastReceived, lastResponded, lastDropped = r, s, d
+		lastReceived, lastResponded, lastDropped, lastPanics = r, s, d, p
 	}
 }
 
@@ -263,6 +259,7 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 // failure cannot crash the server.
 func recoverGoroutine(log *zap.Logger, where string) {
 	if r := recover(); r != nil {
+		statsPanics.Add(1)
 		log.Error("goroutine panic recovered",
 			zap.String("where", where),
 			zap.Any("panic", r),
@@ -405,6 +402,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		zap.Uint64("received_total", statsReceived.Load()),
 		zap.Uint64("responded_total", statsResponded.Load()),
 		zap.Uint64("dropped_total", statsDropped.Load()),
+		zap.Uint64("panics_total", statsPanics.Load()),
 		zap.Duration("drain_duration", time.Since(drainStart)),
 	)
 	return nil

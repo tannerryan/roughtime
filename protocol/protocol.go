@@ -334,6 +334,9 @@ func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 		return 0, errors.New("protocol: RADI must be 4 bytes")
 	}
 	v := binary.LittleEndian.Uint32(buf)
+	if v == 0 {
+		return 0, errors.New("protocol: RADI must not be zero")
+	}
 	if g == groupGoogle || usesMJDMicroseconds(g) {
 		return time.Duration(v) * time.Microsecond, nil
 	}
@@ -1101,7 +1104,12 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 			if !versionOffered(respVer, versions) {
 				return time.Time{}, 0, errors.New("protocol: server chose version not offered by client")
 			}
-			_, hasRespType := resp[TagTYPE]
+			respTypeBytes, hasRespType := resp[TagTYPE]
+			if hasRespType {
+				if len(respTypeBytes) != 4 || binary.LittleEndian.Uint32(respTypeBytes) != 1 {
+					return time.Time{}, 0, errors.New("protocol: response TYPE must be 1")
+				}
+			}
 			g = wireGroupOf(respVer, hasRespType)
 		}
 	}
@@ -1365,6 +1373,9 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 	hs := hashSize(g)
 	if len(pathBytes)%hs != 0 {
 		return errors.New("protocol: PATH length not a multiple of hash size")
+	}
+	if len(pathBytes)/hs > 32 {
+		return errors.New("protocol: PATH exceeds 32 hash values")
 	}
 
 	hash := leafHash(g, leafInput)

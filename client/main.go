@@ -11,11 +11,11 @@
 //
 // Multiple servers:
 //
-//	go run client/main.go -servers ecosystem.json
+//	go run client/main.go -servers client/ecosystem.json
 //
 // Single server from a JSON list:
 //
-//	go run client/main.go -servers ecosystem.json -name time.txryan.com
+//	go run client/main.go -servers client/ecosystem.json -name time.txryan.com
 package main
 
 import (
@@ -43,6 +43,7 @@ var (
 	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
 	pubkey      = flag.String("pubkey", "", "base64-encoded Ed25519 root public key (with -addr)")
 	timeout     = flag.Duration("timeout", 5*time.Second, "UDP read/write timeout")
+	chain       = flag.Bool("chain", true, "chain queries: derive each nonce from the previous reply")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
@@ -68,6 +69,7 @@ type result struct {
 	Name     string
 	Address  string
 	Midpoint time.Time
+	LocalNow time.Time
 	Radius   time.Duration
 	RTT      time.Duration
 	Version  protocol.Version
@@ -77,8 +79,8 @@ type result struct {
 // inSync reports whether the local clock falls within the server's uncertainty
 // window. The bound is radius + RTT/2 because the server's observation could
 // have happened anywhere during the round trip.
-func (r result) inSync(localNow time.Time) bool {
-	drift := r.Midpoint.Sub(localNow)
+func (r result) inSync() bool {
+	drift := r.Midpoint.Sub(r.LocalNow)
 	if drift < 0 {
 		drift = -drift
 	}
@@ -89,7 +91,7 @@ func (r result) inSync(localNow time.Time) bool {
 func main() {
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("roughtime-client", version.Version)
+		fmt.Printf("roughtime-client %s (github.com/tannerryan/roughtime)\n", version.Version)
 		return
 	}
 	if err := run(); err != nil {
@@ -114,31 +116,39 @@ func run() error {
 		return nil
 	}
 
-	// Stream results as each server responds
-	ch := make(chan result, len(servers))
-	for _, srv := range servers {
-		go func(srv serverConfig) {
-			ch <- queryServer(srv)
-		}(srv)
-	}
-
 	const rowFmt = "%-30s  %-30s  %-14s  %-20s  %-8s  %-10s  %-12s  %s\n"
 	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
 
+	var results []result
+	var pchain *protocol.Chain
+	if *chain {
+		// Section 8.2: repeat the query sequence twice in the same order so
+		// every server is checked against every other in both directions.
+		results, pchain = queryChained(append(servers, servers...))
+	} else {
+		ch := make(chan result, len(servers))
+		for _, srv := range servers {
+			go func(srv serverConfig) {
+				ch <- queryServer(srv)
+			}(srv)
+		}
+		for range servers {
+			results = append(results, <-ch)
+		}
+	}
+
 	var drifts []time.Duration
 	var succeeded, failed int
-	for range servers {
-		r := <-ch
+	for _, r := range results {
 		if r.Err != nil {
 			fmt.Printf("%-30s  %-30s  error: %s\n", r.Name, r.Address, r.Err)
 			failed++
 			continue
 		}
-		localNow := time.Now()
-		drift := r.Midpoint.Sub(localNow)
+		drift := r.Midpoint.Sub(r.LocalNow)
 		drifts = append(drifts, drift)
 		status := "out-of-sync"
-		if r.inSync(localNow) {
+		if r.inSync() {
 			status = "in-sync"
 		}
 		fmt.Printf(rowFmt,
@@ -156,6 +166,9 @@ func run() error {
 
 	fmt.Printf("\n%d/%d servers responded\n", succeeded, succeeded+failed)
 	printConsensus(drifts)
+	if pchain != nil && len(pchain.Links) > 0 {
+		printChainStatus(pchain)
+	}
 	if succeeded == 0 {
 		return fmt.Errorf("no servers responded")
 	}
@@ -165,11 +178,10 @@ func run() error {
 // printSingleResult prints a verbose vertical summary of a single verified
 // server response.
 func printSingleResult(r result) {
-	localNow := time.Now()
 	windowStart := r.Midpoint.Add(-r.Radius).UTC().Format(time.RFC3339)
 	windowEnd := r.Midpoint.Add(r.Radius).UTC().Format(time.RFC3339)
 	status := "out-of-sync"
-	if r.inSync(localNow) {
+	if r.inSync() {
 		status = "in-sync"
 	}
 	// In -addr mode Name and Address are identical; skip the redundant line.
@@ -182,8 +194,8 @@ func printSingleResult(r result) {
 	fmt.Printf("Radius:    %s\n", r.Radius)
 	fmt.Printf("Window:    [%s, %s]\n", windowStart, windowEnd)
 	fmt.Printf("RTT:       %s\n", r.RTT.Round(time.Millisecond))
-	fmt.Printf("Local:     %s\n", localNow.UTC().Format(time.RFC3339Nano))
-	fmt.Printf("Drift:     %s\n", r.Midpoint.Sub(localNow).Round(time.Millisecond))
+	fmt.Printf("Local:     %s\n", r.LocalNow.UTC().Format(time.RFC3339Nano))
+	fmt.Printf("Drift:     %s\n", r.Midpoint.Sub(r.LocalNow).Round(time.Millisecond))
 	fmt.Printf("Status:    %s\n", status)
 }
 
@@ -204,6 +216,16 @@ func printConsensus(drifts []time.Duration) {
 		lo.Round(time.Millisecond),
 		hi.Round(time.Millisecond),
 	)
+}
+
+// printChainStatus verifies the chain and prints the result.
+func printChainStatus(c *protocol.Chain) {
+	err := c.Verify()
+	if err == nil {
+		fmt.Printf("Chain:              ok (%d links verified)\n", len(c.Links))
+	} else {
+		fmt.Printf("Chain:              FAILED: %s\n", err)
+	}
 }
 
 // medianDuration returns the median of a slice of durations without mutating
@@ -323,6 +345,108 @@ func queryServer(srv serverConfig) result {
 	return queryOnce(srv.Name, r.Address, rootPK, ietfVersions, *timeout)
 }
 
+// queryChained queries servers sequentially using protocol.Chain, deriving each
+// nonce from the previous response per Section 8.2. Results are returned in
+// server order.
+func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
+	var c protocol.Chain
+	results := make([]result, len(servers))
+
+	for i, srv := range servers {
+		r := &results[i]
+		r.Name = srv.Name
+		if len(srv.Addresses) == 0 {
+			r.Err = fmt.Errorf("no addresses")
+			continue
+		}
+		r.Address = srv.Addresses[0].Address
+
+		rootPK, err := decodePubKey(srv.PublicKey)
+		if err != nil {
+			r.Err = fmt.Errorf("decoding public key: %w", err)
+			continue
+		}
+
+		versions := ietfVersions
+		if strings.EqualFold(srv.Version, "Google-Roughtime") {
+			versions = []protocol.Version{protocol.VersionGoogle}
+		}
+
+		link, err := c.NextRequest(versions, rootPK, rand.Reader)
+		if err != nil {
+			r.Err = fmt.Errorf("creating chained request: %w", err)
+			continue
+		}
+
+		reply, rtt, localNow, err := sendRequest(r.Address, link.Request, *timeout)
+		if err != nil {
+			r.Err = err
+			continue
+		}
+		r.RTT = rtt
+		r.LocalNow = localNow
+		link.Response = reply
+
+		parsed, err := protocol.ParseRequest(link.Request)
+		if err != nil {
+			r.Err = fmt.Errorf("parsing chained request: %w", err)
+			continue
+		}
+
+		midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPK, parsed.Nonce, link.Request)
+		if err != nil {
+			r.Err = fmt.Errorf("verification: %w", err)
+			continue
+		}
+
+		// Append only after verification so a bad response doesn't poison the
+		// nonce derivation for subsequent links.
+		c.Append(link)
+
+		r.Midpoint = midpoint
+		r.Radius = radius
+		if ver, ok := protocol.ExtractVersion(reply); ok {
+			r.Version = ver
+		} else {
+			r.Version = slices.Max(versions)
+		}
+	}
+
+	return results, &c
+}
+
+// sendRequest sends a raw Roughtime request packet and returns the reply, RTT,
+// and the local time captured immediately after receiving the response.
+func sendRequest(address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
+	raddr, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("resolving %s: %w", address, err)
+	}
+	conn, err := net.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("dialing %s: %w", address, err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("set write deadline: %w", err)
+	}
+	start := time.Now()
+	if _, err := conn.Write(request); err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("sending: %w", err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("set read deadline: %w", err)
+	}
+	buf := make([]byte, 65535)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("reading: %w", err)
+	}
+	return buf[:n], time.Since(start), time.Now(), nil
+}
+
 // queryOnce sends one Roughtime request and verifies the response.
 func queryOnce(name, address string, rootPK []byte, versions []protocol.Version, timeout time.Duration) result {
 	r := result{Name: name, Address: address}
@@ -334,44 +458,15 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 		return r
 	}
 
-	raddr, err := net.ResolveUDPAddr("udp", address)
+	reply, rtt, localNow, err := sendRequest(address, request, timeout)
 	if err != nil {
-		r.Err = fmt.Errorf("resolving %s: %w", address, err)
+		r.Err = err
 		return r
 	}
+	r.RTT = rtt
+	r.LocalNow = localNow
 
-	conn, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		r.Err = fmt.Errorf("dialing %s: %w", address, err)
-		return r
-	}
-	defer conn.Close()
-
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		r.Err = fmt.Errorf("set write deadline: %w", err)
-		return r
-	}
-	start := time.Now()
-	if _, err := conn.Write(request); err != nil {
-		r.Err = fmt.Errorf("sending: %w", err)
-		return r
-	}
-
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		r.Err = fmt.Errorf("set read deadline: %w", err)
-		return r
-	}
-	// 65535 is the maximum UDP datagram payload; using less risks silent
-	// truncation on platforms where Read does not surface the truncation flag.
-	buf := make([]byte, 65535)
-	n, err := conn.Read(buf)
-	if err != nil {
-		r.Err = fmt.Errorf("reading: %w", err)
-		return r
-	}
-	r.RTT = time.Since(start)
-
-	midpoint, radius, err := protocol.VerifyReply(versions, buf[:n], rootPK, nonce, request)
+	midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPK, nonce, request)
 	if err != nil {
 		r.Err = fmt.Errorf("verification: %w", err)
 		return r
@@ -379,7 +474,7 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 
 	r.Midpoint = midpoint
 	r.Radius = radius
-	if ver, ok := protocol.ExtractVersion(buf[:n]); ok {
+	if ver, ok := protocol.ExtractVersion(reply); ok {
 		r.Version = ver
 	} else {
 		r.Version = slices.Max(versions)
