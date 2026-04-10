@@ -7,8 +7,7 @@
 //
 // Usage:
 //
-//	go run debug/main.go -addr time.txryan.com:2002 \
-//	                     -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+//	go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 package main
 
 import (
@@ -39,6 +38,7 @@ var (
 type probeResult struct {
 	version  protocol.Version
 	midpoint time.Time
+	localNow time.Time
 	radius   time.Duration
 	rtt      time.Duration
 	request  []byte
@@ -51,7 +51,7 @@ type probeResult struct {
 func main() {
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("roughtime-debug", version.Version)
+		fmt.Printf("roughtime-debug %s (github.com/tannerryan/roughtime)\n", version.Version)
 		return
 	}
 	if *addr == "" || *pubkey == "" {
@@ -165,6 +165,7 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 		return r
 	}
 	r.rtt = time.Since(start)
+	r.localNow = time.Now()
 	r.reply = buf[:n]
 
 	midpoint, radius, err := protocol.VerifyReply(versions, r.reply, rootPK, nonce, request)
@@ -278,13 +279,12 @@ func printResponse(r probeResult, tags map[uint32][]byte) {
 // printVerified prints the verified result summary, including the amplification
 // check that Roughtime requires of every server response.
 func printVerified(r probeResult) {
-	localNow := time.Now()
 	fmt.Printf("=== Verified Result ===\n")
 	fmt.Printf("Round-trip time: %s\n", r.rtt)
 	fmt.Printf("Midpoint:        %s\n", r.midpoint.UTC().Format(time.RFC3339))
 	fmt.Printf("Radius:          %s\n", r.radius)
-	fmt.Printf("Local time:      %s\n", localNow.UTC().Format(time.RFC3339Nano))
-	fmt.Printf("Clock drift:     %s\n", r.midpoint.Sub(localNow).Round(time.Millisecond))
+	fmt.Printf("Local time:      %s\n", r.localNow.UTC().Format(time.RFC3339Nano))
+	fmt.Printf("Clock drift:     %s\n", r.midpoint.Sub(r.localNow).Round(time.Millisecond))
 	if len(r.reply) <= len(r.request) {
 		fmt.Printf("Amplification:   ok (reply %d ≤ request %d)\n", len(r.reply), len(r.request))
 	} else {
