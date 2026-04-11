@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tannerryan/roughtime/internal/version"
 	"github.com/tannerryan/roughtime/protocol"
@@ -225,6 +226,8 @@ func run() error {
 // printSingleResult prints a verbose vertical summary of a single verified
 // server response.
 func printSingleResult(r result) {
+	safeName := sanitize(r.Name)
+	safeAddress := sanitize(r.Address)
 	windowStart := r.Midpoint.Add(-r.Radius).UTC().Format(time.RFC3339)
 	windowEnd := r.Midpoint.Add(r.Radius).UTC().Format(time.RFC3339)
 	status := "out-of-sync"
@@ -232,10 +235,10 @@ func printSingleResult(r result) {
 		status = "in-sync"
 	}
 	// In -addr mode Name and Address are identical; skip the redundant line.
-	if r.Name != r.Address {
-		fmt.Printf("Server:    %s\n", r.Name)
+	if safeName != safeAddress {
+		fmt.Printf("Server:    %s\n", safeName)
 	}
-	fmt.Printf("Address:   %s\n", r.Address)
+	fmt.Printf("Address:   %s\n", safeAddress)
 	fmt.Printf("Version:   %s\n", r.Version)
 	fmt.Printf("Midpoint:  %s\n", r.Midpoint.UTC().Format(time.RFC3339))
 	fmt.Printf("Radius:    %s\n", r.Radius)
@@ -344,8 +347,10 @@ func loadServersFile(path string) ([]serverConfig, error) {
 
 // sanitize strips control characters from untrusted input.
 func sanitize(s string) string {
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
+		if unicode.IsControl(r) {
 			return -1
 		}
 		return r

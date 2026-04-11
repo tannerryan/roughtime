@@ -4365,3 +4365,234 @@ func FuzzGrease(f *testing.F) {
 		Grease(data, Version(verRaw))
 	})
 }
+
+// TestNoncInSREPExported verifies that the exported NoncInSREP wrapper agrees
+// with the internal noncInSREP for every (version, hasType) combination.
+func TestNoncInSREPExported(t *testing.T) {
+	versions := []Version{
+		VersionGoogle, VersionDraft01, VersionDraft02, VersionDraft03,
+		VersionDraft04, VersionDraft05, VersionDraft07, VersionDraft08,
+		VersionDraft10, VersionDraft12,
+	}
+	for _, v := range versions {
+		for _, hasType := range []bool{false, true} {
+			want := noncInSREP(wireGroupOf(v, hasType))
+			if got := NoncInSREP(v, hasType); got != want {
+				t.Errorf("NoncInSREP(%s, %v) = %v, want %v", v, hasType, got, want)
+			}
+		}
+	}
+	// Sanity check: only drafts 01–02 place NONC inside SREP.
+	if !NoncInSREP(VersionDraft01, false) || !NoncInSREP(VersionDraft02, false) {
+		t.Fatal("drafts 01 and 02 must report NONC-in-SREP")
+	}
+	if NoncInSREP(VersionDraft12, true) {
+		t.Fatal("draft 12 must not report NONC-in-SREP")
+	}
+}
+
+// TestSupportedExported verifies that the exported Supported() returns every
+// IETF version (newest first) followed by VersionGoogle as the final entry.
+func TestSupportedExported(t *testing.T) {
+	got := Supported()
+	if len(got) != len(supportedVersions)+1 {
+		t.Fatalf("len(Supported()) = %d, want %d", len(got), len(supportedVersions)+1)
+	}
+	if got[len(got)-1] != VersionGoogle {
+		t.Fatalf("last entry = %s, want VersionGoogle", got[len(got)-1])
+	}
+	// IETF entries must be in descending order.
+	for i := 1; i < len(got)-1; i++ {
+		if got[i] >= got[i-1] {
+			t.Fatalf("IETF entries not descending at index %d: %s >= %s", i, got[i], got[i-1])
+		}
+	}
+	// Mutating the returned slice must not affect future calls.
+	got[0] = VersionGoogle
+	if Supported()[0] == VersionGoogle {
+		t.Fatal("Supported() must return a defensive copy")
+	}
+}
+
+// TestCertBytesPanicsOnCacheMiss verifies that certBytes panics with a clear
+// message when the certificate cache lacks an entry — a programming-error guard
+// rather than a runtime input check.
+func TestCertBytesPanicsOnCacheMiss(t *testing.T) {
+	c := &Certificate{cache: map[certCacheKey][]byte{}}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on cache miss")
+		}
+		msg, ok := r.(string)
+		if !ok || !bytes.Contains([]byte(msg), []byte("cache miss")) {
+			t.Fatalf("unexpected panic value: %v", r)
+		}
+	}()
+	_ = c.certBytes(groupD12)
+}
+
+// TestVerifyNoVersionDowngradeBranches exercises every error branch in
+// verifyNoVersionDowngrade that's not already covered by integration tests.
+func TestVerifyNoVersionDowngradeBranches(t *testing.T) {
+	srepWithVER := func(ver Version, vers ...Version) map[uint32][]byte {
+		verBuf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(verBuf, uint32(ver))
+		versBuf := make([]byte, 4*len(vers))
+		for i, v := range vers {
+			binary.LittleEndian.PutUint32(versBuf[4*i:], uint32(v))
+		}
+		return map[uint32][]byte{TagVER: verBuf, TagVERS: versBuf}
+	}
+
+	t.Run("nil srep", func(t *testing.T) {
+		if err := verifyNoVersionDowngrade(nil, []Version{VersionDraft12}); err == nil {
+			t.Fatal("expected error for nil srep")
+		}
+	})
+
+	t.Run("missing VER", func(t *testing.T) {
+		srep := map[uint32][]byte{TagVERS: make([]byte, 4)}
+		if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft12}); err == nil {
+			t.Fatal("expected error for missing VER")
+		}
+	})
+
+	t.Run("short VER", func(t *testing.T) {
+		srep := map[uint32][]byte{TagVER: {1, 2, 3}, TagVERS: make([]byte, 4)}
+		if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft12}); err == nil {
+			t.Fatal("expected error for short VER")
+		}
+	})
+
+	t.Run("missing VERS", func(t *testing.T) {
+		srep := map[uint32][]byte{TagVER: make([]byte, 4)}
+		if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft12}); err == nil {
+			t.Fatal("expected error for missing VERS")
+		}
+	})
+
+	t.Run("malformed VERS length", func(t *testing.T) {
+		srep := map[uint32][]byte{TagVER: make([]byte, 4), TagVERS: {1, 2, 3}}
+		if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft12}); err == nil {
+			t.Fatal("expected error for malformed VERS length")
+		}
+	})
+
+	t.Run("no mutual version", func(t *testing.T) {
+		srep := srepWithVER(VersionDraft12, VersionDraft12)
+		if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft08}); err == nil {
+			t.Fatal("expected error when client and server share nothing")
+		}
+	})
+
+	t.Run("downgrade detected", func(t *testing.T) {
+		// Server claims to support both 10 and 12 but chose 10 — a downgrade
+		// when the client also supports 12.
+		srep := srepWithVER(VersionDraft10, VersionDraft10, VersionDraft12)
+		err := verifyNoVersionDowngrade(srep, []Version{VersionDraft10, VersionDraft12})
+		if err == nil {
+			t.Fatal("expected downgrade error")
+		}
+	})
+
+	t.Run("happy path", func(t *testing.T) {
+		srep := srepWithVER(VersionDraft12, VersionDraft10, VersionDraft12)
+		if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft10, VersionDraft12}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+// TestGreaseDropTagOnGarbageBody verifies that greaseDropTag returns nil when
+// the response body cannot be decoded.
+func TestGreaseDropTagOnGarbageBody(t *testing.T) {
+	// A draft-08 reply has the ROUGHTIM header followed by the body. Build a
+	// header with a body length > 0 but garbage body bytes that will fail to
+	// decode.
+	header := make([]byte, 12)
+	copy(header[:8], []byte("ROUGHTIM"))
+	binary.LittleEndian.PutUint32(header[8:12], 4)
+	reply := append(header, []byte{0xff, 0xff, 0xff, 0xff}...)
+	if got := greaseDropTag(reply, VersionDraft08); got != nil {
+		t.Fatalf("expected nil for garbage body, got %d bytes", len(got))
+	}
+}
+
+// TestGreaseDropTagNoCandidates verifies that greaseDropTag returns nil when
+// the response body decodes but contains none of the mandatory tags it would
+// otherwise drop (SIG/SREP/CERT/PATH/INDX).
+func TestGreaseDropTagNoCandidates(t *testing.T) {
+	body, err := encode(map[uint32][]byte{TagNONC: make([]byte, 32)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := make([]byte, 12)
+	copy(header[:8], []byte("ROUGHTIM"))
+	binary.LittleEndian.PutUint32(header[8:12], uint32(len(body)))
+	reply := append(header, body...)
+	if got := greaseDropTag(reply, VersionDraft08); got != nil {
+		t.Fatalf("expected nil when no candidate tags exist, got %d bytes", len(got))
+	}
+}
+
+// TestFindTagRangeMalformed exercises the malformed-input branches of
+// findTagRange directly with crafted byte slices.
+func TestFindTagRangeMalformed(t *testing.T) {
+	t.Run("too short", func(t *testing.T) {
+		if _, _, ok := findTagRange([]byte{1, 2, 3}, TagNONC); ok {
+			t.Fatal("expected ok=false for <4 byte msg")
+		}
+	})
+	t.Run("zero tag count", func(t *testing.T) {
+		msg := make([]byte, 4)
+		if _, _, ok := findTagRange(msg, TagNONC); ok {
+			t.Fatal("expected ok=false for zero tag count")
+		}
+	})
+	t.Run("oversized tag count", func(t *testing.T) {
+		msg := make([]byte, 4)
+		binary.LittleEndian.PutUint32(msg, 513)
+		if _, _, ok := findTagRange(msg, TagNONC); ok {
+			t.Fatal("expected ok=false for tag count > 512")
+		}
+	})
+	t.Run("truncated header", func(t *testing.T) {
+		// n=2 means tagsOff=8, valsOff=16, but we only supply 8 bytes total.
+		msg := make([]byte, 8)
+		binary.LittleEndian.PutUint32(msg, 2)
+		if _, _, ok := findTagRange(msg, TagNONC); ok {
+			t.Fatal("expected ok=false for truncated header")
+		}
+	})
+	t.Run("tag not found", func(t *testing.T) {
+		msg := make([]byte, 8)
+		binary.LittleEndian.PutUint32(msg, 1)
+		binary.LittleEndian.PutUint32(msg[4:], TagNONC)
+		if _, _, ok := findTagRange(msg, TagSIG); ok {
+			t.Fatal("expected ok=false when tag absent")
+		}
+	})
+	t.Run("last tag with values", func(t *testing.T) {
+		// Encode a real two-tag message and look up the last tag, exercising
+		// the idx == n-1 branch where hi is derived from len(msg).
+		body, err := encode(map[uint32][]byte{
+			TagNONC: bytes.Repeat([]byte{0x11}, 32),
+			TagPAD:  bytes.Repeat([]byte{0x22}, 8),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// PAD sorts after NONC, so PAD is the last tag.
+		lo, hi, ok := findTagRange(body, TagPAD)
+		if !ok {
+			t.Fatal("expected to find PAD")
+		}
+		if hi-lo != 8 {
+			t.Fatalf("PAD length = %d, want 8", hi-lo)
+		}
+		if !bytes.Equal(body[lo:hi], bytes.Repeat([]byte{0x22}, 8)) {
+			t.Fatal("PAD value mismatch")
+		}
+	})
+}

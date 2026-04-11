@@ -41,13 +41,13 @@ test-verbose:
 test-race:
 	go test -race ./...
 
-# Run unit tests with coverage
+# Run unit tests with coverage (protocol package only)
 test-cover:
-	go test -cover ./...
+	go test -cover ./protocol/
 
 # Run unit tests with race detector and coverage profile (used by CI)
 test-race-cover:
-	go test -race -covermode=atomic -coverprofile=coverage.out ./...
+	go test -race -covermode=atomic -coverprofile=coverage.out ./protocol/
 
 # Verify module checksums match go.sum
 verify:

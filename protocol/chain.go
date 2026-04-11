@@ -187,13 +187,13 @@ func (c *Chain) Verify() error {
 }
 
 // malfeasanceReport is the JSON structure for malfeasance reporting in drafts
-// 14+ (Section 8.4). Drafts 10–11 used a simpler {nonces, responses} format
+// 12+ (Section 8.4). Drafts 10–11 used a simpler {nonces, responses} format
 // (Section 9.3); see malfeasanceReportLegacy.
 type malfeasanceReport struct {
 	Responses []malfeasanceLink `json:"responses"`
 }
 
-// malfeasanceLink is one entry in a drafts-14+ malfeasance report.
+// malfeasanceLink is one entry in a drafts-12+ malfeasance report.
 type malfeasanceLink struct {
 	Rand      string `json:"rand,omitempty"`
 	PublicKey string `json:"publicKey"`
@@ -232,14 +232,14 @@ func (c *Chain) MalfeasanceReport() ([]byte, error) {
 }
 
 // ParseMalfeasanceReport deserializes a JSON malfeasance report into a Chain.
-// Both the drafts 14+ format (Section 8.4) and the legacy drafts 10–11 format
+// Both the drafts 12+ format (Section 8.4) and the legacy drafts 10–11 format
 // (Section 9.3) are accepted. Legacy reports yield links with Rand and Response
 // populated but no Request or PublicKey, so [Chain.Verify] cannot be used on
 // them.
 func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	const maxChainLinks = 1024
 
-	// Detect format: the drafts 14+ format has an object in responses[0]; the
+	// Detect format: the drafts 12+ format has an object in responses[0]; the
 	// legacy format has a string in responses[0] and a top-level "nonces" key.
 	var probe struct {
 		Nonces    json.RawMessage   `json:"nonces"`

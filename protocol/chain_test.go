@@ -966,3 +966,120 @@ func FuzzChainVerify(f *testing.F) {
 		_ = c.Verify()
 	})
 }
+
+// errReader is an io.Reader that always returns the configured error.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestChainNonceRejectsEmptyVersions verifies that ChainNonce surfaces the
+// "empty version list" error from clientVersionPreference instead of panicking.
+func TestChainNonceRejectsEmptyVersions(t *testing.T) {
+	if _, _, err := ChainNonce(nil, rand.Reader, nil); err == nil {
+		t.Fatal("expected error for empty versions")
+	}
+}
+
+// TestChainNonceFirstReadError verifies that an entropy reader failure on the
+// first link is wrapped with a useful message.
+func TestChainNonceFirstReadError(t *testing.T) {
+	want := errors.New("entropy boom")
+	_, _, err := ChainNonce(nil, errReader{want}, []Version{VersionDraft12})
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("expected wrapped %v, got %v", want, err)
+	}
+}
+
+// TestChainNonceDerivedReadError verifies that an entropy reader failure on a
+// derived link is wrapped with a useful message.
+func TestChainNonceDerivedReadError(t *testing.T) {
+	want := errors.New("entropy boom")
+	prev := []byte("previous response")
+	_, _, err := ChainNonce(prev, errReader{want}, []Version{VersionDraft12})
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("expected wrapped %v, got %v", want, err)
+	}
+}
+
+// TestNextRequestRejectsEmptyVersions verifies that NextRequest surfaces the
+// version preference error.
+func TestNextRequestRejectsEmptyVersions(t *testing.T) {
+	rootSK, _ := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	var c Chain
+	if _, err := c.NextRequest(nil, rootPK, rand.Reader); err == nil {
+		t.Fatal("expected error for empty versions")
+	}
+}
+
+// TestNextRequestEntropyError verifies that an entropy failure during
+// NextRequest is propagated.
+func TestNextRequestEntropyError(t *testing.T) {
+	rootSK, _ := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	var c Chain
+	_, err := c.NextRequest([]Version{VersionDraft12}, rootPK, errReader{errors.New("no entropy")})
+	if err == nil {
+		t.Fatal("expected entropy error")
+	}
+}
+
+// TestParseMalfeasanceReportRejectsTooManyLinks verifies that the parser caps
+// the number of links to prevent unbounded allocation.
+func TestParseMalfeasanceReportRejectsTooManyLinks(t *testing.T) {
+	const n = 1025
+	entries := make([]string, n)
+	for i := range entries {
+		entries[i] = `""`
+	}
+	data := []byte(`{"nonces":[` + joinStrings(entries) + `],"responses":[` + joinStrings(entries) + `]}`)
+	if _, err := ParseMalfeasanceReport(data); err == nil {
+		t.Fatal("expected error for too many links")
+	}
+}
+
+// joinStrings is a tiny helper to avoid pulling in strings just for one call.
+func joinStrings(parts []string) string {
+	var b []byte
+	for i, p := range parts {
+		if i > 0 {
+			b = append(b, ',')
+		}
+		b = append(b, p...)
+	}
+	return string(b)
+}
+
+// TestParseMalfeasanceReportLegacyBadBase64 verifies that bad base64 in either
+// the nonces or responses array of a legacy report is rejected.
+func TestParseMalfeasanceReportLegacyBadBase64(t *testing.T) {
+	good := base64.StdEncoding.EncodeToString([]byte("ok"))
+	t.Run("nonce", func(t *testing.T) {
+		data := []byte(`{"nonces":["!!!"],"responses":["` + good + `"]}`)
+		if _, err := ParseMalfeasanceReport(data); err == nil {
+			t.Fatal("expected error for bad legacy nonce")
+		}
+	})
+	t.Run("response", func(t *testing.T) {
+		data := []byte(`{"nonces":["` + good + `"],"responses":["!!!"]}`)
+		if _, err := ParseMalfeasanceReport(data); err == nil {
+			t.Fatal("expected error for bad legacy response")
+		}
+	})
+}
+
+// TestParseMalfeasanceReportRejectsBadRand verifies that an invalid base64 rand
+// in a drafts 12+ report is rejected.
+func TestParseMalfeasanceReportRejectsBadRand(t *testing.T) {
+	good := base64.StdEncoding.EncodeToString([]byte("ok"))
+	entry := map[string]string{
+		"rand":      "!!!not-base64!!!",
+		"publicKey": good,
+		"request":   good,
+		"response":  good,
+	}
+	data, _ := json.Marshal(map[string]any{"responses": []any{entry}})
+	if _, err := ParseMalfeasanceReport(data); err == nil {
+		t.Fatal("expected error for bad rand")
+	}
+}
