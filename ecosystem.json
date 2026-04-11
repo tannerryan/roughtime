@@ -22,6 +22,22 @@
       "publicKeyType": "ed25519",
       "publicKey": "S3AzfZJ5CjSdkJ21ZJGbxqdYP/SoE8fXKY0+aicsehI=",
       "addresses": [{ "protocol": "udp", "address": "roughtime.se:2002" }]
+    },
+    {
+      "name": "sth1.roughtime.netnod.se",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "9l1JN4HakGnG44yyqyNNCb0HN0XfsysBbnl/kbZoZDc=",
+      "addresses": [
+        { "protocol": "udp", "address": "sth1.roughtime.netnod.se:2002" }
+      ]
+    },
+    {
+      "name": "time.teax.dev",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "84pMADvKUcSOq5RNbVRjVrjiU16Dxo2XV2Qkm+4DRTg=",
+      "addresses": [{ "protocol": "udp", "address": "time.teax.dev:2002" }]
     }
   ]
 }
