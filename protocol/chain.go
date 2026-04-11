@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"time"
 )
@@ -26,10 +27,10 @@ var (
 	ErrCausalOrder = errors.New("protocol: causal ordering violation")
 )
 
-// ChainLink is one server query in a Roughtime measurement chain (Section
-// 8.4.1). The fields map 1:1 to the malfeasance report JSON format.
+// ChainLink is one server query in a Roughtime measurement chain (Section 8.4).
+// The fields map 1:1 to the malfeasance report JSON format.
 type ChainLink struct {
-	Rand      []byte // 32-byte blind; nil for the first link
+	Rand      []byte // blind (size matches the version's nonce length); nil for the first link
 	PublicKey []byte // server's long-term Ed25519 public key
 	Request   []byte // full request packet including ROUGHTIM header
 	Response  []byte // full response packet including ROUGHTIM header
@@ -42,26 +43,42 @@ type Chain struct {
 }
 
 // ChainNonce derives the nonce for the next link in a chain (Section 8.2). For
-// the first link (prevResponse nil), it returns a random 32-byte nonce with nil
-// rand. For subsequent links it returns H(prevResponse || rand) and the 32-byte
-// rand, where H is the first 32 bytes of SHA-512.
-func ChainNonce(prevResponse []byte, entropy io.Reader) (nonce, rand []byte, err error) {
+// the first link (prevResponse nil), it returns a random nonce with nil rand.
+// For subsequent links it returns H(prevResponse || rand) and the rand blind.
+// The versions slice selects the nonce size. See [chainHasher] for the hash
+// choice.
+func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (nonce, rand []byte, err error) {
+	_, g, err := clientVersionPreference(versions)
+	if err != nil {
+		return nil, nil, err
+	}
+	ns := nonceSize(g)
+
 	if prevResponse == nil {
-		nonce = make([]byte, 32)
+		nonce = make([]byte, ns)
 		if _, err = io.ReadFull(entropy, nonce); err != nil {
 			return nil, nil, fmt.Errorf("protocol: read entropy: %w", err)
 		}
 		return nonce, nil, nil
 	}
-	rand = make([]byte, 32)
+	rand = make([]byte, ns)
 	if _, err = io.ReadFull(entropy, rand); err != nil {
 		return nil, nil, fmt.Errorf("protocol: read entropy: %w", err)
 	}
-	h := sha512.New()
+	h := chainHasher(g)
 	h.Write(prevResponse)
 	h.Write(rand)
-	nonce = h.Sum(nil)[:32]
+	nonce = h.Sum(nil)[:ns]
 	return nonce, rand, nil
+}
+
+// chainHasher returns the hash function for chain nonce derivation. The chain
+// hash always uses SHA-512 because it must produce enough bytes to fill the
+// nonce (up to 64 bytes for Google and drafts 01–04). Drafts 02 and 07 use
+// SHA-512/256 for Merkle tree hashes, but SHA-512/256 only produces 32 bytes
+// which is insufficient for 64-byte nonces.
+func chainHasher(_ wireGroup) hash.Hash {
+	return sha512.New()
 }
 
 // NextRequest creates the next chained request. The returned ChainLink has
@@ -76,7 +93,7 @@ func (c *Chain) NextRequest(versions []Version, rootPK ed25519.PublicKey, entrop
 		}
 	}
 
-	nonce, blind, err := ChainNonce(prevResp, entropy)
+	nonce, blind, err := ChainNonce(prevResp, entropy, versions)
 	if err != nil {
 		return ChainLink{}, err
 	}
@@ -120,25 +137,30 @@ func (c *Chain) Verify() error {
 			return fmt.Errorf("protocol: chain link %d: parse request: %w", i, err)
 		}
 
-		// Verify nonce linkage for all links after the first.
-		if i > 0 {
-			if len(link.Rand) != 32 {
-				return fmt.Errorf("protocol: chain link %d: %w: rand is %d bytes, want 32", i, ErrChainNonce, len(link.Rand))
-			}
-			h := sha512.New()
-			h.Write(c.Links[i-1].Response)
-			h.Write(link.Rand)
-			want := h.Sum(nil)[:32]
-			if !bytes.Equal(req.Nonce, want) {
-				return fmt.Errorf("protocol: chain link %d: %w", i, ErrChainNonce)
-			}
-		}
-
 		// Determine versions for VerifyReply. An empty VER list in the request
 		// indicates Google-Roughtime.
 		versions := req.Versions
 		if len(versions) == 0 {
 			versions = []Version{VersionGoogle}
+		}
+
+		// Verify nonce linkage for all links after the first.
+		if i > 0 {
+			_, g, err := clientVersionPreference(versions)
+			if err != nil {
+				return fmt.Errorf("protocol: chain link %d: %w", i, err)
+			}
+			ns := len(req.Nonce)
+			if len(link.Rand) != ns {
+				return fmt.Errorf("protocol: chain link %d: %w: rand is %d bytes, want %d", i, ErrChainNonce, len(link.Rand), ns)
+			}
+			h := chainHasher(g)
+			h.Write(c.Links[i-1].Response)
+			h.Write(link.Rand)
+			want := h.Sum(nil)[:ns]
+			if !bytes.Equal(req.Nonce, want) {
+				return fmt.Errorf("protocol: chain link %d: %w", i, ErrChainNonce)
+			}
 		}
 
 		midpoint, radius, err := VerifyReply(versions, link.Response, link.PublicKey, req.Nonce, link.Request)
@@ -164,12 +186,14 @@ func (c *Chain) Verify() error {
 	return nil
 }
 
-// malfeasanceReport is the JSON structure for Section 8.4.1.
+// malfeasanceReport is the JSON structure for malfeasance reporting in drafts
+// 14+ (Section 8.4). Drafts 10–11 used a simpler {nonces, responses} format
+// (Section 9.3); see malfeasanceReportLegacy.
 type malfeasanceReport struct {
 	Responses []malfeasanceLink `json:"responses"`
 }
 
-// malfeasanceLink is one entry in a malfeasance report.
+// malfeasanceLink is one entry in a drafts-14+ malfeasance report.
 type malfeasanceLink struct {
 	Rand      string `json:"rand,omitempty"`
 	PublicKey string `json:"publicKey"`
@@ -177,7 +201,14 @@ type malfeasanceLink struct {
 	Response  string `json:"response"`
 }
 
-// MalfeasanceReport serializes the chain as JSON per Section 8.4.1 (media type
+// malfeasanceReportLegacy is the drafts 10–11 format (Section 9.3): parallel
+// arrays of rand values and response packets. No request or publicKey fields.
+type malfeasanceReportLegacy struct {
+	Nonces    []string `json:"nonces"`
+	Responses []string `json:"responses"`
+}
+
+// MalfeasanceReport serializes the chain as JSON per Section 8.4 (media type
 // application/roughtime-malfeasance+json).
 func (c *Chain) MalfeasanceReport() ([]byte, error) {
 	if len(c.Links) == 0 {
@@ -200,20 +231,57 @@ func (c *Chain) MalfeasanceReport() ([]byte, error) {
 	return json.Marshal(report)
 }
 
-// ParseMalfeasanceReport deserializes a JSON malfeasance report (Section 8.4.1)
-// into a Chain for verification.
+// ParseMalfeasanceReport deserializes a JSON malfeasance report into a Chain.
+// Both the drafts 14+ format (Section 8.4) and the legacy drafts 10–11 format
+// (Section 9.3) are accepted. Legacy reports yield links with Rand and Response
+// populated but no Request or PublicKey, so [Chain.Verify] cannot be used on
+// them.
 func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	const maxChainLinks = 1024
+
+	// Detect format: the drafts 14+ format has an object in responses[0]; the
+	// legacy format has a string in responses[0] and a top-level "nonces" key.
+	var probe struct {
+		Nonces    json.RawMessage   `json:"nonces"`
+		Responses []json.RawMessage `json:"responses"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, fmt.Errorf("protocol: parse malfeasance report: %w", err)
+	}
+	if len(probe.Responses) == 0 {
+		return nil, errors.New("protocol: malfeasance report has no responses")
+	}
+	if len(probe.Responses) > maxChainLinks {
+		return nil, fmt.Errorf("protocol: malfeasance report has %d links (max %d)", len(probe.Responses), maxChainLinks)
+	}
+	legacy := len(probe.Nonces) > 0 && len(probe.Responses[0]) > 0 && probe.Responses[0][0] == '"'
+
+	if legacy {
+		var report malfeasanceReportLegacy
+		if err := json.Unmarshal(data, &report); err != nil {
+			return nil, fmt.Errorf("protocol: parse legacy malfeasance report: %w", err)
+		}
+		if len(report.Nonces) != len(report.Responses) {
+			return nil, fmt.Errorf("protocol: legacy report nonces/responses length mismatch (%d vs %d)", len(report.Nonces), len(report.Responses))
+		}
+		c := &Chain{Links: make([]ChainLink, len(report.Responses))}
+		for i := range report.Responses {
+			var err error
+			if report.Nonces[i] != "" {
+				if c.Links[i].Rand, err = base64.StdEncoding.DecodeString(report.Nonces[i]); err != nil {
+					return nil, fmt.Errorf("protocol: legacy report link %d: decode nonce: %w", i, err)
+				}
+			}
+			if c.Links[i].Response, err = base64.StdEncoding.DecodeString(report.Responses[i]); err != nil {
+				return nil, fmt.Errorf("protocol: legacy report link %d: decode response: %w", i, err)
+			}
+		}
+		return c, nil
+	}
 
 	var report malfeasanceReport
 	if err := json.Unmarshal(data, &report); err != nil {
 		return nil, fmt.Errorf("protocol: parse malfeasance report: %w", err)
-	}
-	if len(report.Responses) == 0 {
-		return nil, errors.New("protocol: malfeasance report has no responses")
-	}
-	if len(report.Responses) > maxChainLinks {
-		return nil, fmt.Errorf("protocol: malfeasance report has %d links (max %d)", len(report.Responses), maxChainLinks)
 	}
 
 	c := &Chain{Links: make([]ChainLink, len(report.Responses))}
