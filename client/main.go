@@ -11,11 +11,11 @@
 //
 // Multiple servers:
 //
-//	go run client/main.go -servers client/ecosystem.json
+//	go run client/main.go -servers ecosystem.json
 //
 // Single server from a JSON list:
 //
-//	go run client/main.go -servers client/ecosystem.json -name time.txryan.com
+//	go run client/main.go -servers ecosystem.json -name time.txryan.com
 package main
 
 import (
@@ -37,26 +37,58 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
+// supportedVersions lists every protocol version this client supports, newest
+// IETF first with Google-Roughtime last.
+var supportedVersions = protocol.Supported()
+
+// ietfVersions is supportedVersions without Google-Roughtime. IETF servers
+// receive only IETF version numbers in the VER tag; Google-Roughtime uses a
+// separate code path that omits VER entirely.
+var ietfVersions = supportedVersions[:len(supportedVersions)-1]
+
 var (
 	serversFile = flag.String("servers", "", "path to JSON server list")
 	nameFilter  = flag.String("name", "", "query only the named server from the JSON list")
 	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
 	pubkey      = flag.String("pubkey", "", "base64-encoded Ed25519 root public key (with -addr)")
-	timeout     = flag.Duration("timeout", 5*time.Second, "UDP read/write timeout")
+	timeout     = flag.Duration("timeout", 500*time.Millisecond, "UDP read/write timeout")
+	retries     = flag.Int("retries", 3, "max retry attempts per server (exponential backoff)")
 	chain       = flag.Bool("chain", true, "chain queries: derive each nonce from the previous reply")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
 // serverConfig matches the JSON schema used by the Roughtime ecosystem.
 type serverConfig struct {
-	Name          string `json:"name"`
-	Version       string `json:"version"`
-	PublicKeyType string `json:"publicKeyType"`
-	PublicKey     string `json:"publicKey"`
+	Name          string      `json:"name"`
+	Version       flexVersion `json:"version"`
+	PublicKeyType string      `json:"publicKeyType"`
+	PublicKey     string      `json:"publicKey"`
 	Addresses     []struct {
 		Protocol string `json:"protocol"`
 		Address  string `json:"address"`
 	} `json:"addresses"`
+}
+
+// flexVersion unmarshals a JSON "version" field that may be a string (de facto
+// ecosystem convention, e.g. "IETF-Roughtime") or an integer (spec requirement,
+// e.g. 2147483660 for 0x8000000c).
+type flexVersion string
+
+// UnmarshalJSON accepts either a JSON string or integer for a version.
+func (v *flexVersion) UnmarshalJSON(b []byte) error {
+	// Try string first (the common case in real ecosystem files).
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		*v = flexVersion(s)
+		return nil
+	}
+	// Fall back to integer (spec-compliant format).
+	var n uint32
+	if err := json.Unmarshal(b, &n); err == nil {
+		*v = flexVersion(fmt.Sprintf("%d", n))
+		return nil
+	}
+	return fmt.Errorf("version must be a string or integer, got %s", string(b))
 }
 
 // serverList is the top-level JSON structure.
@@ -91,13 +123,28 @@ func (r result) inSync() bool {
 func main() {
 	flag.Parse()
 	if *showVersion {
-		fmt.Printf("roughtime-client %s (github.com/tannerryan/roughtime)\n", version.Version)
+		fmt.Printf("roughtime-client %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Version, version.Copyright)
 		return
+	}
+	if err := validateFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "client: %s\n", err)
+		os.Exit(1)
 	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "client: %s\n", err)
 		os.Exit(1)
 	}
+}
+
+// validateFlags checks CLI flags are within permitted ranges.
+func validateFlags() error {
+	if *timeout <= 0 {
+		return fmt.Errorf("-timeout %s must be > 0", *timeout)
+	}
+	if *retries < 1 {
+		return fmt.Errorf("-retries %d must be >= 1", *retries)
+	}
+	return nil
 }
 
 // run queries the configured servers and prints results.
@@ -258,21 +305,20 @@ func loadServers() ([]serverConfig, error) {
 		return servers, nil
 	}
 	if *addr != "" && *pubkey != "" {
+		cleanAddr := sanitize(*addr)
 		return []serverConfig{{
-			Name:      *addr,
+			Name:      cleanAddr,
 			PublicKey: *pubkey,
 			Addresses: []struct {
 				Protocol string `json:"protocol"`
 				Address  string `json:"address"`
-			}{{Protocol: "udp", Address: *addr}},
+			}{{Protocol: "udp", Address: cleanAddr}},
 		}}, nil
 	}
 	return nil, fmt.Errorf("provide -servers <file> or -addr <host:port> -pubkey <base64>")
 }
 
-// loadServersFile reads and parses a JSON server list. The path is operator-
-// supplied via a CLI flag and is normalized with filepath.Clean before reading.
-// Unknown JSON fields are rejected so schema drift fails loudly.
+// loadServersFile reads and parses a JSON server list.
 func loadServersFile(path string) ([]serverConfig, error) {
 	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
@@ -280,7 +326,6 @@ func loadServersFile(path string) ([]serverConfig, error) {
 	}
 	defer f.Close()
 	dec := json.NewDecoder(f)
-	dec.DisallowUnknownFields()
 	var list serverList
 	if err := dec.Decode(&list); err != nil {
 		return nil, fmt.Errorf("parsing server list: %w", err)
@@ -288,20 +333,24 @@ func loadServersFile(path string) ([]serverConfig, error) {
 	if len(list.Servers) == 0 {
 		return nil, fmt.Errorf("no servers in %s", path)
 	}
+	for i := range list.Servers {
+		list.Servers[i].Name = sanitize(list.Servers[i].Name)
+		for j := range list.Servers[i].Addresses {
+			list.Servers[i].Addresses[j].Address = sanitize(list.Servers[i].Addresses[j].Address)
+		}
+	}
 	return list.Servers, nil
 }
 
-// ietfVersions lists every IETF Roughtime version this client advertises in the
-// VER tag, newest first. It is derived from protocol.SupportedVersions so
-// adding a new draft to the protocol package automatically expands the client.
-var ietfVersions = func() []protocol.Version {
-	all := protocol.SupportedVersions()
-	out := make([]protocol.Version, len(all))
-	for i, v := range all {
-		out[len(all)-1-i] = v
-	}
-	return out
-}()
+// sanitize strips control characters from untrusted input.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
 
 // decodePubKey accepts an Ed25519 root public key encoded as standard base64,
 // URL base64, or lowercase hex (the three forms used by published Roughtime
@@ -338,7 +387,7 @@ func queryServer(srv serverConfig) result {
 		return r
 	}
 
-	if strings.EqualFold(srv.Version, "Google-Roughtime") {
+	if strings.EqualFold(string(srv.Version), "Google-Roughtime") {
 		return queryOnce(srv.Name, r.Address, rootPK, []protocol.Version{protocol.VersionGoogle}, *timeout)
 	}
 
@@ -368,7 +417,7 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 		}
 
 		versions := ietfVersions
-		if strings.EqualFold(srv.Version, "Google-Roughtime") {
+		if strings.EqualFold(string(srv.Version), "Google-Roughtime") {
 			versions = []protocol.Version{protocol.VersionGoogle}
 		}
 
@@ -378,26 +427,45 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 			continue
 		}
 
-		reply, rtt, localNow, err := sendRequest(r.Address, link.Request, *timeout)
-		if err != nil {
-			r.Err = err
-			continue
-		}
-		r.RTT = rtt
-		r.LocalNow = localNow
-		link.Response = reply
-
 		parsed, err := protocol.ParseRequest(link.Request)
 		if err != nil {
 			r.Err = fmt.Errorf("parsing chained request: %w", err)
 			continue
 		}
 
-		midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPK, parsed.Nonce, link.Request)
-		if err != nil {
-			r.Err = fmt.Errorf("verification: %w", err)
+		var reply []byte
+		var rtt time.Duration
+		var localNow time.Time
+		var midpoint time.Time
+		var radius time.Duration
+		backoff := *timeout
+		ok := false
+		for attempt := range *retries {
+			var networkErr bool
+			reply, rtt, localNow, err = sendRequest(r.Address, link.Request, backoff)
+			if err != nil {
+				networkErr = true
+			} else {
+				midpoint, radius, err = protocol.VerifyReply(versions, reply, rootPK, parsed.Nonce, link.Request)
+			}
+			if err == nil {
+				ok = true
+				break
+			}
+			if attempt < *retries-1 {
+				if networkErr {
+					time.Sleep(backoff)
+					backoff = time.Duration(float64(backoff) * 1.5)
+				}
+			}
+		}
+		if !ok {
+			r.Err = err
 			continue
 		}
+		r.RTT = rtt
+		r.LocalNow = localNow
+		link.Response = reply
 
 		// Append only after verification so a bad response doesn't poison the
 		// nonce derivation for subsequent links.
@@ -458,19 +526,37 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 		return r
 	}
 
-	reply, rtt, localNow, err := sendRequest(address, request, timeout)
-	if err != nil {
-		r.Err = err
-		return r
+	var reply []byte
+	var rtt time.Duration
+	var localNow time.Time
+	var midpoint time.Time
+	var radius time.Duration
+	backoff := timeout
+	for attempt := range *retries {
+		var networkErr bool
+		reply, rtt, localNow, err = sendRequest(address, request, backoff)
+		if err != nil {
+			networkErr = true
+		} else {
+			midpoint, radius, err = protocol.VerifyReply(versions, reply, rootPK, nonce, request)
+		}
+		if err == nil {
+			break
+		}
+		if attempt == *retries-1 {
+			if !networkErr {
+				err = fmt.Errorf("verification: %w", err)
+			}
+			r.Err = err
+			return r
+		}
+		if networkErr {
+			time.Sleep(backoff)
+			backoff = time.Duration(float64(backoff) * 1.5)
+		}
 	}
 	r.RTT = rtt
 	r.LocalNow = localNow
-
-	midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPK, nonce, request)
-	if err != nil {
-		r.Err = fmt.Errorf("verification: %w", err)
-		return r
-	}
 
 	r.Midpoint = midpoint
 	r.Radius = radius

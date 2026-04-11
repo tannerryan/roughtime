@@ -11,6 +11,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -19,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -29,10 +29,14 @@ import (
 
 var (
 	addr        = flag.String("addr", "", "host:port of the Roughtime server")
-	pubkey      = flag.String("pubkey", "", "base64-encoded Ed25519 root public key")
-	timeout     = flag.Duration("timeout", 2*time.Second, "per-version probe timeout")
+	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex)")
+	timeout     = flag.Duration("timeout", 500*time.Millisecond, "per-version probe timeout")
+	retries     = flag.Int("retries", 3, "max retry attempts per version (exponential backoff)")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
+
+// probeVersions lists every distinct VER value, newest first.
+var probeVersions = protocol.Supported()
 
 // probeResult holds the outcome of a single version probe.
 type probeResult struct {
@@ -51,11 +55,11 @@ type probeResult struct {
 func main() {
 	flag.Parse()
 	if *showVersion {
-		fmt.Printf("roughtime-debug %s (github.com/tannerryan/roughtime)\n", version.Version)
+		fmt.Printf("roughtime-debug %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Version, version.Copyright)
 		return
 	}
-	if *addr == "" || *pubkey == "" {
-		fmt.Fprintf(os.Stderr, "usage: debug -addr <host:port> -pubkey <base64>\n")
+	if err := validateFlags(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}
 	if err := run(); err != nil {
@@ -64,21 +68,29 @@ func main() {
 	}
 }
 
-// probeVersions lists every distinct VER value, newest first.
-var probeVersions = func() []protocol.Version {
-	out := slices.Clone(protocol.SupportedVersions())
-	slices.Reverse(out)
-	return append(out, protocol.VersionGoogle)
-}()
+// validateFlags checks CLI flags are within permitted ranges.
+func validateFlags() error {
+	if *addr == "" || *pubkey == "" {
+		return fmt.Errorf("usage: debug -addr <host:port> -pubkey <base64>")
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("-timeout %s must be > 0", *timeout)
+	}
+	if *retries < 1 {
+		return fmt.Errorf("-retries %d must be >= 1", *retries)
+	}
+	return nil
+}
 
 // run probes all versions and prints diagnostics for the best one.
 func run() error {
-	rootPK, err := base64.StdEncoding.DecodeString(*pubkey)
+	rootPK, err := decodePubKey(*pubkey)
 	if err != nil {
 		return fmt.Errorf("decoding public key: %w", err)
 	}
 
 	fmt.Printf("=== Version Probe: %s ===\n", *addr)
+	fmt.Printf("Timeout: %s\n", *timeout)
 	var supported []protocol.Version
 	var best *probeResult
 
@@ -117,8 +129,8 @@ func run() error {
 	return nil
 }
 
-// probe sends a single Roughtime request for a specific version and verifies
-// the response.
+// probe sends a Roughtime request for a specific version, retrying on network
+// and verification failures (e.g. greased responses).
 func probe(rootPK []byte, ver protocol.Version) probeResult {
 	r := probeResult{version: ver}
 	versions := []protocol.Version{ver}
@@ -131,52 +143,68 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 	r.nonce = nonce
 	r.request = request
 
+	var reply []byte
+	var rtt time.Duration
+	var localNow time.Time
+	var midpoint time.Time
+	var radius time.Duration
+	for attempt := range *retries {
+		var networkErr bool
+		reply, rtt, localNow, err = sendProbe(request, *timeout)
+		if err != nil {
+			networkErr = true
+		} else {
+			midpoint, radius, err = protocol.VerifyReply(versions, reply, rootPK, nonce, request)
+		}
+		if err == nil {
+			break
+		}
+		if attempt == *retries-1 {
+			if !networkErr {
+				err = fmt.Errorf("verify: %w", err)
+			}
+			r.err = err
+			return r
+		}
+	}
+	r.reply = reply
+	r.rtt = rtt
+	r.localNow = localNow
+	r.midpoint = midpoint
+	r.radius = radius
+	return r
+}
+
+// sendProbe sends a single UDP request and returns the raw reply, RTT, and
+// local time captured immediately after receiving the response.
+func sendProbe(request []byte, deadline time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
 	raddr, err := net.ResolveUDPAddr("udp", *addr)
 	if err != nil {
-		r.err = fmt.Errorf("resolve: %w", err)
-		return r
+		return nil, 0, time.Time{}, fmt.Errorf("resolve: %w", err)
 	}
-
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
-		r.err = fmt.Errorf("dial: %w", err)
-		return r
+		return nil, 0, time.Time{}, fmt.Errorf("dial: %w", err)
 	}
 	defer conn.Close()
 
-	if err := conn.SetWriteDeadline(time.Now().Add(*timeout)); err != nil {
-		r.err = fmt.Errorf("set write deadline: %w", err)
-		return r
+	if err := conn.SetWriteDeadline(time.Now().Add(deadline)); err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("set write deadline: %w", err)
 	}
 	start := time.Now()
 	if _, err := conn.Write(request); err != nil {
-		r.err = fmt.Errorf("send: %w", err)
-		return r
+		return nil, 0, time.Time{}, fmt.Errorf("send: %w", err)
 	}
 
-	if err := conn.SetReadDeadline(time.Now().Add(*timeout)); err != nil {
-		r.err = fmt.Errorf("set read deadline: %w", err)
-		return r
+	if err := conn.SetReadDeadline(time.Now().Add(deadline)); err != nil {
+		return nil, 0, time.Time{}, fmt.Errorf("set read deadline: %w", err)
 	}
 	buf := make([]byte, 65535)
 	n, err := conn.Read(buf)
 	if err != nil {
-		r.err = fmt.Errorf("read: %w", err)
-		return r
+		return nil, 0, time.Time{}, fmt.Errorf("read: %w", err)
 	}
-	r.rtt = time.Since(start)
-	r.localNow = time.Now()
-	r.reply = buf[:n]
-
-	midpoint, radius, err := protocol.VerifyReply(versions, r.reply, rootPK, nonce, request)
-	if err != nil {
-		r.err = fmt.Errorf("verify: %w", err)
-		return r
-	}
-
-	r.midpoint = midpoint
-	r.radius = radius
-	return r
+	return buf[:n], time.Since(start), time.Now(), nil
 }
 
 // isIETF reports whether a packet begins with the ROUGHTIM magic.
@@ -317,7 +345,7 @@ func printResponseDetail(r probeResult, tags map[uint32][]byte) {
 	}
 	if path, ok := tags[protocol.TagPATH]; ok {
 		hs := 32
-		if len(r.nonce) == 64 {
+		if r.version == protocol.VersionGoogle {
 			hs = 64
 		}
 		fmt.Printf("Merkle path:     %d node(s)\n", len(path)/hs)
@@ -470,4 +498,22 @@ func hexDump(data []byte) {
 		}
 		fmt.Printf("|\n")
 	}
+}
+
+// decodePubKey accepts an Ed25519 root public key encoded as standard base64,
+// URL base64, or lowercase hex (the three forms used by published Roughtime
+// ecosystem feeds). It returns an error unless the result is exactly 32 bytes.
+func decodePubKey(s string) ([]byte, error) {
+	for _, dec := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+		hex.DecodeString,
+	} {
+		if b, err := dec(s); err == nil && len(b) == ed25519.PublicKeySize {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("public key %q is not 32 bytes of base64 or hex", s)
 }

@@ -1,0 +1,23 @@
+name: Set up Go
+description: Configure Go from go.mod, optionally installing Makefile dev tools.
+
+inputs:
+  install-tools:
+    description: If 'true', install goimports, staticcheck, golangci-lint, gopls.
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+        check-latest: true
+
+    - if: inputs.install-tools == 'true'
+      shell: bash
+      run: |
+        go install golang.org/x/tools/cmd/goimports@latest
+        go install honnef.co/go/tools/cmd/staticcheck@latest
+        go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        go install golang.org/x/tools/gopls@latest

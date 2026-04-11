@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	mrand "math/rand/v2"
 	"slices"
 	"time"
 )
@@ -153,6 +154,8 @@ const (
 	TagMINT uint32 = 0x544e494d // MINT
 	TagMAXT uint32 = 0x5458414d // MAXT
 	TagINDX uint32 = 0x58444e49 // INDX
+	// TagZZZZ: draft 08's registry listed 0x7a7a7a7a (a typo, lowercase
+	// "zzzz"); the correct value 0x5a5a5a5a was used from draft 09 onward.
 	TagZZZZ uint32 = 0x5a5a5a5a // ZZZZ (client padding, drafts 08+)
 	TagPAD  uint32 = 0xff444150 // PAD\xff (Google-Roughtime client padding)
 
@@ -161,7 +164,7 @@ const (
 
 // Wire-format limits. maxMessageSize bounds adversarial input fed to [Decode];
 // maxEncodeTags / maxDecodeTags bound the tag count; maxVersionList bounds the
-// VER list a client may advertise (drafts 14+ require ≤ 32).
+// VER list a client may advertise (drafts 13+ require ≤ 32).
 const (
 	maxMessageSize = 65535
 	maxEncodeTags  = 512
@@ -182,8 +185,7 @@ func hashSize(g wireGroup) int {
 }
 
 // usesRoughtimHeader reports whether packets use the 12-byte ROUGHTIM header.
-// The header is required by every IETF draft (drafts 01–19, §5/§6 "Roughtime
-// Packet Format"). Google-Roughtime sends a bare message with no envelope.
+// All IETF drafts require it; Google-Roughtime sends bare messages.
 func usesRoughtimHeader(g wireGroup) bool { return g >= groupD01 }
 
 // usesMJDMicroseconds reports whether timestamps use MJD microsecond encoding
@@ -199,9 +201,12 @@ func usesFullPacketLeaf(g wireGroup) bool { return g >= groupD12 }
 // 03 moved NONC to the top-level response.
 func noncInSREP(g wireGroup) bool { return g == groupD01 || g == groupD02 }
 
-// hasResponseVER reports whether the response includes a top-level VER tag.
-// Drafts 01–11 carry VER at the top level; drafts 12+ moved VER inside SREP
-// (Figure 3 in those drafts) and MUST NOT include it at the top level.
+// NoncInSREP reports whether the given version and TYPE presence indicate a
+// wire group that places NONC inside SREP (drafts 01–02).
+func NoncInSREP(ver Version, hasType bool) bool { return noncInSREP(wireGroupOf(ver, hasType)) }
+
+// hasResponseVER reports whether the response includes a top-level VER tag
+// (drafts 01–11). Drafts 12+ moved VER inside SREP.
 func hasResponseVER(g wireGroup) bool { return g >= groupD01 && g < groupD12 }
 
 // hasResponseNONC reports whether the response includes a top-level NONC echo
@@ -212,7 +217,7 @@ func hasResponseNONC(g wireGroup) bool { return g >= groupD03 }
 func hasSREPVERS(g wireGroup) bool { return g >= groupD12 }
 
 // usesSHA512_256 reports whether the hash algorithm is SHA-512/256 rather than
-// SHA-512 truncated. Drafts 02 and 07 used SHA-512/256; all others use SHA-512
+// SHA-512 truncated. Drafts 02 and 07 use SHA-512/256; all others use SHA-512
 // (truncated to 32 bytes for IETF, full 64 bytes for Google).
 func usesSHA512_256(g wireGroup) bool { return g == groupD02 || g == groupD07 }
 
@@ -264,7 +269,7 @@ func timeToMJDMicro(t time.Time) uint64 {
 		uint64(sec)*1_000_000 +
 		uint64(nsec)/1000
 
-	return (mjd << 40) | usInDay
+	return (mjd << 40) | (usInDay & 0xFFFFFFFFFF)
 }
 
 // encodeTimestamp encodes a time in the format appropriate for a wire group:
@@ -289,13 +294,14 @@ func radiMicroseconds(d time.Duration) uint32 {
 	return uint32(min(max(d.Microseconds(), 1), math.MaxUint32))
 }
 
-// radiSeconds encodes a duration as a RADI value in seconds (drafts 08+).
-// Drafts 10+ require RADI >= 3; earlier drafts clamp to >= 1.
+// radiSeconds encodes a duration as a RADI value in seconds (drafts 08+). The
+// spec requires RADI MUST NOT be zero. Drafts 10–11 require RADI >= 3 (MUST);
+// drafts 12+ relax this to SHOULD when the server lacks leap second info.
 func radiSeconds(d time.Duration, g wireGroup) uint32 {
 	sec := int64(d / time.Second)
 	floor := int64(1)
-	if g >= groupD10 {
-		floor = 3
+	if g == groupD10 {
+		floor = 3 // drafts 10–11 §6.2.5: RADI MUST be at least 3 seconds
 	}
 	return uint32(min(max(sec, floor), math.MaxUint32))
 }
@@ -328,13 +334,16 @@ func decodeTimestamp(buf []byte, g wireGroup) (time.Time, error) {
 	}
 }
 
-// decodeRadius converts a wire-format RADI value to a [time.Duration].
+// decodeRadius converts a wire-format RADI value to a [time.Duration]. Drafts
+// 10+ §6.2.5 say RADI "MUST be at least 3 seconds"; we enforce only the
+// non-zero floor to tolerate deployed servers that send 1s–2s radii. Earlier
+// drafts and Google-Roughtime do not define a lower bound.
 func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 	if len(buf) != 4 {
 		return 0, errors.New("protocol: RADI must be 4 bytes")
 	}
 	v := binary.LittleEndian.Uint32(buf)
-	if v == 0 {
+	if v == 0 && g >= groupD10 {
 		return 0, errors.New("protocol: RADI must not be zero")
 	}
 	if g == groupGoogle || usesMJDMicroseconds(g) {
@@ -446,7 +455,10 @@ func Decode(data []byte) (map[uint32][]byte, error) {
 	}
 	n := binary.LittleEndian.Uint32(data[0:4])
 	if n == 0 {
-		return nil, errors.New("protocol: zero tags")
+		if len(data) != 4 {
+			return nil, errors.New("protocol: trailing data after zero-tag message")
+		}
+		return map[uint32][]byte{}, nil
 	}
 	if n > maxDecodeTags {
 		return nil, errors.New("protocol: tag count exceeds limit")
@@ -530,18 +542,24 @@ func unwrapPacket(pkt []byte) ([]byte, error) {
 	return pkt[12 : 12+mlen], nil
 }
 
-// Request holds the parsed fields of a client request.
+// Request holds the parsed fields of a client request. RawPacket and the
+// Nonce/SRV sub-slices share memory with the caller-supplied buffer; callers
+// that pool the buffer must not mutate it while a Request is in use.
 type Request struct {
 	Nonce     []byte    // 32 bytes (IETF drafts 05+) or 64 bytes (Google, drafts 01–04)
-	Versions  []Version // from VER tag; empty for Google/draft-00
+	Versions  []Version // from VER tag; empty for Google-Roughtime
 	SRV       []byte    // optional; nil if absent
 	HasType   bool      // true when request contains TYPE=0 (drafts 14+)
 	RawPacket []byte    // complete UDP payload for Merkle leaf (drafts 12+)
 }
 
 // ParseRequest auto-detects Google vs IETF framing and extracts request fields.
-// The Nonce and SRV fields are sub-slices of raw and share its memory.
+// The Nonce and SRV fields are sub-slices of raw and share its memory. Framed
+// (IETF) requests that omit VER are rejected; the nonce length must match at
+// least one offered version; SRV (when present) must be 32 bytes for drafts
+// 10+.
 func ParseRequest(raw []byte) (*Request, error) {
+	framed := len(raw) >= 12 && bytes.Equal(raw[:8], packetMagic[:])
 	req := &Request{RawPacket: raw}
 
 	msgBytes, err := unwrapRequest(raw)
@@ -566,6 +584,59 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, err
 	}
 
+	// A framed (ROUGHTIM-header) request is by definition an IETF draft 01+
+	// packet, which requires a VER tag. Silently falling back to Google on a
+	// missing VER would let a malformed framed request be processed as Google.
+	if framed && len(req.Versions) == 0 {
+		return nil, errors.New("protocol: framed request missing VER tag")
+	}
+
+	// Determine the highest declared version for cross-checks. An empty VER
+	// list implies Google-Roughtime (unframed; framed case rejected above).
+	maxVer := VersionGoogle
+	for _, v := range req.Versions {
+		if v > maxVer {
+			maxVer = v
+		}
+	}
+	maxGroup := wireGroupOf(maxVer, false)
+
+	// Drafts 12+ §5.1.1: VER MUST be strictly ascending and non-repeating.
+	// Earlier drafts have no ordering rule, so accept unsorted/duplicate VER.
+	if maxGroup >= groupD12 {
+		for i := 1; i < len(req.Versions); i++ {
+			if req.Versions[i] <= req.Versions[i-1] {
+				return nil, errors.New("protocol: VER list not strictly ascending")
+			}
+		}
+	}
+
+	// The nonce size is 64 bytes for Google/drafts 01–04 and 32 bytes for
+	// drafts 05+. A client VER list may mix versions with different nonce
+	// sizes; accept the request if the nonce length matches at least one of the
+	// offered versions (or Google when VER is absent). Version selection later
+	// picks a mutually supported version whose nonce size matches.
+	nonceOK := false
+	if len(req.Versions) == 0 {
+		nonceOK = len(req.Nonce) == nonceSize(groupGoogle)
+	} else {
+		for _, v := range req.Versions {
+			if len(req.Nonce) == nonceSize(wireGroupOf(v, false)) {
+				nonceOK = true
+				break
+			}
+		}
+	}
+	if !nonceOK {
+		return nil, fmt.Errorf("protocol: nonce length %d matches no offered version", len(req.Nonce))
+	}
+
+	// Drafts 10+ §6.1.3 define SRV as H(0xff || pubkey) truncated to 32 bytes.
+	// Earlier drafts left SRV undefined, so we only enforce length for 10+.
+	if req.SRV != nil && maxGroup >= groupD10 && len(req.SRV) != 32 {
+		return nil, fmt.Errorf("protocol: SRV length %d invalid for drafts 10+ (want 32)", len(req.SRV))
+	}
+
 	return req, nil
 }
 
@@ -577,7 +648,9 @@ func unwrapRequest(raw []byte) ([]byte, error) {
 	return raw, nil
 }
 
-// parseOptionalTags extracts VER, SRV, and TYPE from a decoded message.
+// parseOptionalTags extracts VER, SRV, and TYPE from a decoded message. The
+// caller ([ParseRequest]) performs per-version cross-checks (ascending order,
+// SRV length) after this returns.
 func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 	if vb, ok := msg[TagVER]; ok {
 		if len(vb) == 0 || len(vb)%4 != 0 {
@@ -591,18 +664,10 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 		for i := 0; i < len(vb); i += 4 {
 			req.Versions = append(req.Versions, Version(binary.LittleEndian.Uint32(vb[i:i+4])))
 		}
-		// Drafts 13+ §5.1.2: VER MUST be sorted ascending and non-repeating.
-		// Earlier drafts have no explicit ordering rule; enforce defensively.
-		for i := 1; i < len(req.Versions); i++ {
-			if req.Versions[i] <= req.Versions[i-1] {
-				return errors.New("protocol: VER list not strictly ascending")
-			}
-		}
 	}
 	if srv, ok := msg[TagSRV]; ok {
-		// Drafts 10+ define SRV as H(0xff || pubkey) truncated to 32 bytes.
-		// Reject obviously malformed lengths but accept anything ≤ 64 bytes for
-		// forward compatibility with older drafts that left SRV undefined.
+		// Base sanity bounds only; draft-specific length enforcement happens in
+		// [ParseRequest] once the highest declared version is known.
 		if len(srv) == 0 || len(srv) > 64 {
 			return fmt.Errorf("protocol: SRV tag length %d invalid", len(srv))
 		}
@@ -652,13 +717,16 @@ func init() {
 	}
 }
 
-// SupportedVersions returns all IETF version numbers in ascending order.
-func SupportedVersions() []Version {
-	return supportedVersions
+// Supported returns all recognized protocol versions in descending order
+// (newest IETF first, Google-Roughtime last).
+func Supported() []Version {
+	out := slices.Clone(supportedVersions)
+	slices.Reverse(out)
+	return append(out, VersionGoogle)
 }
 
 // ComputeSRV returns the SRV tag value for a server's long-term Ed25519 public
-// key as defined in draft-ietf-ntp-roughtime-13 §5.1.4 and later: the first 32
+// key as defined in draft-ietf-ntp-roughtime-10 §6.1.3 and later: the first 32
 // bytes of SHA-512(0xff || pubkey).
 func ComputeSRV(rootPK ed25519.PublicKey) []byte {
 	if len(rootPK) != ed25519.PublicKeySize {
@@ -715,6 +783,9 @@ type certCacheKey struct {
 func NewCertificate(mint, maxt time.Time, onlineSK, rootSK ed25519.PrivateKey) (*Certificate, error) {
 	if len(onlineSK) != ed25519.PrivateKeySize || len(rootSK) != ed25519.PrivateKeySize {
 		return nil, errors.New("protocol: invalid key size")
+	}
+	if !mint.Before(maxt) {
+		return nil, errors.New("protocol: MINT must be before MAXT")
 	}
 	c := &Certificate{
 		onlineSK: onlineSK,
@@ -793,8 +864,20 @@ type merkleTree struct {
 	paths    [][][]byte // paths[i] = sibling hashes from leaf i to root
 }
 
+// merkleNodeFirst reports whether the spec's Merkle verification algorithm puts
+// the sibling node before the current hash when the INDX bit is 0. groupD05
+// through groupD12 (drafts 05–13) use H(0x01 || node || hash); all others use
+// H(0x01 || hash || node). Drafts 14–15 originally specified node-first but
+// 16–19 switched to hash-first; since groupD14 covers all of drafts 14–19, we
+// follow the latest spec (draft-19) and use hash-first for that group.
+func merkleNodeFirst(g wireGroup) bool {
+	return g >= groupD05 && g <= groupD12
+}
+
 // newMerkleTree builds the Merkle tree and per-leaf paths in one bottom-up
-// pass. Verification walks INDX bits from LSB: bit 0 → H(0x01 || h || node).
+// pass. The node-hash argument order matches the verification algorithm for
+// each wire group: groupD05–groupD12 use (node, hash) when bit=0, all others
+// use (hash, node).
 func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 	n := len(leafInputs)
 	hs := hashSize(g)
@@ -836,10 +919,16 @@ func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 			paths[i] = append(paths[i], level[sib])
 			indices[i] /= 2 // move to parent position
 		}
-		// Combine pairs to form the next level
+		// Combine pairs to form the next level. Drafts 05–13 define bit=0 as
+		// H(0x01 || node || hash), so the builder must use (right, left) to
+		// match the spec's verification algorithm.
 		next := make([][]byte, len(level)/2)
 		for j := 0; j < len(level); j += 2 {
-			next[j/2] = nodeHash(g, level[j], level[j+1])
+			if merkleNodeFirst(g) {
+				next[j/2] = nodeHash(g, level[j+1], level[j])
+			} else {
+				next[j/2] = nodeHash(g, level[j], level[j+1])
+			}
 		}
 		level = next
 	}
@@ -854,6 +943,14 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 	}
 
 	g := wireGroupOf(ver, requests[0].HasType)
+
+	// All requests in a batch must resolve to the same wire group so the shared
+	// SREP, CERT, and Merkle tree are consistent.
+	for i := 1; i < len(requests); i++ {
+		if wireGroupOf(ver, requests[i].HasType) != g {
+			return nil, errors.New("protocol: batch contains requests with incompatible wire groups")
+		}
+	}
 
 	// Drafts 01–02 place NONC inside the signed SREP, which is shared by every
 	// reply in a batch. That construction only admits a single nonce, so reject
@@ -918,6 +1015,9 @@ func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time,
 	// Drafts 01–02 place NONC inside SREP. CreateReplies rejects multi-request
 	// batches for these groups, so requests[0] is the only nonce here.
 	if noncInSREP(g) {
+		if len(requests) != 1 {
+			return nil, fmt.Errorf("protocol: NONC-in-SREP group requires single-request batch, got %d", len(requests))
+		}
 		srepTags[TagNONC] = requests[0].Nonce
 	}
 	if hasSREPVERS(g) {
@@ -961,7 +1061,7 @@ func buildReply(ver Version, g wireGroup, req Request, i int, tree *merkleTree, 
 	if hasResponseNONC(g) {
 		resp[TagNONC] = req.Nonce
 	}
-	if req.HasType {
+	if g >= groupD14 {
 		var tBuf [4]byte
 		binary.LittleEndian.PutUint32(tBuf[:], 1)
 		resp[TagTYPE] = tBuf[:]
@@ -985,10 +1085,12 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 		return 0, 0, errors.New("protocol: empty version list")
 	}
 	best := slices.Max(versions)
-	// Include TYPE=0 when the best version is draft-12+ (0x8000000c). This is
-	// required by drafts 14–19 and harmlessly ignored by drafts 12–13 (which
-	// share the same wire version but predate the TYPE tag).
-	return best, wireGroupOf(best, best >= VersionDraft12), nil
+	// Drafts 12–19 share wire version 0x8000000c. The client includes TYPE=0 in
+	// the request (a draft-14+ feature) to signal support. If the server
+	// responds without TYPE, verifyReply falls back to groupD12. Passing
+	// hasType=true is harmless for pre-draft-12 versions because wireGroupOf
+	// only inspects hasType in the default branch (draft-12+).
+	return best, wireGroupOf(best, true), nil
 }
 
 // CreateRequest builds a Roughtime request for the given version preferences.
@@ -1017,7 +1119,7 @@ func CreateRequestWithSRV(versions []Version, entropy io.Reader, srv []byte) (no
 		sorted := make([]Version, len(versions))
 		copy(sorted, versions)
 		slices.Sort(sorted)
-		// Drop duplicates: drafts 14+ require strictly ascending VER values.
+		// Drop duplicates: drafts 12+ require strictly ascending VER values.
 		sorted = slices.Compact(sorted)
 		vb := make([]byte, 4*len(sorted))
 		for i, v := range sorted {
@@ -1028,13 +1130,14 @@ func CreateRequestWithSRV(versions []Version, entropy io.Reader, srv []byte) (no
 		if g >= groupD14 {
 			tags[TagTYPE] = make([]byte, 4) // TYPE=0 (request)
 		}
-		if len(srv) > 0 {
+		if len(srv) > 0 && g >= groupD10 {
 			tags[TagSRV] = srv
 		}
 	}
 
-	// Drafts 04+ wrap the message in a 12-byte header; pad the inner body to
-	// 1012 so the total wire size is 1024. Earlier wire groups pad to 1024.
+	// All IETF drafts (01+) wrap the message in a 12-byte ROUGHTIM header; pad
+	// the inner body to 1012 so the total wire size is 1024. Google-Roughtime
+	// has no header and pads to 1024.
 	target := 1024
 	if usesRoughtimHeader(g) {
 		target = 1012
@@ -1096,11 +1199,24 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 		return time.Time{}, 0, fmt.Errorf("protocol: decode reply: %w", err)
 	}
 
+	// Decode SREP once and reuse across version resolution, Merkle
+	// verification, and the downgrade check. If SREP is absent
+	// [verifyReplySigs] will surface the missing-tag error below; if it is
+	// present but malformed, fail fast here.
+	var srep map[uint32][]byte
+	if srepBytes, ok := resp[TagSREP]; ok {
+		s, derr := Decode(srepBytes)
+		if derr != nil {
+			return time.Time{}, 0, fmt.Errorf("protocol: decode SREP: %w", derr)
+		}
+		srep = s
+	}
+
 	// Resolve the server's negotiated version from the response VER tag,
 	// falling back to the client's preferred version
 	g := bestG
 	if bestVer != VersionGoogle {
-		if respVer, ok := extractResponseVER(resp); ok {
+		if respVer, ok := extractResponseVER(resp, srep); ok {
 			if !versionOffered(respVer, versions) {
 				return time.Time{}, 0, errors.New("protocol: server chose version not offered by client")
 			}
@@ -1119,7 +1235,7 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 		return time.Time{}, 0, err
 	}
 
-	midpoint, radius, err = verifyReplySREP(resp, nonce, requestBytes, g)
+	midpoint, radius, err = verifyReplySREP(srep, resp, nonce, requestBytes, g)
 	if err != nil {
 		return time.Time{}, 0, err
 	}
@@ -1127,7 +1243,7 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 	// Drafts 12+ §5.2.5: SREP signs the server's VERS list. Verify the
 	// negotiated version is the highest common version to detect downgrades.
 	if g >= groupD12 {
-		if err := verifyNoVersionDowngrade(resp, versions); err != nil {
+		if err := verifyNoVersionDowngrade(srep, versions); err != nil {
 			return time.Time{}, 0, err
 		}
 	}
@@ -1138,14 +1254,9 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 // verifyNoVersionDowngrade decodes the signed VERS list inside SREP and
 // confirms the chosen version (also inside SREP) is the highest mutually
 // supported version. Drafts 12+ only.
-func verifyNoVersionDowngrade(resp map[uint32][]byte, clientVersions []Version) error {
-	srepBytes, ok := resp[TagSREP]
-	if !ok {
+func verifyNoVersionDowngrade(srep map[uint32][]byte, clientVersions []Version) error {
+	if srep == nil {
 		return errors.New("protocol: missing SREP for downgrade check")
-	}
-	srep, err := Decode(srepBytes)
-	if err != nil {
-		return fmt.Errorf("protocol: decode SREP for downgrade check: %w", err)
 	}
 	verBytes, ok := srep[TagVER]
 	if !ok || len(verBytes) != 4 {
@@ -1156,9 +1267,19 @@ func verifyNoVersionDowngrade(resp map[uint32][]byte, clientVersions []Version) 
 	if !ok || len(versBytes) == 0 || len(versBytes)%4 != 0 {
 		return errors.New("protocol: missing or malformed VERS in SREP")
 	}
-	serverSupports := make(map[Version]bool, len(versBytes)/4)
+	nv := len(versBytes) / 4
+	if nv > maxVersionList {
+		return fmt.Errorf("protocol: VERS has %d entries (max %d)", nv, maxVersionList)
+	}
+	serverSupports := make(map[Version]bool, nv)
+	var prev Version
 	for i := 0; i < len(versBytes); i += 4 {
-		serverSupports[Version(binary.LittleEndian.Uint32(versBytes[i:i+4]))] = true
+		v := Version(binary.LittleEndian.Uint32(versBytes[i : i+4]))
+		if i > 0 && v <= prev {
+			return errors.New("protocol: VERS not sorted in ascending order")
+		}
+		prev = v
+		serverSupports[v] = true
 	}
 	var best Version
 	var found bool
@@ -1178,13 +1299,12 @@ func verifyNoVersionDowngrade(resp map[uint32][]byte, clientVersions []Version) 
 
 // extractResponseVER looks for the negotiated version in a decoded response. It
 // prefers signed VER inside SREP (canonical for drafts 12+) over the unsigned
-// top-level VER (drafts 01-11), closing a downgrade vector.
-func extractResponseVER(resp map[uint32][]byte) (Version, bool) {
-	if srepBytes, ok := resp[TagSREP]; ok {
-		if srep, err := Decode(srepBytes); err == nil {
-			if vb, ok := srep[TagVER]; ok && len(vb) == 4 {
-				return Version(binary.LittleEndian.Uint32(vb)), true
-			}
+// top-level VER (drafts 01-11), closing a downgrade vector. srep may be nil, in
+// which case only the top-level VER is consulted.
+func extractResponseVER(resp, srep map[uint32][]byte) (Version, bool) {
+	if srep != nil {
+		if vb, ok := srep[TagVER]; ok && len(vb) == 4 {
+			return Version(binary.LittleEndian.Uint32(vb)), true
 		}
 	}
 	if vb, ok := resp[TagVER]; ok && len(vb) == 4 {
@@ -1205,7 +1325,13 @@ func ExtractVersion(reply []byte) (Version, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return extractResponseVER(resp)
+	var srep map[uint32][]byte
+	if srepBytes, ok := resp[TagSREP]; ok {
+		if s, derr := Decode(srepBytes); derr == nil {
+			srep = s
+		}
+	}
+	return extractResponseVER(resp, srep)
 }
 
 // versionOffered reports whether ver appears in the client's version list.
@@ -1256,12 +1382,12 @@ func verifyReplySigs(resp map[uint32][]byte, rootPK ed25519.PublicKey, g wireGro
 	return onlinePK, mintBuf, maxtBuf, nil
 }
 
-// verifyReplySREP parses the signed response, verifies the Merkle proof, and
-// decodes the midpoint and radius.
-func verifyReplySREP(resp map[uint32][]byte, nonce, requestBytes []byte, g wireGroup) (time.Time, time.Duration, error) {
-	srep, err := Decode(resp[TagSREP])
-	if err != nil {
-		return time.Time{}, 0, fmt.Errorf("protocol: decode SREP: %w", err)
+// verifyReplySREP verifies the Merkle proof and decodes the midpoint and radius
+// from a pre-decoded SREP. srep must not be nil; the caller is responsible for
+// surfacing missing-SREP errors.
+func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g wireGroup) (time.Time, time.Duration, error) {
+	if srep == nil {
+		return time.Time{}, 0, errors.New("protocol: missing SREP")
 	}
 	midpBytes, ok := srep[TagMIDP]
 	if !ok {
@@ -1274,6 +1400,22 @@ func verifyReplySREP(resp map[uint32][]byte, nonce, requestBytes []byte, g wireG
 	rootHash, ok := srep[TagROOT]
 	if !ok || len(rootHash) != hashSize(g) {
 		return time.Time{}, 0, errors.New("protocol: missing or invalid ROOT")
+	}
+
+	// Verify NONC echo: drafts 01–02 embed NONC inside the signed SREP; drafts
+	// 03+ echo it at the top level. If present, NONC MUST match the client's
+	// nonce. A missing top-level NONC is tolerated because the Merkle proof
+	// already binds the nonce to the signed root, and some real-world servers
+	// (e.g. Cloudflare) omit it.
+	if noncInSREP(g) {
+		srepNonce, ok := srep[TagNONC]
+		if !ok || !bytes.Equal(srepNonce, nonce) {
+			return time.Time{}, 0, errors.New("protocol: NONC in SREP does not match request nonce")
+		}
+	} else if hasResponseNONC(g) {
+		if echoed, ok := resp[TagNONC]; ok && !bytes.Equal(echoed, nonce) {
+			return time.Time{}, 0, errors.New("protocol: response NONC does not match request nonce")
+		}
 	}
 
 	leafData := nonce
@@ -1369,7 +1511,10 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 	}
 	index := binary.LittleEndian.Uint32(indexBytes)
 
-	pathBytes := resp[TagPATH] // may be empty for single-request batches
+	pathBytes, pathOK := resp[TagPATH] // may be zero-length for single-request batches
+	if !pathOK {
+		return errors.New("protocol: missing PATH in response")
+	}
 	hs := hashSize(g)
 	if len(pathBytes)%hs != 0 {
 		return errors.New("protocol: PATH length not a multiple of hash size")
@@ -1380,12 +1525,23 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 
 	hash := leafHash(g, leafInput)
 	steps := len(pathBytes) / hs
+	nf := merkleNodeFirst(g)
 	for i := range steps {
 		sibling := pathBytes[i*hs : (i+1)*hs]
 		if index&1 == 0 {
-			hash = nodeHash(g, hash, sibling)
+			// Drafts 05–13: H(0x01 || node || hash); others: H(0x01 || hash ||
+			// node).
+			if nf {
+				hash = nodeHash(g, sibling, hash)
+			} else {
+				hash = nodeHash(g, hash, sibling)
+			}
 		} else {
-			hash = nodeHash(g, sibling, hash)
+			if nf {
+				hash = nodeHash(g, hash, sibling)
+			} else {
+				hash = nodeHash(g, sibling, hash)
+			}
 		}
 		index >>= 1
 	}
@@ -1399,4 +1555,202 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 		return errors.New("protocol: Merkle root mismatch")
 	}
 	return nil
+}
+
+// Grease applies a random grease transformation to a signed reply per Section
+// 7. It corrupts a signature with incorrect times, drops a mandatory tag,
+// replaces the version with an unsupported number, or adds an undefined tag.
+func Grease(reply []byte, ver Version) []byte {
+	mode := mrand.IntN(4)
+	switch mode {
+	case 1:
+		if out := greaseDropTag(reply, ver); out != nil {
+			return out
+		}
+	case 2:
+		if out := greaseWrongVersion(reply, ver); out != nil {
+			return out
+		}
+	case 3:
+		if out := greaseUndefinedTag(reply, ver); out != nil {
+			return out
+		}
+	}
+	// Mode 0 or fallback: corrupt a signature and timestamp.
+	greaseCorruptSig(reply, ver)
+	return reply
+}
+
+// greaseSplit separates a reply into its ROUGHTIM header (nil for Google) and
+// message body. Returns nil body on malformed input.
+func greaseSplit(reply []byte, ver Version) (header, body []byte) {
+	if ver == VersionGoogle {
+		return nil, reply
+	}
+	if len(reply) < 12 {
+		return nil, nil
+	}
+	return reply[:12], reply[12:]
+}
+
+// greaseJoin prepends the ROUGHTIM header to a re-encoded body, updating the
+// length field to match the new body size.
+func greaseJoin(header, body []byte) []byte {
+	if header == nil {
+		return body
+	}
+	out := make([]byte, len(header)+len(body))
+	copy(out, header)
+	binary.LittleEndian.PutUint32(out[8:12], uint32(len(body)))
+	copy(out[len(header):], body)
+	return out
+}
+
+// greaseCorruptSig corrupts a randomly chosen signature (SREP or DELE) and the
+// MIDP timestamp in place. MIDP is only corrupted when the signature was, since
+// the spec forbids incorrect times with valid signatures.
+func greaseCorruptSig(reply []byte, ver Version) {
+	_, body := greaseSplit(reply, ver)
+	if body == nil {
+		return
+	}
+	base := uint32(len(reply) - len(body))
+
+	sigCorrupted := false
+	if mrand.IntN(2) == 0 {
+		if certLo, certHi, ok := findTagRange(body, TagCERT); ok && certHi > certLo {
+			cert := body[certLo:certHi]
+			if sigLo, sigHi, ok := findTagRange(cert, TagSIG); ok && sigHi > sigLo {
+				reply[base+certLo+sigLo+uint32(mrand.IntN(int(sigHi-sigLo)))] ^= 0xff
+				sigCorrupted = true
+			}
+		}
+	} else {
+		if lo, hi, ok := findTagRange(body, TagSIG); ok && hi > lo {
+			reply[base+lo+uint32(mrand.IntN(int(hi-lo)))] ^= 0xff
+			sigCorrupted = true
+		}
+	}
+	if !sigCorrupted {
+		return
+	}
+	if srepLo, srepHi, ok := findTagRange(body, TagSREP); ok && srepHi > srepLo {
+		srep := body[srepLo:srepHi]
+		if midpLo, midpHi, ok := findTagRange(srep, TagMIDP); ok && midpHi > midpLo {
+			reply[base+srepLo+midpLo+uint32(mrand.IntN(int(midpHi-midpLo)))] ^= 0xff
+		}
+	}
+}
+
+// greaseDropTag removes a randomly chosen mandatory tag from the top-level
+// response message. Returns the modified reply or nil on failure.
+func greaseDropTag(reply []byte, ver Version) []byte {
+	header, body := greaseSplit(reply, ver)
+	if body == nil {
+		return nil
+	}
+	msg, err := Decode(body)
+	if err != nil {
+		return nil
+	}
+	candidates := []uint32{TagSIG, TagSREP, TagCERT, TagPATH, TagINDX}
+	mrand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	for _, tag := range candidates {
+		if _, ok := msg[tag]; ok {
+			delete(msg, tag)
+			out, err := encode(msg)
+			if err != nil {
+				return nil
+			}
+			return greaseJoin(header, out)
+		}
+	}
+	return nil
+}
+
+// greaseWrongVersion overwrites the top-level VER tag with an unsupported
+// version number. Returns nil if no top-level VER exists (Google, drafts 12+).
+func greaseWrongVersion(reply []byte, ver Version) []byte {
+	_, body := greaseSplit(reply, ver)
+	if body == nil {
+		return nil
+	}
+	lo, hi, ok := findTagRange(body, TagVER)
+	if !ok || hi-lo != 4 {
+		return nil
+	}
+	base := uint32(len(reply) - len(body))
+	binary.LittleEndian.PutUint32(reply[base+lo:], 0xFFFFFFFF)
+	return reply
+}
+
+// greaseUndefinedTag adds an undefined tag with random content to the top-level
+// response. Clients MUST ignore undefined tags per Section 7.
+func greaseUndefinedTag(reply []byte, ver Version) []byte {
+	header, body := greaseSplit(reply, ver)
+	if body == nil {
+		return nil
+	}
+	msg, err := Decode(body)
+	if err != nil {
+		return nil
+	}
+	// GRSE (0x45535247) — not in the IANA Roughtime tag registry.
+	const tagGRSE uint32 = 0x45535247
+	var val [4]byte
+	binary.LittleEndian.PutUint32(val[:], mrand.Uint32())
+	msg[tagGRSE] = val[:]
+	out, err := encode(msg)
+	if err != nil {
+		return nil
+	}
+	return greaseJoin(header, out)
+}
+
+// findTagRange locates the byte range [lo, hi) of a tag's value within a raw
+// Roughtime message. Returns false if the tag is not found or the message is
+// malformed.
+func findTagRange(msg []byte, tag uint32) (lo, hi uint32, ok bool) {
+	if len(msg) < 4 {
+		return 0, 0, false
+	}
+	n := binary.LittleEndian.Uint32(msg[:4])
+	if n == 0 || n > 512 {
+		return 0, 0, false
+	}
+
+	tagsOff := 4 + (n-1)*4
+	valsOff := tagsOff + n*4
+	if valsOff < tagsOff || uint32(len(msg)) < valsOff {
+		return 0, 0, false
+	}
+
+	idx := int(-1)
+	for i := range n {
+		if binary.LittleEndian.Uint32(msg[tagsOff+i*4:]) == tag {
+			idx = int(i)
+			break
+		}
+	}
+	if idx < 0 {
+		return 0, 0, false
+	}
+
+	if idx == 0 {
+		lo = 0
+	} else {
+		lo = binary.LittleEndian.Uint32(msg[4+(idx-1)*4:])
+	}
+	if idx == int(n)-1 {
+		hi = uint32(len(msg)) - valsOff
+	} else {
+		hi = binary.LittleEndian.Uint32(msg[4+idx*4:])
+	}
+
+	lo += valsOff
+	hi += valsOff
+	if hi > uint32(len(msg)) || lo >= hi {
+		return 0, 0, false
+	}
+	return lo, hi, true
 }

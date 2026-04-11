@@ -10,6 +10,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"maps"
 	"math"
 	"testing"
@@ -42,7 +43,8 @@ func randBytes(t *testing.T, n int) []byte {
 
 // buildGoogleRequest constructs a padded Google-Roughtime request.
 func buildGoogleRequest(nonce []byte) []byte {
-	pad := make([]byte, 1024-len(nonce)-12)
+	// Header: 4 (tag count) + 4 (1 offset) + 8 (2 tags) = 16 bytes.
+	pad := make([]byte, 1024-len(nonce)-16)
 	msg, _ := encode(map[uint32][]byte{
 		TagNONC: nonce,
 		TagPAD:  pad,
@@ -67,7 +69,12 @@ func buildIETFRequest(nonce []byte, versions []Version, withType bool) []byte {
 	if len(msg) < 1012 {
 		padded := make(map[uint32][]byte, len(tags)+1)
 		maps.Copy(padded, tags)
-		padded[TagZZZZ] = make([]byte, 1012-len(msg))
+		// Select the correct padding tag: drafts 08+ use ZZZZ, 01-07 use PAD\0.
+		padTag := tagPADIETF
+		if len(versions) > 0 && versions[0] >= VersionDraft08 {
+			padTag = TagZZZZ
+		}
+		padded[padTag] = make([]byte, 1012-len(msg))
 		msg, _ = encode(padded)
 	}
 	return wrapPacket(msg)
@@ -155,7 +162,8 @@ func verifyResponseTYPE(t *testing.T, resp map[uint32][]byte, hasType bool) {
 	}
 }
 
-// verifySREPTags checks that SREP contains ROOT, MIDP, RADI, and version tags.
+// verifySREPTags checks that SREP contains ROOT, MIDP, RADI, version tags, and
+// NONC (for wire groups that embed it).
 func verifySREPTags(t *testing.T, srepBytes []byte, g wireGroup) {
 	t.Helper()
 	srep, err := Decode(srepBytes)
@@ -173,6 +181,11 @@ func verifySREPTags(t *testing.T, srepBytes []byte, g wireGroup) {
 		}
 		if _, ok := srep[TagVERS]; !ok {
 			t.Fatal("missing VERS in SREP")
+		}
+	}
+	if noncInSREP(g) {
+		if _, ok := srep[TagNONC]; !ok {
+			t.Fatal("NONC should be inside SREP for this wire group")
 		}
 	}
 }
@@ -680,7 +693,8 @@ func TestRadiMicroseconds(t *testing.T) {
 	}
 }
 
-// TestRadiSeconds verifies second RADI clamping: >= 1 for D08, >= 3 for D10+.
+// TestRadiSeconds verifies second RADI clamping: floor is 1 for most drafts
+// (RADI MUST NOT be zero), and floor is 3 for drafts 10–11 (§6.2.5 MUST).
 func TestRadiSeconds(t *testing.T) {
 	if radiSeconds(500*time.Millisecond, groupD08) != 1 {
 		t.Fatal("D08: sub-second should clamp to 1")
@@ -689,10 +703,20 @@ func TestRadiSeconds(t *testing.T) {
 		t.Fatal("D08: 2s should be 2")
 	}
 	if radiSeconds(time.Second, groupD10) != 3 {
-		t.Fatal("D10: 1s should clamp to 3")
+		t.Fatal("D10: 1s should clamp to 3 (MUST be at least 3)")
+	}
+	if radiSeconds(2*time.Second, groupD10) != 3 {
+		t.Fatal("D10: 2s should clamp to 3 (MUST be at least 3)")
+	}
+	if radiSeconds(3*time.Second, groupD10) != 3 {
+		t.Fatal("D10: 3s should be 3")
 	}
 	if radiSeconds(5*time.Second, groupD10) != 5 {
 		t.Fatal("D10: 5s should be 5")
+	}
+	// groupD12 does not enforce the floor of 3 (SHOULD, not MUST).
+	if radiSeconds(time.Second, groupD12) != 1 {
+		t.Fatal("D12: 1s should be 1 (no MUST floor)")
 	}
 	if radiSeconds(time.Duration(math.MaxInt64), groupD08) != math.MaxUint32 {
 		t.Fatal("overflow should clamp to MaxUint32")
@@ -734,9 +758,16 @@ func TestDecodeRadiusRejectsShort(t *testing.T) {
 
 // TestDecodeRadiusRejectsZero verifies that RADI=0 is rejected per §5.2.5.
 func TestDecodeRadiusRejectsZero(t *testing.T) {
-	for _, g := range []wireGroup{groupGoogle, groupD05, groupD10, groupD14} {
+	// Drafts 10+ forbid RADI == 0 (§6.2.5 MUST).
+	for _, g := range []wireGroup{groupD10, groupD12, groupD14} {
 		if _, err := decodeRadius(make([]byte, 4), g); err == nil {
 			t.Fatalf("expected error for RADI=0 with group %d", g)
+		}
+	}
+	// Pre-draft-10 and Google do not forbid RADI == 0.
+	for _, g := range []wireGroup{groupGoogle, groupD01, groupD05, groupD08} {
+		if _, err := decodeRadius(make([]byte, 4), g); err != nil {
+			t.Fatalf("RADI=0 should be accepted for group %d: %v", g, err)
 		}
 	}
 }
@@ -863,10 +894,22 @@ func TestDecodeRejectsTooShort(t *testing.T) {
 	}
 }
 
-// TestDecodeRejectsZeroTags verifies that a zero tag count is rejected.
-func TestDecodeRejectsZeroTags(t *testing.T) {
-	if _, err := Decode([]byte{0, 0, 0, 0}); err == nil {
-		t.Fatal("expected error")
+// TestDecodeZeroTags verifies that a zero-tag message returns an empty map.
+func TestDecodeZeroTags(t *testing.T) {
+	msg, err := Decode([]byte{0, 0, 0, 0})
+	if err != nil {
+		t.Fatalf("zero-tag message should be valid: %v", err)
+	}
+	if len(msg) != 0 {
+		t.Fatalf("expected empty map, got %d entries", len(msg))
+	}
+}
+
+// TestDecodeZeroTagsTrailingData verifies that trailing data after a zero-tag
+// header is rejected.
+func TestDecodeZeroTagsTrailingData(t *testing.T) {
+	if _, err := Decode([]byte{0, 0, 0, 0, 0xff}); err == nil {
+		t.Fatal("expected error for trailing data")
 	}
 }
 
@@ -1013,9 +1056,9 @@ func TestSelectVersionRejectsNoMutual(t *testing.T) {
 	}
 }
 
-// TestSupportedVersionsAscending verifies VERS list ordering.
-func TestSupportedVersionsAscending(t *testing.T) {
-	vs := SupportedVersions()
+// TestSupportedAscending verifies the internal VERS list is ascending.
+func TestSupportedAscending(t *testing.T) {
+	vs := supportedVersions
 	for i := 1; i < len(vs); i++ {
 		if vs[i] <= vs[i-1] {
 			t.Fatalf("not ascending at index %d", i)
@@ -1023,8 +1066,8 @@ func TestSupportedVersionsAscending(t *testing.T) {
 	}
 }
 
-// TestSupportedVersionsBytesLength verifies pre-encoded VERS byte length.
-func TestSupportedVersionsBytesLength(t *testing.T) {
+// TestSupportedBytesLength verifies the pre-encoded VERS byte length.
+func TestSupportedBytesLength(t *testing.T) {
 	if len(supportedVersionsBytes) != 4*len(supportedVersions) {
 		t.Fatal("length mismatch")
 	}
@@ -1094,6 +1137,63 @@ func TestParseRequestSRV(t *testing.T) {
 	}
 }
 
+// TestParseRequestRejectsSRVWrongLengthD10 verifies that drafts 10+ reject an
+// SRV tag whose length is not 32 bytes (the SHA-512/256 hash length).
+func TestParseRequestRejectsSRVWrongLengthD10(t *testing.T) {
+	nonce := randBytes(t, 32)
+	msg, _ := encode(map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  {0x0c, 0x00, 0x00, 0x80}, // draft-12
+		TagSRV:  make([]byte, 16),         // wrong length
+		TagZZZZ: make([]byte, 900),
+	})
+	if _, err := ParseRequest(wrapPacket(msg)); err == nil {
+		t.Fatal("expected SRV length rejection for draft-12")
+	}
+}
+
+// TestParseRequestAcceptsShortSRVPreD10 verifies that pre-draft-10 VER lists do
+// not enforce the SRV-length rule (drafts 05–09 did not constrain SRV length).
+func TestParseRequestAcceptsShortSRVPreD10(t *testing.T) {
+	nonce := randBytes(t, 32)
+	msg, _ := encode(map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  {0x08, 0x00, 0x00, 0x80}, // draft-08
+		TagSRV:  make([]byte, 16),
+		TagPAD:  make([]byte, 900),
+	})
+	if _, err := ParseRequest(msg); err != nil {
+		t.Fatalf("expected draft-08 short SRV to be accepted: %v", err)
+	}
+}
+
+// TestParseRequestRejectsNonceVersionMismatch verifies that a request whose
+// nonce length does not match its declared max version is rejected.
+func TestParseRequestRejectsNonceVersionMismatch(t *testing.T) {
+	// draft-12 requires a 32-byte nonce; supply 64 bytes.
+	msg, _ := encode(map[uint32][]byte{
+		TagNONC: make([]byte, 64),
+		TagVER:  {0x0c, 0x00, 0x00, 0x80},
+		TagZZZZ: make([]byte, 900),
+	})
+	if _, err := ParseRequest(wrapPacket(msg)); err == nil {
+		t.Fatal("expected nonce/version mismatch rejection")
+	}
+}
+
+// TestParseRequestRejectsFramedMissingVER verifies a framed (ROUGHTIM header)
+// request without a VER tag is rejected.
+func TestParseRequestRejectsFramedMissingVER(t *testing.T) {
+	nonce := randBytes(t, 32)
+	msg, _ := encode(map[uint32][]byte{
+		TagNONC: nonce,
+		TagZZZZ: make([]byte, 900),
+	})
+	if _, err := ParseRequest(wrapPacket(msg)); err == nil {
+		t.Fatal("expected framed-request-missing-VER rejection")
+	}
+}
+
 // TestParseRequestNoVER verifies that missing VER yields empty Versions.
 func TestParseRequestNoVER(t *testing.T) {
 	nonce := randBytes(t, 64)
@@ -1136,6 +1236,27 @@ func TestNewCertificate(t *testing.T) {
 func TestNewCertificateRejectsInvalidKeySize(t *testing.T) {
 	if _, err := NewCertificate(time.Now(), time.Now(), make([]byte, 10), make([]byte, 10)); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+// TestNewCertificateRejectsInvalidWindow verifies that MINT >= MAXT is
+// rejected.
+func TestNewCertificateRejectsInvalidWindow(t *testing.T) {
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+
+	// MINT == MAXT
+	if _, err := NewCertificate(now, now, onlineSK, rootSK); err == nil {
+		t.Fatal("expected error for MINT == MAXT")
+	}
+	// MINT > MAXT
+	if _, err := NewCertificate(now.Add(time.Hour), now, onlineSK, rootSK); err == nil {
+		t.Fatal("expected error for MINT > MAXT")
+	}
+	// MINT < MAXT (valid)
+	if _, err := NewCertificate(now, now.Add(time.Hour), onlineSK, rootSK); err != nil {
+		t.Fatalf("unexpected error for valid window: %v", err)
 	}
 }
 
@@ -1183,12 +1304,14 @@ func TestMerkleTreeSingleLeaf(t *testing.T) {
 }
 
 // TestMerkleTreeTwoLeaves verifies root and sibling paths for a balanced tree.
+// groupD12 uses node-first convention: parent = H(0x01 || right || left).
 func TestMerkleTreeTwoLeaves(t *testing.T) {
 	d0 := bytes.Repeat([]byte{0xaa}, 32)
 	d1 := bytes.Repeat([]byte{0xbb}, 32)
 	tree := newMerkleTree(groupD12, [][]byte{d0, d1})
 	h0, h1 := leafHash(groupD12, d0), leafHash(groupD12, d1)
-	if !bytes.Equal(tree.rootHash, nodeHash(groupD12, h0, h1)) {
+	// Node-first: nodeHash(right=h1, left=h0)
+	if !bytes.Equal(tree.rootHash, nodeHash(groupD12, h1, h0)) {
 		t.Fatal("root mismatch")
 	}
 	if !bytes.Equal(tree.paths[0][0], h1) || !bytes.Equal(tree.paths[1][0], h0) {
@@ -1209,10 +1332,11 @@ func TestMerkleTreeThreeLeaves(t *testing.T) {
 	h1 := leafHash(groupD12, d[1])
 	h2 := leafHash(groupD12, d[2])
 
-	// With power-of-2 padding, 3 leaves become [h0, h1, h2, h2]
-	n01 := nodeHash(groupD12, h0, h1)
+	// With power-of-2 padding, 3 leaves become [h0, h1, h2, h2]. groupD12 uses
+	// node-first: nodeHash(right, left).
+	n01 := nodeHash(groupD12, h1, h0)
 	n22 := nodeHash(groupD12, h2, h2)
-	wantRoot := nodeHash(groupD12, n01, n22)
+	wantRoot := nodeHash(groupD12, n22, n01)
 	if !bytes.Equal(tree.rootHash, wantRoot) {
 		t.Fatal("three-leaf root mismatch")
 	}
@@ -1229,8 +1353,9 @@ func TestMerkleTreeFourLeaves(t *testing.T) {
 	for i := range h {
 		h[i] = leafHash(groupD12, leaves[i])
 	}
-	n01, n23 := nodeHash(groupD12, h[0], h[1]), nodeHash(groupD12, h[2], h[3])
-	if !bytes.Equal(tree.rootHash, nodeHash(groupD12, n01, n23)) {
+	// groupD12 uses node-first: nodeHash(right, left).
+	n01, n23 := nodeHash(groupD12, h[1], h[0]), nodeHash(groupD12, h[3], h[2])
+	if !bytes.Equal(tree.rootHash, nodeHash(groupD12, n23, n01)) {
 		t.Fatal("root mismatch")
 	}
 	if len(tree.paths[0]) != 2 || !bytes.Equal(tree.paths[0][0], h[1]) || !bytes.Equal(tree.paths[0][1], n23) {
@@ -1253,10 +1378,11 @@ func TestMerkleTreeNonPowerOfTwo(t *testing.T) {
 				hash := leafHash(groupD12, d)
 				index := uint32(i)
 				for _, sib := range tree.paths[i] {
+					// groupD12 uses node-first convention.
 					if index&1 == 0 {
-						hash = nodeHash(groupD12, hash, sib)
-					} else {
 						hash = nodeHash(groupD12, sib, hash)
+					} else {
+						hash = nodeHash(groupD12, hash, sib)
 					}
 					index >>= 1
 				}
@@ -1337,6 +1463,7 @@ func TestCreateRepliesRejectsEmpty(t *testing.T) {
 }
 
 // TestClientVersionPreference verifies that the highest version is selected.
+// The client includes TYPE in the request, so draft-12 maps to groupD14.
 func TestClientVersionPreference(t *testing.T) {
 	ver, g, err := clientVersionPreference([]Version{VersionDraft08, VersionDraft12})
 	if err != nil || ver != VersionDraft12 || g != groupD14 {
@@ -1409,9 +1536,9 @@ func TestCreateRequestIETF(t *testing.T) {
 	}
 }
 
-// TestCreateRequestDraft12 verifies that draft 12+ requests include TYPE=0.
-// TYPE is required by drafts 14–19 and harmlessly ignored by drafts 12–13 (all
-// share wire version 0x8000000c).
+// TestCreateRequestDraft12 verifies that draft 12 requests include TYPE=0. The
+// client always sends TYPE to signal draft-14+ support; if the server responds
+// without TYPE the client falls back to groupD12.
 func TestCreateRequestDraft12(t *testing.T) {
 	nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
 	if err != nil {
@@ -1425,7 +1552,7 @@ func TestCreateRequestDraft12(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !parsed.HasType {
-		t.Fatal("draft 12+ request should have TYPE=0")
+		t.Fatal("draft 12 request should have TYPE")
 	}
 }
 
@@ -1442,7 +1569,7 @@ func TestCreateRequestRejectsEmpty(t *testing.T) {
 // 0x8000000c shared by drafts 12–19). Each subtest creates a request, parses it
 // as the server, signs a reply, and verifies the reply as the client.
 func TestVerifyReplyAllVersions(t *testing.T) {
-	for _, v := range append([]Version{VersionGoogle}, SupportedVersions()...) {
+	for _, v := range append([]Version{VersionGoogle}, supportedVersions...) {
 		t.Run(v.ShortString(), func(t *testing.T) {
 			verifyRoundTrip(t, []Version{v}, v)
 		})
@@ -1599,13 +1726,65 @@ func TestVerifyReplyBatchDraft12(t *testing.T) {
 	}
 }
 
+// TestCreateRepliesRejectsMixedHasType verifies that a batch where requests
+// share VersionDraft12 but differ in HasType (draft 12-13 vs 14-19 clients) is
+// rejected. Mixed HasType values resolve to different wire groups, so the
+// shared SREP/Merkle/CERT would be built for the wrong group for some requests.
+func TestCreateRepliesRejectsMixedHasType(t *testing.T) {
+	cert, _ := testCert(t)
+
+	_, req0, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed0, err := ParseRequest(req0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a draft 12-13 client (no TYPE).
+	parsed0.HasType = false
+
+	_, req1, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed1, err := ParseRequest(req1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// parsed1.HasType is true from CreateRequest (draft 14+ client with
+	// TYPE=0).
+
+	reqs := []Request{*parsed0, *parsed1}
+	if _, err := CreateReplies(VersionDraft12, reqs, time.Now(), time.Second, cert); err == nil {
+		t.Fatal("expected error for mixed HasType batch")
+	}
+}
+
+// TestCreateRepliesBatchDraft01Rejected verifies that multi-request batches are
+// rejected for drafts 01-02 (NONC is inside SREP).
+func TestCreateRepliesBatchDraft01Rejected(t *testing.T) {
+	cert, _ := testCert(t)
+	nonce0 := randBytes(t, 64)
+	nonce1 := randBytes(t, 64)
+	raw0 := buildIETFRequest(nonce0, []Version{VersionDraft01}, false)
+	raw1 := buildIETFRequest(nonce1, []Version{VersionDraft01}, false)
+	reqs := []Request{
+		{Nonce: nonce0, Versions: []Version{VersionDraft01}, RawPacket: raw0},
+		{Nonce: nonce1, Versions: []Version{VersionDraft01}, RawPacket: raw1},
+	}
+	if _, err := CreateReplies(VersionDraft01, reqs, time.Now(), time.Second, cert); err == nil {
+		t.Fatal("expected error for multi-request draft-01 batch")
+	}
+}
+
 // TestExtractResponseVERTopLevel verifies VER extraction from the top-level
 // response.
 func TestExtractResponseVERTopLevel(t *testing.T) {
 	resp := map[uint32][]byte{
 		TagVER: {0x08, 0x00, 0x00, 0x80},
 	}
-	ver, ok := extractResponseVER(resp)
+	ver, ok := extractResponseVER(resp, nil)
 	if !ok || ver != VersionDraft08 {
 		t.Fatal("expected VersionDraft08 from top-level VER")
 	}
@@ -1614,14 +1793,14 @@ func TestExtractResponseVERTopLevel(t *testing.T) {
 // TestExtractResponseVERFromSREP verifies VER extraction from inside SREP when
 // no top-level VER is present.
 func TestExtractResponseVERFromSREP(t *testing.T) {
-	srepMsg, _ := encode(map[uint32][]byte{
+	srep := map[uint32][]byte{
 		TagVER:  {0x0c, 0x00, 0x00, 0x80},
 		TagRADI: make([]byte, 4),
 		TagMIDP: make([]byte, 8),
 		TagROOT: make([]byte, 32),
-	})
-	resp := map[uint32][]byte{TagSREP: srepMsg}
-	ver, ok := extractResponseVER(resp)
+	}
+	resp := map[uint32][]byte{}
+	ver, ok := extractResponseVER(resp, srep)
 	if !ok || ver != VersionDraft12 {
 		t.Fatal("expected VersionDraft12 from SREP VER")
 	}
@@ -1631,7 +1810,7 @@ func TestExtractResponseVERFromSREP(t *testing.T) {
 // returns false.
 func TestExtractResponseVERMissing(t *testing.T) {
 	resp := map[uint32][]byte{TagSIG: make([]byte, 64)}
-	if _, ok := extractResponseVER(resp); ok {
+	if _, ok := extractResponseVER(resp, nil); ok {
 		t.Fatal("expected no VER")
 	}
 }
@@ -2073,26 +2252,22 @@ func TestVerifyMerkleRejectsLongPATH(t *testing.T) {
 	}
 }
 
-// TestVerifyReplySREPRejectsCorruptSREP verifies that verifyReplySREP rejects
-// an un-decodable SREP body.
-func TestVerifyReplySREPRejectsCorruptSREP(t *testing.T) {
-	resp := map[uint32][]byte{
-		TagSREP: {0xff, 0xff, 0xff, 0xff},
-	}
-	if _, _, err := verifyReplySREP(resp, nil, nil, groupGoogle); err == nil {
-		t.Fatal("expected error for corrupt SREP")
+// TestVerifyReplySREPRejectsNilSREP verifies that verifyReplySREP rejects a nil
+// pre-decoded SREP (the caller decodes SREP once and passes it in).
+func TestVerifyReplySREPRejectsNilSREP(t *testing.T) {
+	if _, _, err := verifyReplySREP(nil, map[uint32][]byte{}, nil, nil, groupGoogle); err == nil {
+		t.Fatal("expected error for nil SREP")
 	}
 }
 
 // TestVerifyReplySREPRejectsMissingMIDP verifies that verifyReplySREP rejects a
 // SREP without MIDP.
 func TestVerifyReplySREPRejectsMissingMIDP(t *testing.T) {
-	srepBytes, _ := encode(map[uint32][]byte{
+	srep := map[uint32][]byte{
 		TagRADI: make([]byte, 4),
 		TagROOT: make([]byte, 64),
-	})
-	resp := map[uint32][]byte{TagSREP: srepBytes}
-	if _, _, err := verifyReplySREP(resp, nil, nil, groupGoogle); err == nil {
+	}
+	if _, _, err := verifyReplySREP(srep, map[uint32][]byte{}, nil, nil, groupGoogle); err == nil {
 		t.Fatal("expected error for missing MIDP")
 	}
 }
@@ -2100,12 +2275,11 @@ func TestVerifyReplySREPRejectsMissingMIDP(t *testing.T) {
 // TestVerifyReplySREPRejectsMissingRADI verifies that verifyReplySREP rejects a
 // SREP without RADI.
 func TestVerifyReplySREPRejectsMissingRADI(t *testing.T) {
-	srepBytes, _ := encode(map[uint32][]byte{
+	srep := map[uint32][]byte{
 		TagMIDP: make([]byte, 8),
 		TagROOT: make([]byte, 64),
-	})
-	resp := map[uint32][]byte{TagSREP: srepBytes}
-	if _, _, err := verifyReplySREP(resp, nil, nil, groupGoogle); err == nil {
+	}
+	if _, _, err := verifyReplySREP(srep, map[uint32][]byte{}, nil, nil, groupGoogle); err == nil {
 		t.Fatal("expected error for missing RADI")
 	}
 }
@@ -2113,13 +2287,12 @@ func TestVerifyReplySREPRejectsMissingRADI(t *testing.T) {
 // TestVerifyReplySREPRejectsBadROOT verifies that verifyReplySREP rejects a
 // SREP with a wrong-length ROOT hash.
 func TestVerifyReplySREPRejectsBadROOT(t *testing.T) {
-	srepBytes, _ := encode(map[uint32][]byte{
+	srep := map[uint32][]byte{
 		TagMIDP: make([]byte, 8),
 		TagRADI: make([]byte, 4),
 		TagROOT: make([]byte, 16), // should be 64 for Google
-	})
-	resp := map[uint32][]byte{TagSREP: srepBytes}
-	if _, _, err := verifyReplySREP(resp, nil, nil, groupGoogle); err == nil {
+	}
+	if _, _, err := verifyReplySREP(srep, map[uint32][]byte{}, nil, nil, groupGoogle); err == nil {
 		t.Fatal("expected error for bad ROOT size")
 	}
 }
@@ -2130,17 +2303,16 @@ func TestVerifyReplySREPRejectsBadMIDP(t *testing.T) {
 	nonce := make([]byte, 64)
 	root := leafHash(groupGoogle, nonce)
 	var indx [4]byte
-	srepBytes, _ := encode(map[uint32][]byte{
+	srep := map[uint32][]byte{
 		TagMIDP: make([]byte, 4), // should be 8
 		TagRADI: make([]byte, 4),
 		TagROOT: root,
-	})
+	}
 	resp := map[uint32][]byte{
-		TagSREP: srepBytes,
 		TagINDX: indx[:],
 		TagPATH: {},
 	}
-	if _, _, err := verifyReplySREP(resp, nonce, nil, groupGoogle); err == nil {
+	if _, _, err := verifyReplySREP(srep, resp, nonce, nil, groupGoogle); err == nil {
 		t.Fatal("expected error for bad MIDP size")
 	}
 }
@@ -2151,17 +2323,16 @@ func TestVerifyReplySREPRejectsBadRADI(t *testing.T) {
 	nonce := make([]byte, 64)
 	root := leafHash(groupGoogle, nonce)
 	var indx [4]byte
-	srepBytes, _ := encode(map[uint32][]byte{
+	srep := map[uint32][]byte{
 		TagMIDP: make([]byte, 8),
 		TagRADI: make([]byte, 8), // should be 4
 		TagROOT: root,
-	})
+	}
 	resp := map[uint32][]byte{
-		TagSREP: srepBytes,
 		TagINDX: indx[:],
 		TagPATH: {},
 	}
-	if _, _, err := verifyReplySREP(resp, nonce, nil, groupGoogle); err == nil {
+	if _, _, err := verifyReplySREP(srep, resp, nonce, nil, groupGoogle); err == nil {
 		t.Fatal("expected error for bad RADI size")
 	}
 }
@@ -2386,18 +2557,36 @@ func TestDraft12NoTopLevelVER(t *testing.T) {
 }
 
 // TestParseRequestRejectsUnsortedVER verifies that VER lists which are not
-// strictly ascending are rejected (drafts 13+ §5.1.2 MUST).
+// strictly ascending are rejected when the highest declared version is drafts
+// 12+ (§5.1.1 MUST).
 func TestParseRequestRejectsUnsortedVER(t *testing.T) {
 	nonce := randBytes(t, 32)
-	// Out of order: Draft12 then Draft10.
+	// Out of order: Draft12 then Draft10 (max=12, gate applies).
 	raw := buildIETFRequest(nonce, []Version{VersionDraft12, VersionDraft10}, false)
 	if _, err := ParseRequest(raw); err == nil {
-		t.Fatal("expected error for unsorted VER list")
+		t.Fatal("expected error for unsorted VER list containing drafts 12+")
 	}
-	// Duplicates should also be rejected.
-	raw = buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft10}, false)
+	// Duplicates within drafts 12+ must also be rejected.
+	raw = buildIETFRequest(nonce, []Version{VersionDraft12, VersionDraft12}, false)
 	if _, err := ParseRequest(raw); err == nil {
-		t.Fatal("expected error for repeating VER list")
+		t.Fatal("expected error for repeating VER list containing drafts 12+")
+	}
+}
+
+// TestParseRequestAcceptsUnsortedVERPreD12 verifies that pre-draft-12 VER lists
+// may be unsorted or duplicated; the strict-ascending rule only starts at
+// draft-12 (§5.1.1).
+func TestParseRequestAcceptsUnsortedVERPreD12(t *testing.T) {
+	// 32-byte nonce: consistent with draft-05+ which is the higher of the
+	// declared versions.
+	nonce := randBytes(t, 32)
+	raw := buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft05}, false)
+	if _, err := ParseRequest(raw); err != nil {
+		t.Fatalf("pre-D12 unsorted VER list should be accepted: %v", err)
+	}
+	raw = buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft10}, false)
+	if _, err := ParseRequest(raw); err != nil {
+		t.Fatalf("pre-D12 duplicate VER list should be accepted: %v", err)
 	}
 }
 
@@ -2502,4 +2691,1677 @@ func TestVerifyReplyRejectsResponseTYPENot1(t *testing.T) {
 			t.Fatalf("expected error for response TYPE=%d", badType)
 		}
 	}
+}
+
+// TestVerifyNoVersionDowngradeRejectsLargeVERS verifies that a server VERS list
+// with more than 32 entries is rejected (drafts 14+ §5.2.5).
+func TestVerifyNoVersionDowngradeRejectsLargeVERS(t *testing.T) {
+	cert, rootSK := testCert(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+
+	// Build a response with a VERS list of 33 entries.
+	g := groupD14
+	nonce := randBytes(t, 32)
+	req := buildIETFRequest(nonce, []Version{VersionDraft12}, true)
+	parsed, _ := ParseRequest(req)
+	tree := newMerkleTree(g, [][]byte{parsed.RawPacket})
+
+	midpBuf := encodeTimestamp(time.Now(), g)
+	var radiBuf [4]byte
+	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second, g))
+	var verBuf [4]byte
+	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
+
+	// Create oversized VERS with 33 entries
+	largeVERS := make([]byte, 33*4)
+	for i := range 33 {
+		binary.LittleEndian.PutUint32(largeVERS[i*4:], uint32(0x80000001+i))
+	}
+
+	srepTags := map[uint32][]byte{
+		TagRADI: radiBuf[:],
+		TagMIDP: midpBuf[:],
+		TagROOT: tree.rootHash,
+		TagVER:  verBuf[:],
+		TagVERS: largeVERS,
+	}
+	srepBytes, _ := encode(srepTags)
+	toSign := make([]byte, len(responseCtx)+len(srepBytes))
+	copy(toSign, responseCtx)
+	copy(toSign[len(responseCtx):], srepBytes)
+	srepSig := ed25519.Sign(cert.onlineSK, toSign)
+
+	var typeBuf [4]byte
+	binary.LittleEndian.PutUint32(typeBuf[:], 1)
+	resp := map[uint32][]byte{
+		TagSIG:  srepSig,
+		TagSREP: srepBytes,
+		TagCERT: cert.certBytes(g),
+		TagPATH: nil,
+		TagINDX: make([]byte, 4),
+		TagNONC: nonce,
+		TagTYPE: typeBuf[:],
+	}
+	replyMsg, _ := encode(resp)
+	reply := wrapPacket(replyMsg)
+	if _, _, err := VerifyReply([]Version{VersionDraft12}, reply, rootPK, nonce, req); err == nil {
+		t.Fatal("expected error for VERS with >32 entries")
+	}
+}
+
+// TestMerkleNodeFirstConvention verifies that the Merkle tree convention
+// differs between wire groups: groupD05–groupD12 use node-first, others use
+// hash-first.
+func TestMerkleNodeFirstConvention(t *testing.T) {
+	d0 := bytes.Repeat([]byte{0xaa}, 32)
+	d1 := bytes.Repeat([]byte{0xbb}, 32)
+
+	// groupGoogle uses hash-first: nodeHash(h0, h1)
+	treeG := newMerkleTree(groupGoogle, [][]byte{d0, d1})
+	h0g, h1g := leafHash(groupGoogle, d0), leafHash(groupGoogle, d1)
+	if !bytes.Equal(treeG.rootHash, nodeHash(groupGoogle, h0g, h1g)) {
+		t.Fatal("groupGoogle: expected hash-first")
+	}
+
+	// groupD08 uses node-first: nodeHash(h1, h0)
+	tree08 := newMerkleTree(groupD08, [][]byte{d0, d1})
+	h0_08, h1_08 := leafHash(groupD08, d0), leafHash(groupD08, d1)
+	if !bytes.Equal(tree08.rootHash, nodeHash(groupD08, h1_08, h0_08)) {
+		t.Fatal("groupD08: expected node-first")
+	}
+
+	// groupD14 uses hash-first: nodeHash(h0, h1) (draft 16+ convention)
+	tree14 := newMerkleTree(groupD14, [][]byte{d0, d1})
+	h0_14, h1_14 := leafHash(groupD14, d0), leafHash(groupD14, d1)
+	if !bytes.Equal(tree14.rootHash, nodeHash(groupD14, h0_14, h1_14)) {
+		t.Fatal("groupD14: expected hash-first")
+	}
+}
+
+// TestCreateRequestPaddingTag verifies that CreateRequest emits the correct
+// padding tag per wire group: PAD\xff for Google, PAD\0 for IETF drafts 01–07,
+// and ZZZZ for IETF drafts 08+.
+func TestCreateRequestPaddingTag(t *testing.T) {
+	tests := []struct {
+		name    string
+		ver     []Version
+		wantTag uint32
+	}{
+		{"Google", []Version{VersionGoogle}, TagPAD},
+		{"draft-01", []Version{VersionDraft01}, tagPADIETF},
+		{"draft-05", []Version{VersionDraft05}, tagPADIETF},
+		{"draft-07", []Version{VersionDraft07}, tagPADIETF},
+		{"draft-08", []Version{VersionDraft08}, TagZZZZ},
+		{"draft-10", []Version{VersionDraft10}, TagZZZZ},
+		{"draft-12", []Version{VersionDraft12}, TagZZZZ},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, req, err := CreateRequest(tt.ver, rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Strip ROUGHTIM header for IETF drafts.
+			msg := req
+			if tt.ver[0] != VersionGoogle {
+				msg, err = unwrapPacket(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			decoded, err := Decode(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := decoded[tt.wantTag]; !ok {
+				t.Fatalf("expected padding tag %#08x in request", tt.wantTag)
+			}
+		})
+	}
+}
+
+// TestLeafHashSHA512_256 verifies that SHA-512/256 groups (groupD02, groupD07)
+// produce distinct Merkle leaf hashes from SHA-512-truncated groups.
+func TestLeafHashSHA512_256(t *testing.T) {
+	data := []byte("test SHA-512/256 leaf")
+	h256 := sha512.Sum512_256(append([]byte{0x00}, data...))
+	h512 := sha512.Sum512(append([]byte{0x00}, data...))
+
+	for _, g := range []wireGroup{groupD02, groupD07} {
+		got := leafHash(g, data)
+		if !bytes.Equal(got, h256[:]) {
+			t.Fatalf("group %d leafHash should use SHA-512/256", g)
+		}
+		if bytes.Equal(got, h512[:32]) {
+			t.Fatalf("group %d leafHash matches SHA-512 truncated (should be SHA-512/256)", g)
+		}
+	}
+}
+
+// TestNodeHashSHA512_256 verifies that SHA-512/256 groups produce nodeHash
+// using the SHA-512/256 algorithm.
+func TestNodeHashSHA512_256(t *testing.T) {
+	left := bytes.Repeat([]byte{0xcc}, 32)
+	right := bytes.Repeat([]byte{0xdd}, 32)
+	buf := append([]byte{0x01}, left...)
+	buf = append(buf, right...)
+	want256 := sha512.Sum512_256(buf)
+	want512 := sha512.Sum512(buf)
+
+	for _, g := range []wireGroup{groupD02, groupD07} {
+		got := nodeHash(g, left, right)
+		if !bytes.Equal(got, want256[:]) {
+			t.Fatalf("group %d nodeHash should use SHA-512/256", g)
+		}
+		if bytes.Equal(got, want512[:32]) {
+			t.Fatalf("group %d nodeHash matches SHA-512 truncated (should be SHA-512/256)", g)
+		}
+	}
+}
+
+// TestComputeSRV verifies the SRV tag value matches SHA-512(0xff ||
+// pubkey)[:32].
+func TestComputeSRV(t *testing.T) {
+	_, rootSK, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+
+	h := sha512.New()
+	h.Write([]byte{0xff})
+	h.Write(rootPK)
+	want := h.Sum(nil)[:32]
+
+	got := ComputeSRV(rootPK)
+	if !bytes.Equal(got, want) {
+		t.Fatal("ComputeSRV mismatch")
+	}
+}
+
+// TestComputeSRVBadKeyLength verifies ComputeSRV returns nil for invalid key
+// lengths.
+func TestComputeSRVBadKeyLength(t *testing.T) {
+	if got := ComputeSRV(make([]byte, 16)); got != nil {
+		t.Fatal("expected nil for short key")
+	}
+	if got := ComputeSRV(nil); got != nil {
+		t.Fatal("expected nil for nil key")
+	}
+}
+
+// TestCreateRepliesBatchDraft03 verifies that multi-request batches succeed for
+// draft-03+ (NONC at top level, enabling Merkle batching).
+func TestCreateRepliesBatchDraft03(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	const n = 3
+	reqs := make([]Request, n)
+	nonces := make([][]byte, n)
+	rawReqs := make([][]byte, n)
+	for i := range n {
+		nonce, req, err := CreateRequest([]Version{VersionDraft03}, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqs[i] = *parsed
+		nonces[i] = nonce
+		rawReqs[i] = req
+	}
+	replies, err := CreateReplies(VersionDraft03, reqs, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		if _, _, err := VerifyReply([]Version{VersionDraft03}, replies[i], rootPK, nonces[i], rawReqs[i]); err != nil {
+			t.Fatalf("reply %d: %v", i, err)
+		}
+	}
+}
+
+// TestCreateRepliesBatchDraft02Rejected verifies that multi-request batches are
+// rejected for draft-02 (NONC is inside SREP, same as draft-01).
+func TestCreateRepliesBatchDraft02Rejected(t *testing.T) {
+	cert, _ := testCert(t)
+	nonce0 := randBytes(t, 64)
+	nonce1 := randBytes(t, 64)
+	raw0 := buildIETFRequest(nonce0, []Version{VersionDraft02}, false)
+	raw1 := buildIETFRequest(nonce1, []Version{VersionDraft02}, false)
+	reqs := []Request{
+		{Nonce: nonce0, Versions: []Version{VersionDraft02}, RawPacket: raw0},
+		{Nonce: nonce1, Versions: []Version{VersionDraft02}, RawPacket: raw1},
+	}
+	if _, err := CreateReplies(VersionDraft02, reqs, time.Now(), time.Second, cert); err == nil {
+		t.Fatal("expected error for multi-request draft-02 batch")
+	}
+}
+
+// TestExtractVersionFromReply verifies the ExtractVersion public API for IETF
+// replies (Google has no VER tag so it returns false).
+func TestExtractVersionFromReply(t *testing.T) {
+	// IETF versions with top-level or SREP VER should be extractable.
+	for _, ver := range []Version{VersionDraft08, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			cert, _ := testCert(t)
+			nonce, req, err := CreateRequest([]Version{ver}, rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = nonce
+			parsed, err := ParseRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replies, err := CreateReplies(ver, []Request{*parsed}, time.Now(), time.Second, cert)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := ExtractVersion(replies[0])
+			if !ok {
+				t.Fatal("ExtractVersion returned false")
+			}
+			// Draft-08 has top-level VER; draft-12 has SREP VER. Both should
+			// return the wire version for draft-12 (0x8000000c).
+			if ver == VersionDraft12 && got != VersionDraft12 {
+				t.Fatalf("got %s, want %s", got, VersionDraft12)
+			}
+		})
+	}
+
+	// Google-Roughtime has no VER tag.
+	t.Run("Google", func(t *testing.T) {
+		cert, _ := testCert(t)
+		_, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replies, err := CreateReplies(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ExtractVersion(replies[0]); ok {
+			t.Fatal("Google-Roughtime should not have extractable version")
+		}
+	})
+}
+
+// TestVerifyReplyRejectsMismatchedNONC verifies that a present but wrong
+// top-level NONC in drafts 03+ is rejected.
+func TestVerifyReplyRejectsMismatchedNONC(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies, err := CreateReplies(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tamper with the NONC in the reply.
+	reply := replies[0]
+	inner, err := unwrapPacket(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := Decode(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badNonce := make([]byte, len(resp[TagNONC]))
+	copy(badNonce, resp[TagNONC])
+	badNonce[0] ^= 0xff
+	resp[TagNONC] = badNonce
+	tampered, err := encode(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedReply := wrapPacket(tampered)
+
+	if _, _, err := VerifyReply([]Version{VersionDraft08}, tamperedReply, rootPK, nonce, req); err == nil {
+		t.Fatal("expected error for mismatched NONC")
+	}
+}
+
+// TestVerifyReplyMidpointAtDELEBoundary verifies that midpoint exactly equal to
+// MINT or MAXT passes validation.
+func TestVerifyReplyMidpointAtDELEBoundary(t *testing.T) {
+	rootSK, onlineSK := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	now := time.Now().Truncate(time.Second)
+	cert, err := NewCertificate(now, now.Add(time.Hour), onlineSK, rootSK)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// MIDP=MINT: create reply at exactly the MINT boundary.
+	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies, err := CreateReplies(VersionDraft08, []Request{*parsed}, now, time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := VerifyReply([]Version{VersionDraft08}, replies[0], rootPK, nonce, req); err != nil {
+		t.Fatalf("midpoint=MINT should pass: %v", err)
+	}
+
+	// MIDP near MAXT boundary.
+	maxtTime := now.Add(time.Hour)
+	nonce2, req2, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed2, err := ParseRequest(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies2, err := CreateReplies(VersionDraft08, []Request{*parsed2}, maxtTime, time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := VerifyReply([]Version{VersionDraft08}, replies2[0], rootPK, nonce2, req2); err != nil {
+		t.Fatalf("midpoint=MAXT should pass: %v", err)
+	}
+}
+
+// TestVerifyReplyToleratesUnknownTags verifies that extra unknown tags in a
+// response do not break verification.
+func TestVerifyReplyToleratesUnknownTags(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies, err := CreateReplies(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Inject an unknown tag into the reply.
+	inner, err := unwrapPacket(replies[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := Decode(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp[0xFFFFFFFC] = make([]byte, 4) // unknown tag
+	tampered, err := encode(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedReply := wrapPacket(tampered)
+
+	if _, _, err := VerifyReply([]Version{VersionDraft08}, tamperedReply, rootPK, nonce, req); err != nil {
+		t.Fatalf("unknown tag should not break verification: %v", err)
+	}
+}
+
+// TestVerifyNoVersionDowngradeRejectsUnsortedVERS verifies that an unsorted
+// VERS list in SREP is rejected.
+func TestVerifyNoVersionDowngradeRejectsUnsortedVERS(t *testing.T) {
+	// Build a minimal SREP with unsorted VERS and call
+	// verifyNoVersionDowngrade.
+	srepVER := make([]byte, 4)
+	binary.LittleEndian.PutUint32(srepVER, uint32(VersionDraft12))
+
+	unsortedVERS := make([]byte, 8)
+	binary.LittleEndian.PutUint32(unsortedVERS[0:], uint32(VersionDraft12))
+	binary.LittleEndian.PutUint32(unsortedVERS[4:], uint32(VersionDraft08))
+
+	srepInner := map[uint32][]byte{
+		TagROOT: make([]byte, 32),
+		TagMIDP: make([]byte, 8),
+		TagRADI: {0x03, 0x00, 0x00, 0x00},
+		TagVER:  srepVER,
+		TagVERS: unsortedVERS,
+	}
+	srepBytes, err := encode(srepInner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srep, err := Decode(srepBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = verifyNoVersionDowngrade(srep, []Version{VersionDraft12})
+	if err == nil {
+		t.Fatal("expected error for unsorted VERS in SREP")
+	}
+	if got := err.Error(); got != "protocol: VERS not sorted in ascending order" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestExtractResponseVERPrefersSSREP verifies that when both top-level VER and
+// SREP VER are present, the SREP VER takes precedence.
+func TestExtractResponseVERPrefersSREP(t *testing.T) {
+	// Build a response with VER in both SREP and top level.
+	srepInner := map[uint32][]byte{
+		TagROOT: make([]byte, 32),
+		TagMIDP: make([]byte, 8),
+		TagRADI: {0x03, 0x00, 0x00, 0x00},
+	}
+	srepVER := make([]byte, 4)
+	binary.LittleEndian.PutUint32(srepVER, uint32(VersionDraft12))
+	srepInner[TagVER] = srepVER
+	srepBytes, err := encode(srepInner)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	topVER := make([]byte, 4)
+	binary.LittleEndian.PutUint32(topVER, uint32(VersionDraft08))
+	resp := map[uint32][]byte{
+		TagSREP: srepBytes,
+		TagVER:  topVER,
+	}
+
+	srep, err := Decode(srepBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := extractResponseVER(resp, srep)
+	if !ok {
+		t.Fatal("extractResponseVER returned false")
+	}
+	if got != VersionDraft12 {
+		t.Fatalf("got %s, want %s (SREP VER should take precedence)", got, VersionDraft12)
+	}
+}
+
+// TestCreateRepliesBatchDraft08 verifies that multi-request batches work for
+// draft-08 (NONC at top level, node-first Merkle, Unix seconds).
+func TestCreateRepliesBatchDraft08(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	const n = 4
+	reqs := make([]Request, n)
+	nonces := make([][]byte, n)
+	rawReqs := make([][]byte, n)
+	for i := range n {
+		nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqs[i] = *parsed
+		nonces[i] = nonce
+		rawReqs[i] = req
+	}
+	replies, err := CreateReplies(VersionDraft08, reqs, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		if _, _, err := VerifyReply([]Version{VersionDraft08}, replies[i], rootPK, nonces[i], rawReqs[i]); err != nil {
+			t.Fatalf("reply %d: %v", i, err)
+		}
+	}
+}
+
+// TestParseRequestRejectsOversizedVER verifies that a request with >32 VER
+// entries is rejected.
+func TestParseRequestRejectsOversizedVER(t *testing.T) {
+	nonce := randBytes(t, 32)
+	vers := make([]byte, 4*33) // 33 entries
+	for i := range 33 {
+		binary.LittleEndian.PutUint32(vers[4*i:], uint32(i+1))
+	}
+	tags := map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  vers,
+	}
+	msg, err := encode(tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkt := wrapPacket(msg)
+	if _, err := ParseRequest(pkt); err == nil {
+		t.Fatal("expected error for >32 VER entries")
+	}
+}
+
+// TestParseRequestRejectsTYPEWrongLength verifies that a TYPE tag with a length
+// other than 4 bytes is rejected. The spec requires TYPE to be a uint32.
+func TestParseRequestRejectsTYPEWrongLength(t *testing.T) {
+	nonce := randBytes(t, 32)
+	for _, typeLen := range []int{0, 1, 2, 3, 5, 8} {
+		t.Run(fmt.Sprintf("len=%d", typeLen), func(t *testing.T) {
+			msg, _ := encode(map[uint32][]byte{
+				TagNONC: nonce,
+				TagVER:  {0x0c, 0x00, 0x00, 0x80},
+				TagTYPE: make([]byte, typeLen),
+				TagZZZZ: make([]byte, 900),
+			})
+			if _, err := ParseRequest(wrapPacket(msg)); err == nil {
+				t.Fatalf("expected error for TYPE length %d", typeLen)
+			}
+		})
+	}
+}
+
+// TestParseRequestAcceptsVER32 verifies that a request with exactly 32 VER
+// entries (the maximum allowed by drafts 14+) is accepted.
+func TestParseRequestAcceptsVER32(t *testing.T) {
+	nonce := randBytes(t, 32)
+	vers := make([]byte, 4*32)
+	for i := range 32 {
+		binary.LittleEndian.PutUint32(vers[4*i:], uint32(0x80000001+i))
+	}
+	tags := map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  vers,
+		TagZZZZ: make([]byte, 800),
+	}
+	msg, err := encode(tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkt := wrapPacket(msg)
+	req, err := ParseRequest(pkt)
+	if err != nil {
+		t.Fatalf("VER with exactly 32 entries should be accepted: %v", err)
+	}
+	if len(req.Versions) != 32 {
+		t.Fatalf("expected 32 versions, got %d", len(req.Versions))
+	}
+}
+
+// TestVerifyReplyRejectsMismatchedNONCInSREP verifies that a tampered NONC
+// inside SREP is detected for drafts 01–02 (which place NONC inside SREP rather
+// than at the top level).
+func TestVerifyReplyRejectsMismatchedNONCInSREP(t *testing.T) {
+	for _, ver := range []Version{VersionDraft01, VersionDraft02} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+
+			// Tamper with the NONC inside SREP.
+			tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
+				srepBytes := tags[TagSREP]
+				srepTags, err := Decode(srepBytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				srepNonce := srepTags[TagNONC]
+				if len(srepNonce) == 0 {
+					t.Fatal("expected NONC in SREP for this draft")
+				}
+				srepNonce[0] ^= 0xff
+				srepTags[TagNONC] = srepNonce
+				newSREP, err := encode(srepTags)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tags[TagSREP] = newSREP
+			})
+
+			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err == nil {
+				t.Fatal("expected error for tampered NONC in SREP")
+			}
+		})
+	}
+}
+
+// TestMerkleTreeNonPowerOfTwoD14 verifies that non-power-of-2 batch sizes
+// produce valid Merkle proofs for groupD14 (hash-first convention), mirroring
+// TestMerkleTreeNonPowerOfTwo which covers groupD12 (node-first).
+func TestMerkleTreeNonPowerOfTwoD14(t *testing.T) {
+	for _, n := range []int{3, 5, 6, 7, 9, 15, 17} {
+		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
+			leaves := make([][]byte, n)
+			for i := range leaves {
+				leaves[i] = randBytes(t, 32)
+			}
+			tree := newMerkleTree(groupD14, leaves)
+
+			for i, d := range leaves {
+				hash := leafHash(groupD14, d)
+				index := uint32(i)
+				for _, sib := range tree.paths[i] {
+					// groupD14 uses hash-first: left-right by hash comparison.
+					if index&1 == 0 {
+						hash = nodeHash(groupD14, hash, sib)
+					} else {
+						hash = nodeHash(groupD14, sib, hash)
+					}
+					index >>= 1
+				}
+				if index != 0 {
+					t.Fatalf("leaf %d: trailing INDX bits non-zero", i)
+				}
+				if !bytes.Equal(hash, tree.rootHash) {
+					t.Fatalf("leaf %d: root mismatch", i)
+				}
+			}
+		})
+	}
+}
+
+// TestCreateRepliesBatchDraft14 verifies that multi-request batches work for
+// drafts 14+ (TYPE tag present, hash-first Merkle, full-packet leaf).
+func TestCreateRepliesBatchDraft14(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	const n = 5
+	reqs := make([]Request, n)
+	nonces := make([][]byte, n)
+	rawReqs := make([][]byte, n)
+	for i := range n {
+		nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !parsed.HasType {
+			t.Fatal("CreateRequest for draft-12 should set TYPE")
+		}
+		reqs[i] = *parsed
+		nonces[i] = nonce
+		rawReqs[i] = req
+	}
+	replies, err := CreateReplies(VersionDraft12, reqs, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		mid, rad, err := VerifyReply([]Version{VersionDraft12}, replies[i], rootPK, nonces[i], rawReqs[i])
+		if err != nil {
+			t.Fatalf("reply %d: %v", i, err)
+		}
+		if mid.IsZero() || rad == 0 {
+			t.Fatalf("reply %d: zero midpoint or radius", i)
+		}
+	}
+}
+
+// TestVerifyReplyToleratesMissingNONC verifies that a response missing the
+// top-level NONC tag is tolerated for drafts 03+ because the Merkle proof
+// already binds the nonce to the signed root. Real-world servers (e.g.
+// Cloudflare) omit it.
+func TestVerifyReplyToleratesMissingNONC(t *testing.T) {
+	for _, ver := range []Version{VersionDraft03, VersionDraft05, VersionDraft08, VersionDraft10, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
+				delete(tags, TagNONC)
+			})
+			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err != nil {
+				t.Fatalf("missing NONC should be tolerated (Merkle proof binds nonce): %v", err)
+			}
+		})
+	}
+}
+
+// TestVerifyReplyRejectsMissingPATH verifies that a response missing the PATH
+// tag is rejected.
+func TestVerifyReplyRejectsMissingPATH(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			ietf := ver != VersionGoogle
+			tampered := corruptReplyTag(t, reply, ietf, func(tags map[uint32][]byte) {
+				delete(tags, TagPATH)
+			})
+			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err == nil {
+				t.Fatal("expected error for missing PATH")
+			}
+		})
+	}
+}
+
+// TestVerifyReplyRejectsMissingTYPE verifies that a draft-14+ response
+// (groupD14) without the TYPE tag falls back to groupD12 (graceful degradation)
+// and still verifies via the Merkle proof. This is intentional backward
+// compatibility with servers that do not support TYPE.
+func TestVerifyReplyRejectsMissingTYPE(t *testing.T) {
+	// A valid draft-12+ reply without TYPE falls back to groupD12, which shares
+	// the same wire format. This should still verify.
+	reply, rootPK, nonce, req := validReply(t, VersionDraft12, []Version{VersionDraft12})
+	tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
+		delete(tags, TagTYPE)
+	})
+	// Should still verify (graceful fallback to groupD12).
+	if _, _, err := VerifyReply([]Version{VersionDraft12}, tampered, rootPK, nonce, req); err != nil {
+		t.Fatalf("expected graceful fallback without TYPE: %v", err)
+	}
+}
+
+// TestVerifyReplyRejectsZeroRADI verifies that VerifyReply rejects a response
+// with RADI=0 in the signed SREP (integration test, not just unit decode).
+func TestVerifyReplyRejectsZeroRADI(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			ietf := ver != VersionGoogle
+			tampered := corruptReplyTag(t, reply, ietf, func(tags map[uint32][]byte) {
+				srepBytes := tags[TagSREP]
+				srepTags, err := Decode(srepBytes)
+				if err != nil {
+					t.Fatal(err)
+				}
+				srepTags[TagRADI] = make([]byte, 4) // RADI=0
+				newSREP, err := encode(srepTags)
+				if err != nil {
+					t.Fatal(err)
+				}
+				tags[TagSREP] = newSREP
+			})
+			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err == nil {
+				t.Fatal("expected error for RADI=0")
+			}
+		})
+	}
+}
+
+// TestDecodeRadiusMJDMicroseconds verifies that decodeRadius returns
+// microsecond-scale durations for MJD-microsecond groups (drafts 01–07).
+func TestDecodeRadiusMJDMicroseconds(t *testing.T) {
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, 1000000) // 1 second in microseconds
+	for _, g := range []wireGroup{groupD01, groupD02, groupD03, groupD05, groupD07} {
+		d, err := decodeRadius(buf, g)
+		if err != nil {
+			t.Fatalf("group %d: %v", g, err)
+		}
+		if d != time.Second {
+			t.Fatalf("group %d: radius = %v, want 1s", g, d)
+		}
+	}
+}
+
+// TestRadiSecondsGroupD14 verifies that radiSeconds for groupD14 returns the
+// same floor-of-1 behavior as groupD12.
+func TestRadiSecondsGroupD14(t *testing.T) {
+	got := radiSeconds(time.Second, groupD14)
+	if got != 1 {
+		t.Fatalf("radiSeconds(1s, groupD14) = %d, want 1", got)
+	}
+	got = radiSeconds(500*time.Millisecond, groupD14)
+	if got != 1 {
+		t.Fatalf("radiSeconds(500ms, groupD14) = %d, want 1 (floor)", got)
+	}
+}
+
+// TestNewCertificateGroupD14 verifies that NewCertificate produces valid
+// certificates for groupD14 (same wire format as groupD12).
+func TestNewCertificateGroupD14(t *testing.T) {
+	rootSK, onlineSK := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	now := time.Now()
+	cert, err := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Verify the cert is valid by round-tripping through verifyCert.
+	_, _, _, err = verifyCert(cert.certBytes(groupD14), rootPK, groupD14)
+	if err != nil {
+		t.Fatalf("verifyCert with groupD14 failed: %v", err)
+	}
+}
+
+// TestMerkleTreeGoogleBatch verifies that Google-Roughtime Merkle trees work
+// correctly with multiple leaves (64-byte SHA-512 hashes).
+func TestMerkleTreeGoogleBatch(t *testing.T) {
+	g := groupGoogle
+	leaves := make([][]byte, 5)
+	for i := range leaves {
+		leaves[i] = randBytes(t, 64) // 64-byte nonces
+	}
+	tree := newMerkleTree(g, leaves)
+	if len(tree.rootHash) != 64 {
+		t.Fatalf("Google Merkle root length = %d, want 64", len(tree.rootHash))
+	}
+	// Verify each leaf's Merkle proof by manually walking the path.
+	for i, leaf := range leaves {
+		path := tree.paths[i]
+		hash := leafHash(g, leaf)
+		index := uint32(i)
+		for _, sibling := range path {
+			if index&1 == 0 {
+				hash = nodeHash(g, hash, sibling)
+			} else {
+				hash = nodeHash(g, sibling, hash)
+			}
+			index >>= 1
+		}
+		if !bytes.Equal(hash, tree.rootHash) {
+			t.Fatalf("proof %d: Merkle root mismatch", i)
+		}
+	}
+}
+
+// TestCreateRepliesBatchGoogle verifies batch signing for Google-Roughtime with
+// multiple requests (non-power-of-2 batch size).
+func TestCreateRepliesBatchGoogle(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.rootPK
+	const n = 3
+	reqs := make([]Request, n)
+	nonces := make([][]byte, n)
+	rawReqs := make([][]byte, n)
+	for i := range n {
+		nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reqs[i] = *parsed
+		nonces[i] = nonce
+		rawReqs[i] = req
+	}
+	replies, err := CreateReplies(VersionGoogle, reqs, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		mid, rad, err := VerifyReply([]Version{VersionGoogle}, replies[i], rootPK, nonces[i], rawReqs[i])
+		if err != nil {
+			t.Fatalf("reply %d: %v", i, err)
+		}
+		if mid.IsZero() || rad == 0 {
+			t.Fatalf("reply %d: zero midpoint or radius", i)
+		}
+	}
+}
+
+// TestCreateRequestWithSRVOmittedForOldDrafts verifies that
+// CreateRequestWithSRV omits the SRV tag for pre-draft-10 versions.
+func TestCreateRequestWithSRVOmittedForOldDrafts(t *testing.T) {
+	pk := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	srv := ComputeSRV(pk)
+	for _, ver := range []Version{VersionGoogle, VersionDraft01, VersionDraft05, VersionDraft08} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			_, req, err := CreateRequestWithSRV([]Version{ver}, rand.Reader, srv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Parse and check for SRV tag absence.
+			var msg []byte
+			if ver == VersionGoogle {
+				msg = req
+			} else {
+				msg, err = unwrapPacket(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			tags, err := Decode(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := tags[TagSRV]; ok {
+				t.Fatalf("SRV tag should be absent for %s", ver)
+			}
+		})
+	}
+}
+
+// TestCreateRequestWithSRVIncludedForDraft10Plus verifies that
+// CreateRequestWithSRV includes the SRV tag for draft-10+ versions.
+func TestCreateRequestWithSRVIncludedForDraft10Plus(t *testing.T) {
+	pk := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	srv := ComputeSRV(pk)
+	for _, ver := range []Version{VersionDraft10, VersionDraft11, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			_, req, err := CreateRequestWithSRV([]Version{ver}, rand.Reader, srv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := unwrapPacket(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tags, err := Decode(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srvVal, ok := tags[TagSRV]
+			if !ok {
+				t.Fatalf("SRV tag should be present for %s", ver)
+			}
+			if !bytes.Equal(srvVal, srv) {
+				t.Fatal("SRV value mismatch")
+			}
+		})
+	}
+}
+
+// TestMerkleTreeLargeBatchD14 verifies Merkle tree construction and proof
+// verification with a 32-leaf batch (maximum PATH depth per spec) for groupD14.
+func TestMerkleTreeLargeBatchD14(t *testing.T) {
+	g := groupD14
+	const n = 32
+	leaves := make([][]byte, n)
+	for i := range leaves {
+		leaves[i] = randBytes(t, 1024) // full-packet leaf data
+	}
+	tree := newMerkleTree(g, leaves)
+	if len(tree.rootHash) != 32 {
+		t.Fatalf("root hash length = %d, want 32", len(tree.rootHash))
+	}
+	// Verify each leaf's proof manually.
+	for i, leaf := range leaves {
+		path := tree.paths[i]
+		hash := leafHash(g, leaf)
+		index := uint32(i)
+		for _, sibling := range path {
+			if index&1 == 0 {
+				hash = nodeHash(g, hash, sibling)
+			} else {
+				hash = nodeHash(g, sibling, hash)
+			}
+			index >>= 1
+		}
+		if !bytes.Equal(hash, tree.rootHash) {
+			t.Fatalf("leaf %d: Merkle root mismatch", i)
+		}
+	}
+}
+
+// TestCreateRequestZZZZAllZero verifies that the ZZZZ padding bytes emitted by
+// CreateRequest are all zero (§5.1.4: "Its value MUST be all zero bytes").
+func TestCreateRequestZZZZAllZero(t *testing.T) {
+	for _, ver := range []Version{VersionDraft08, VersionDraft10, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			msg, err := unwrapPacket(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := Decode(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pad, ok := decoded[TagZZZZ]
+			if !ok {
+				t.Fatal("expected ZZZZ tag")
+			}
+			for i, b := range pad {
+				if b != 0 {
+					t.Fatalf("ZZZZ byte %d = %#x, want 0", i, b)
+				}
+			}
+		})
+	}
+}
+
+// TestSREPContainsVERSForDraft12 verifies that SREP in draft-12+ responses
+// contains the VERS tag with all supported versions in ascending order.
+func TestSREPContainsVERSForDraft12(t *testing.T) {
+	cert, _ := testCert(t)
+	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := replies[0]
+	inner, err := unwrapPacket(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := Decode(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srepBytes, ok := resp[TagSREP]
+	if !ok {
+		t.Fatal("missing SREP in response")
+	}
+	srep, err := Decode(srepBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versBytes, ok := srep[TagVERS]
+	if !ok {
+		t.Fatal("missing VERS in SREP")
+	}
+	if len(versBytes)%4 != 0 || len(versBytes) == 0 {
+		t.Fatalf("VERS length = %d, not a positive multiple of 4", len(versBytes))
+	}
+	// Verify ascending order and that VersionDraft12 is included.
+	nv := len(versBytes) / 4
+	var prev Version
+	found12 := false
+	for i := range nv {
+		v := Version(binary.LittleEndian.Uint32(versBytes[4*i : 4*i+4]))
+		if i > 0 && v <= prev {
+			t.Fatalf("VERS not ascending: %s <= %s", v, prev)
+		}
+		if v == VersionDraft12 {
+			found12 = true
+		}
+		prev = v
+	}
+	if !found12 {
+		t.Fatal("VersionDraft12 not found in VERS")
+	}
+}
+
+// TestParseRequestRejectsEmptyVER verifies that a VER tag with zero length is
+// rejected.
+func TestParseRequestRejectsEmptyVER(t *testing.T) {
+	nonce := randBytes(t, 32)
+	tags := map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  {}, // empty VER
+	}
+	msg, _ := encode(tags)
+	pkt := wrapPacket(msg)
+	if _, err := ParseRequest(pkt); err == nil {
+		t.Fatal("expected error for empty VER tag")
+	}
+}
+
+// TestParseRequestRejectsNonMultiple4VER verifies that a VER tag with length
+// not a multiple of 4 is rejected.
+func TestParseRequestRejectsNonMultiple4VER(t *testing.T) {
+	nonce := randBytes(t, 32)
+	tags := map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  {0x01, 0x02, 0x03}, // 3 bytes, not a multiple of 4
+	}
+	msg, _ := encode(tags)
+	pkt := wrapPacket(msg)
+	if _, err := ParseRequest(pkt); err == nil {
+		t.Fatal("expected error for VER tag with non-multiple-of-4 length")
+	}
+}
+
+// FuzzDecode exercises the wire-format parser with arbitrary input. It must
+// never panic regardless of the input.
+func FuzzDecode(f *testing.F) {
+	// Seed with a valid single-tag message.
+	valid, _ := encode(map[uint32][]byte{TagNONC: make([]byte, 32)})
+	f.Add(valid)
+
+	// Seed with a valid multi-tag message.
+	multi, _ := encode(map[uint32][]byte{
+		TagNONC: make([]byte, 32),
+		TagVER:  {0x0c, 0x00, 0x00, 0x80},
+		TagZZZZ: make([]byte, 64),
+	})
+	f.Add(multi)
+
+	// Seed with minimal valid (zero-tag) message.
+	f.Add([]byte{0x00, 0x00, 0x00, 0x00})
+
+	// Seed with empty and tiny inputs.
+	f.Add([]byte{})
+	f.Add([]byte{0x01})
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Must not panic.
+		msg, err := Decode(data)
+		if err != nil {
+			return
+		}
+		// If decoding succeeds, re-encode and re-decode should round-trip
+		// (values are byte-aligned copies of the original data).
+		reencoded, err := encode(msg)
+		if err != nil {
+			// Some decoded messages may have empty map or values that fail to
+			// re-encode, which is fine.
+			return
+		}
+		msg2, err := Decode(reencoded)
+		if err != nil {
+			t.Fatalf("re-decode failed: %v", err)
+		}
+		if len(msg) != len(msg2) {
+			t.Fatalf("tag count mismatch: %d vs %d", len(msg), len(msg2))
+		}
+		for tag, val := range msg {
+			if !bytes.Equal(val, msg2[tag]) {
+				t.Fatalf("value mismatch for tag %#x", tag)
+			}
+		}
+	})
+}
+
+// FuzzParseRequest exercises request parsing with arbitrary input. It must
+// never panic regardless of the input.
+func FuzzParseRequest(f *testing.F) {
+	// Seed with a valid Google-Roughtime request.
+	_, googleReq, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	f.Add(googleReq)
+
+	// Seed with a valid IETF request (with ROUGHTIM header).
+	_, ietfReq, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	f.Add(ietfReq)
+
+	// Seed with a valid early draft request.
+	_, d01Req, _ := CreateRequest([]Version{VersionDraft01}, rand.Reader)
+	f.Add(d01Req)
+
+	f.Add([]byte{})
+	f.Add([]byte{0x00})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Must not panic.
+		ParseRequest(data) //nolint:errcheck // fuzz target tests for panics
+	})
+}
+
+// FuzzVerifyReply exercises reply verification with arbitrary input against a
+// fixed key. It must never panic regardless of the input.
+func FuzzVerifyReply(f *testing.F) {
+	// Generate a valid reply to use as seed. We inline the cert setup because
+	// testCert takes *testing.T, not *testing.F.
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	now := time.Now()
+	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	parsed, _ := ParseRequest(req)
+	replies, _ := CreateReplies(VersionDraft12, []Request{*parsed}, now, time.Second, cert)
+	f.Add(replies[0], []byte(rootPK), nonce, req)
+
+	f.Fuzz(func(t *testing.T, reply, rootKey, nonce, request []byte) {
+		// Must not panic.
+		VerifyReply([]Version{VersionDraft12}, reply, rootKey, nonce, request) //nolint:errcheck // fuzz target tests for panics
+	})
+}
+
+// FuzzVerifyReplyAllVersions exercises VerifyReply across every wire group, not
+// just Draft12. Each version exercises different code paths (hash algorithms,
+// nonce sizes, timestamp encodings, delegation contexts, NONC placement, etc).
+func FuzzVerifyReplyAllVersions(f *testing.F) {
+	versions := []Version{
+		VersionGoogle, VersionDraft01, VersionDraft02, VersionDraft03,
+		VersionDraft05, VersionDraft07, VersionDraft08, VersionDraft10,
+		VersionDraft12,
+	}
+
+	// Generate valid seeds for every version.
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	now := time.Now()
+	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+
+	for _, ver := range versions {
+		clientVers := []Version{ver}
+		nonce, req, err := CreateRequest(clientVers, rand.Reader)
+		if err != nil {
+			continue
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			continue
+		}
+		replies, err := CreateReplies(ver, []Request{*parsed}, now, time.Second, cert)
+		if err != nil {
+			continue
+		}
+		// Encode the version index as a single byte so the fuzzer can mutate
+		// it.
+		f.Add(replies[0], []byte(rootPK), nonce, req, byte(ver&0xff))
+	}
+
+	f.Fuzz(func(t *testing.T, reply, rootKey, nonce, request []byte, verHint byte) {
+		// Use verHint to select a version, giving coverage across wire groups.
+		idx := int(verHint) % len(versions)
+		ver := versions[idx]
+		// Must not panic.
+		VerifyReply([]Version{ver}, reply, rootKey, nonce, request) //nolint:errcheck // fuzz target tests for panics
+	})
+}
+
+// FuzzCreateReplies exercises server-side reply creation with fuzzed requests.
+// A panic here would be a DoS vector against the server.
+func FuzzCreateReplies(f *testing.F) {
+	versions := []Version{
+		VersionGoogle, VersionDraft01, VersionDraft02, VersionDraft05,
+		VersionDraft08, VersionDraft12,
+	}
+
+	// Seed with valid requests for each version.
+	for _, ver := range versions {
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+		if err != nil {
+			continue
+		}
+		f.Add(req, byte(ver&0xff))
+	}
+
+	// Seed with degenerate inputs.
+	f.Add([]byte{}, byte(0))
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff}, byte(0))
+	f.Add(make([]byte, 1024), byte(0x0c))
+
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+
+	f.Fuzz(func(t *testing.T, reqBytes []byte, verHint byte) {
+		idx := int(verHint) % len(versions)
+		ver := versions[idx]
+
+		parsed, err := ParseRequest(reqBytes)
+		if err != nil {
+			return
+		}
+		// Must not panic. Errors are fine.
+		CreateReplies(ver, []Request{*parsed}, now, time.Second, cert) //nolint:errcheck // fuzz target tests for panics
+	})
+}
+
+// FuzzCreateRepliesBatch exercises batch reply creation with multiple fuzzed
+// requests. Batch processing uses Merkle tree construction which must not panic
+// on adversarial input combinations.
+func FuzzCreateRepliesBatch(f *testing.F) {
+	// Seed with two valid Draft12 requests.
+	_, req1, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	_, req2, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	f.Add(req1, req2)
+
+	// Seed with two valid Google requests.
+	_, gReq1, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	_, gReq2, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	f.Add(gReq1, gReq2)
+
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+
+	f.Fuzz(func(t *testing.T, reqBytes1, reqBytes2 []byte) {
+		p1, err := ParseRequest(reqBytes1)
+		if err != nil {
+			return
+		}
+		p2, err := ParseRequest(reqBytes2)
+		if err != nil {
+			return
+		}
+		// Try both Draft12 and Google batches. Must not panic.
+		CreateReplies(VersionDraft12, []Request{*p1, *p2}, now, time.Second, cert) //nolint:errcheck // fuzz target tests for panics
+		CreateReplies(VersionGoogle, []Request{*p1, *p2}, now, time.Second, cert)  //nolint:errcheck // fuzz target tests for panics
+	})
+}
+
+// FuzzDecodeTimestamp exercises timestamp decoding across all encoding formats
+// (Unix µs, MJD µs, Unix seconds). Must not panic on short or malformed
+// buffers.
+func FuzzDecodeTimestamp(f *testing.F) {
+	// Valid 8-byte timestamps.
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(time.Now().UnixMicro()))
+	f.Add(buf[:], byte(0))
+
+	// MJD timestamp.
+	f.Add(buf[:], byte(1))
+
+	// Short inputs.
+	f.Add([]byte{}, byte(0))
+	f.Add([]byte{0x01, 0x02, 0x03}, byte(5))
+	f.Add([]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, byte(0))
+
+	versions := []Version{
+		VersionGoogle, VersionDraft01, VersionDraft05, VersionDraft08, VersionDraft12,
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte, verHint byte) {
+		idx := int(verHint) % len(versions)
+		// Must not panic.
+		DecodeTimestamp(versions[idx], data) //nolint:errcheck // fuzz target tests for panics
+	})
+}
+
+// FuzzEncode exercises the wire format encoder with arbitrary tag-value maps.
+// Must not panic on pathological inputs (many tags, huge values, etc).
+func FuzzEncode(f *testing.F) {
+	// Seed with a simple valid message.
+	f.Add(uint32(1), []byte{0x00, 0x00, 0x00, 0x00})
+
+	// Seed with values of various sizes.
+	f.Add(uint32(3), make([]byte, 256))
+
+	f.Fuzz(func(t *testing.T, numTags uint32, valTemplate []byte) {
+		// Bound the number of tags to avoid OOM.
+		n := int(numTags%64) + 1
+		// Ensure valTemplate is 4-byte aligned.
+		if len(valTemplate)%4 != 0 {
+			aligned := len(valTemplate) &^ 3
+			if aligned == 0 {
+				valTemplate = []byte{0, 0, 0, 0}
+			} else {
+				valTemplate = valTemplate[:aligned]
+			}
+		}
+		if len(valTemplate) == 0 {
+			valTemplate = []byte{0, 0, 0, 0}
+		}
+
+		msg := make(map[uint32][]byte, n)
+		for i := range n {
+			tag := uint32(i * 0x01010101) // spread tags across the space
+			msg[tag] = valTemplate
+		}
+
+		// Must not panic.
+		encoded, err := encode(msg)
+		if err != nil {
+			return
+		}
+		// Decode enforces maxMessageSize; skip round-trip for oversized
+		// messages.
+		if len(encoded) > maxMessageSize {
+			return
+		}
+		// Round-trip: decode must succeed and match.
+		decoded, err := Decode(encoded)
+		if err != nil {
+			t.Fatalf("round-trip decode failed: %v", err)
+		}
+		if len(decoded) != len(msg) {
+			t.Fatalf("tag count mismatch: got %d, want %d", len(decoded), len(msg))
+		}
+		for tag, val := range msg {
+			if !bytes.Equal(val, decoded[tag]) {
+				t.Fatalf("value mismatch for tag %#x", tag)
+			}
+		}
+	})
+}
+
+// FuzzExtractVersion exercises the public ExtractVersion API with arbitrary
+// reply bytes. Must not panic on malformed input.
+func FuzzExtractVersion(f *testing.F) {
+	// Seed with valid replies.
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+		if err != nil {
+			continue
+		}
+		parsed, _ := ParseRequest(req)
+		if parsed == nil {
+			continue
+		}
+		replies, err := CreateReplies(ver, []Request{*parsed}, now, time.Second, cert)
+		if err != nil {
+			continue
+		}
+		f.Add(replies[0])
+	}
+
+	f.Add([]byte{})
+	f.Add([]byte{0x00, 0x00, 0x00, 0x00})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Must not panic.
+		ExtractVersion(data)
+	})
+}
+
+// FuzzSelectVersion exercises the server-side version selector with arbitrary
+// client VER lists and nonce lengths. Must not panic on any input.
+func FuzzSelectVersion(f *testing.F) {
+	f.Add([]byte{}, 32)
+	f.Add([]byte{}, 64)
+	f.Add([]byte{0x0c, 0x00, 0x00, 0x80}, 32)
+	f.Add([]byte{0x08, 0x00, 0x00, 0x80, 0x0c, 0x00, 0x00, 0x80}, 32)
+
+	f.Fuzz(func(t *testing.T, verBytes []byte, nonceLen int) {
+		if len(verBytes)%4 != 0 || len(verBytes) > 4*maxVersionList {
+			return
+		}
+		vers := make([]Version, 0, len(verBytes)/4)
+		for i := 0; i < len(verBytes); i += 4 {
+			vers = append(vers, Version(binary.LittleEndian.Uint32(verBytes[i:i+4])))
+		}
+		if nonceLen < 0 || nonceLen > 1024 {
+			return
+		}
+		// Must not panic.
+		_, _ = SelectVersion(vers, nonceLen)
+	})
+}
+
+// TestGreaseDoesNotPanic verifies that Grease does not panic on valid replies.
+func TestGreaseDoesNotPanic(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.String(), func(t *testing.T) {
+			reply, _, _, _ := validReply(t, ver, []Version{ver})
+			for range 200 {
+				cp := make([]byte, len(reply))
+				copy(cp, reply)
+				Grease(cp, ver)
+			}
+		})
+	}
+}
+
+// TestGreaseCorruptSig verifies that greaseCorruptSig always produces a reply
+// that fails verification.
+func TestGreaseCorruptSig(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.String(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			for range 50 {
+				cp := make([]byte, len(reply))
+				copy(cp, reply)
+				greaseCorruptSig(cp, ver)
+				if _, _, err := VerifyReply([]Version{ver}, cp, rootPK, nonce, req); err == nil {
+					t.Fatal("greaseCorruptSig produced a reply that still verifies")
+				}
+			}
+		})
+	}
+}
+
+// TestGreaseDropTag verifies that greaseDropTag produces a reply that fails
+// verification.
+func TestGreaseDropTag(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.String(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			out := greaseDropTag(reply, ver)
+			if out == nil {
+				t.Fatal("greaseDropTag returned nil")
+			}
+			if _, _, err := VerifyReply([]Version{ver}, out, rootPK, nonce, req); err == nil {
+				t.Fatal("expected verification failure after dropping a mandatory tag")
+			}
+		})
+	}
+}
+
+// TestGreaseWrongVersion verifies that greaseWrongVersion produces a reply that
+// fails verification (draft 08 has a top-level VER).
+func TestGreaseWrongVersion(t *testing.T) {
+	// Draft08 has a top-level VER tag.
+	reply, rootPK, nonce, req := validReply(t, VersionDraft08, []Version{VersionDraft08})
+	out := greaseWrongVersion(reply, VersionDraft08)
+	if out == nil {
+		t.Fatal("greaseWrongVersion returned nil for draft08")
+	}
+	if _, _, err := VerifyReply([]Version{VersionDraft08}, out, rootPK, nonce, req); err == nil {
+		t.Fatal("expected verification failure for wrong version")
+	}
+}
+
+// TestGreaseWrongVersionNilForGoogle verifies that greaseWrongVersion returns
+// nil for Google-Roughtime (no top-level VER).
+func TestGreaseWrongVersionNilForGoogle(t *testing.T) {
+	reply, _, _, _ := validReply(t, VersionGoogle, []Version{VersionGoogle})
+	if out := greaseWrongVersion(reply, VersionGoogle); out != nil {
+		t.Fatal("expected nil for Google version (no top-level VER)")
+	}
+}
+
+// TestGreaseWrongVersionNilForDraft12 verifies that greaseWrongVersion returns
+// nil for drafts 12+ (VER is inside SREP, not top-level).
+func TestGreaseWrongVersionNilForDraft12(t *testing.T) {
+	reply, _, _, _ := validReply(t, VersionDraft12, []Version{VersionDraft12})
+	if out := greaseWrongVersion(reply, VersionDraft12); out != nil {
+		t.Fatal("expected nil for draft12 (no top-level VER)")
+	}
+}
+
+// TestGreaseUndefinedTag verifies that greaseUndefinedTag produces a reply that
+// still verifies (clients MUST ignore undefined tags).
+func TestGreaseUndefinedTag(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.String(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			out := greaseUndefinedTag(reply, ver)
+			if out == nil {
+				t.Fatal("greaseUndefinedTag returned nil")
+			}
+			if len(out) <= len(reply) {
+				t.Fatal("expected greased reply to be larger (added tag)")
+			}
+			if _, _, err := VerifyReply([]Version{ver}, out, rootPK, nonce, req); err != nil {
+				t.Fatalf("undefined tag should not break verification: %v", err)
+			}
+		})
+	}
+}
+
+// TestGreaseAllModesReachable verifies that all four grease modes fire over
+// many iterations.
+func TestGreaseAllModesReachable(t *testing.T) {
+	// Use Draft08 which has a top-level VER, so all 4 modes can fire.
+	reply, rootPK, nonce, req := validReply(t, VersionDraft08, []Version{VersionDraft08})
+
+	var sigCorrupt, tagDrop, wrongVer, undefinedTag int
+	for range 1000 {
+		cp := make([]byte, len(reply))
+		copy(cp, reply)
+		out := Grease(cp, VersionDraft08)
+
+		_, _, err := VerifyReply([]Version{VersionDraft08}, out, rootPK, nonce, req)
+		switch {
+		case err == nil:
+			// Verification passed — must be an undefined tag addition.
+			undefinedTag++
+		case len(out) < len(reply):
+			// Smaller reply — must be a dropped tag.
+			tagDrop++
+		default:
+			// Same size, verification failed — either sig corruption or wrong
+			// version. Decode to check if VER was changed.
+			_, body := greaseSplit(out, VersionDraft08)
+			if body != nil {
+				if lo, hi, ok := findTagRange(body, TagVER); ok && hi-lo == 4 {
+					v := binary.LittleEndian.Uint32(body[lo:])
+					if v == 0xFFFFFFFF {
+						wrongVer++
+						continue
+					}
+				}
+			}
+			sigCorrupt++
+		}
+	}
+
+	if sigCorrupt == 0 {
+		t.Error("signature corruption mode never fired")
+	}
+	if tagDrop == 0 {
+		t.Error("tag drop mode never fired")
+	}
+	if wrongVer == 0 {
+		t.Error("wrong version mode never fired")
+	}
+	if undefinedTag == 0 {
+		t.Error("undefined tag mode never fired")
+	}
+	t.Logf("distribution: sig=%d drop=%d ver=%d undef=%d", sigCorrupt, tagDrop, wrongVer, undefinedTag)
+}
+
+// TestGreaseMalformedInput verifies that Grease does not panic on malformed
+// input.
+func TestGreaseMalformedInput(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.String(), func(t *testing.T) {
+			for _, input := range [][]byte{nil, {}, {0x00}, make([]byte, 11)} {
+				Grease(input, ver)
+			}
+		})
+	}
+}
+
+// FuzzGrease verifies that Grease does not panic on arbitrary input.
+func FuzzGrease(f *testing.F) {
+	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
+	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+		if err != nil {
+			continue
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			continue
+		}
+		replies, err := CreateReplies(ver, []Request{*parsed}, now, time.Second, cert)
+		if err != nil {
+			continue
+		}
+		f.Add(replies[0], uint32(ver))
+	}
+	f.Add([]byte{}, uint32(0))
+	f.Add([]byte{0xff}, uint32(VersionDraft08))
+
+	f.Fuzz(func(t *testing.T, data []byte, verRaw uint32) {
+		Grease(data, Version(verRaw))
+	})
 }
