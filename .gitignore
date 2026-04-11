@@ -1,3 +1,6 @@
 roughtime
 roughtime-client
 roughtime-debug
+coverage.out
+coverage.txt
+coverage.html

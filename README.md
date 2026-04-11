@@ -114,10 +114,13 @@ make build            # build roughtime, roughtime-client, roughtime-debug
 make test             # unit tests
 make test-race        # unit tests with race detector
 make test-cover       # unit tests with coverage
+make test-race-cover  # race detector + coverage profile (used by CI)
 make fuzz             # run all fuzz targets (FUZZ_TIME=30s each)
-make fuzz FUZZ_TIME=60s
-make lint             # vet + staticcheck + golangci-lint
-make check            # full suite (fmt, vet, lint, build, race, coverage, report card)
+make verify           # go mod download + go mod verify (module integrity)
+make coverage-report  # test-race-cover + per-function summary + HTML report
+make lint             # vet + staticcheck + golangci-lint + gopls
+make check            # full suite (verify, fmt, vet, lint, build, race+cover, report card)
+make clean            # remove built binaries and coverage artifacts
 ```
 
 ## Example Output

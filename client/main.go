@@ -305,13 +305,14 @@ func loadServers() ([]serverConfig, error) {
 		return servers, nil
 	}
 	if *addr != "" && *pubkey != "" {
+		cleanAddr := sanitize(*addr)
 		return []serverConfig{{
-			Name:      *addr,
+			Name:      cleanAddr,
 			PublicKey: *pubkey,
 			Addresses: []struct {
 				Protocol string `json:"protocol"`
 				Address  string `json:"address"`
-			}{{Protocol: "udp", Address: *addr}},
+			}{{Protocol: "udp", Address: cleanAddr}},
 		}}, nil
 	}
 	return nil, fmt.Errorf("provide -servers <file> or -addr <host:port> -pubkey <base64>")
@@ -332,7 +333,23 @@ func loadServersFile(path string) ([]serverConfig, error) {
 	if len(list.Servers) == 0 {
 		return nil, fmt.Errorf("no servers in %s", path)
 	}
+	for i := range list.Servers {
+		list.Servers[i].Name = sanitize(list.Servers[i].Name)
+		for j := range list.Servers[i].Addresses {
+			list.Servers[i].Addresses[j].Address = sanitize(list.Servers[i].Addresses[j].Address)
+		}
+	}
 	return list.Servers, nil
+}
+
+// sanitize strips control characters from untrusted input.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // decodePubKey accepts an Ed25519 root public key encoded as standard base64,
