@@ -583,6 +583,109 @@ func TestVerifyMultipleVersions(t *testing.T) {
 	}
 }
 
+// TestVerifyChainDraft10 verifies that a chain built with VersionDraft10
+// (groupD10) passes verification.
+func TestVerifyChainDraft10(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft10, 3)
+	if err := c.Verify(); err != nil {
+		t.Fatalf("draft-10 chain should verify: %v", err)
+	}
+}
+
+// TestVerifyChainDraft11 verifies that a chain built with VersionDraft11
+// (groupD10) passes verification.
+func TestVerifyChainDraft11(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft11, 3)
+	if err := c.Verify(); err != nil {
+		t.Fatalf("draft-11 chain should verify: %v", err)
+	}
+}
+
+// TestMalfeasanceReportRoundTripDraft10 verifies that a draft-10 chain survives
+// malfeasance report serialization and deserialization, and that the
+// deserialized chain still verifies.
+func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft10, 3)
+
+	data, err := c.MalfeasanceReport()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	parsed, err := ParseMalfeasanceReport(data)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(parsed.Links) != len(c.Links) {
+		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
+	}
+	if err := parsed.Verify(); err != nil {
+		t.Fatalf("deserialized draft-10 chain should verify: %v", err)
+	}
+}
+
+// TestParseMalfeasanceReportLegacyFromChain verifies that the legacy drafts
+// 10–11 malfeasance report format ({nonces, responses}) is correctly parsed
+// when constructed from a real draft-10 chain.
+func TestParseMalfeasanceReportLegacyFromChain(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft10, 3)
+
+	// Build a legacy-format report manually from the chain data.
+	nonces := make([]string, len(c.Links))
+	responses := make([]string, len(c.Links))
+	for i, link := range c.Links {
+		if link.Rand != nil {
+			nonces[i] = base64.StdEncoding.EncodeToString(link.Rand)
+		}
+		responses[i] = base64.StdEncoding.EncodeToString(link.Response)
+	}
+	data, err := json.Marshal(struct {
+		Nonces    []string `json:"nonces"`
+		Responses []string `json:"responses"`
+	}{Nonces: nonces, Responses: responses})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parsed, err := ParseMalfeasanceReport(data)
+	if err != nil {
+		t.Fatalf("parse legacy report: %v", err)
+	}
+	if len(parsed.Links) != len(c.Links) {
+		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
+	}
+	for i, link := range parsed.Links {
+		if !bytes.Equal(link.Rand, c.Links[i].Rand) {
+			t.Fatalf("link %d: rand mismatch", i)
+		}
+		if !bytes.Equal(link.Response, c.Links[i].Response) {
+			t.Fatalf("link %d: response mismatch", i)
+		}
+	}
+}
+
+// TestChainNonceDraft10 verifies that draft-10 chain nonces use SHA-512 with
+// 32-byte nonces.
+func TestChainNonceDraft10(t *testing.T) {
+	prevResp := randBytes(t, 128)
+	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blind) != 32 {
+		t.Fatalf("draft-10 blind length = %d, want 32", len(blind))
+	}
+	if len(nonce) != 32 {
+		t.Fatalf("draft-10 nonce length = %d, want 32", len(nonce))
+	}
+	h := sha512.New()
+	h.Write(prevResp)
+	h.Write(blind)
+	want := h.Sum(nil)[:32]
+	if !bytes.Equal(nonce, want) {
+		t.Fatal("draft-10 chain nonce mismatch")
+	}
+}
+
 // TestVerifyBadRandLength verifies that a rand of wrong length is detected.
 func TestVerifyBadRandLength(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft12, 2)

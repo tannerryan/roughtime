@@ -525,7 +525,7 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 	r := result{Name: name, Address: address}
 
 	srv := protocol.ComputeSRV(rootPK)
-	nonce, request, err := protocol.CreateRequestWithSRV(versions, rand.Reader, srv)
+	nonce, request, err := protocol.CreateRequest(versions, rand.Reader, srv)
 	if err != nil {
 		r.Err = fmt.Errorf("creating request: %w", err)
 		return r

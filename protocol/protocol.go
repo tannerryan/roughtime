@@ -2,8 +2,10 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Package protocol implements the Roughtime wire protocol for both server and
-// client use. It supports Google-Roughtime and IETF drafts 01-19 (drafts 12-19
-// share wire version 0x8000000c).
+// client use. It supports Google-Roughtime and IETF drafts 01-19. Drafts 12-19
+// share wire version 0x8000000c but differ in wire behavior: drafts 14-19
+// include a TYPE tag, which changes the Merkle leaf hash and delegation context
+// group.
 package protocol
 
 import (
@@ -103,8 +105,8 @@ const (
 	groupD07                     // Draft 07 (SHA-512/256, delegation ctx without hyphens)
 	groupD08                     // Drafts 08–09 (Unix seconds, ZZZZ padding)
 	groupD10                     // Drafts 10–11 (RADI ≥ 3, SRV tag)
-	groupD12                     // Drafts 12–13 (full-packet leaf, VERS in SREP)
-	groupD14                     // Drafts 14–19 (TYPE tag in request and response)
+	groupD12                     // Drafts 12–13 (full-packet leaf, VERS in SREP); also fallback for 14–19 without TYPE
+	groupD14                     // Drafts 14–19 with TYPE tag present (changes Merkle leaf and delegation context)
 )
 
 // wireGroupOf returns the wire format group for a version and TYPE presence.
@@ -1101,14 +1103,9 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 }
 
 // CreateRequest builds a Roughtime request for the given version preferences.
-// The returned nonce is needed to verify the server's reply.
-func CreateRequest(versions []Version, entropy io.Reader) (nonce, request []byte, err error) {
-	return CreateRequestWithSRV(versions, entropy, nil)
-}
-
-// CreateRequestWithSRV is like [CreateRequest] but includes the SRV tag (drafts
-// 10+) computed by [ComputeSRV]. SRV is omitted from Google-Roughtime requests.
-func CreateRequestWithSRV(versions []Version, entropy io.Reader, srv []byte) (nonce, request []byte, err error) {
+// The returned nonce is needed to verify the server's reply. The optional srv
+// parameter includes the SRV tag (drafts 10+) computed by [ComputeSRV].
+func CreateRequest(versions []Version, entropy io.Reader, srv []byte) (nonce, request []byte, err error) {
 	_, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, nil, err
@@ -1120,6 +1117,27 @@ func CreateRequestWithSRV(versions []Version, entropy io.Reader, srv []byte) (no
 		return nil, nil, fmt.Errorf("protocol: read entropy: %w", err)
 	}
 
+	request, err = createRequestFromNonce(g, versions, nonce, srv)
+	return nonce, request, err
+}
+
+// CreateRequestWithNonce builds a request using a caller-supplied nonce instead
+// of generating one randomly. The nonce must match the size required by the
+// negotiated protocol version. For document timestamping, callers typically set
+// this to a cryptographic hash of the payload to be timestamped.
+func CreateRequestWithNonce(versions []Version, nonce []byte, srv []byte) ([]byte, error) {
+	_, g, err := clientVersionPreference(versions)
+	if err != nil {
+		return nil, err
+	}
+	if len(nonce) != nonceSize(g) {
+		return nil, fmt.Errorf("protocol: nonce length %d, want %d", len(nonce), nonceSize(g))
+	}
+	return createRequestFromNonce(g, versions, nonce, srv)
+}
+
+// createRequestFromNonce assembles a request packet from a pre-built nonce.
+func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) ([]byte, error) {
 	tags := map[uint32][]byte{TagNONC: nonce}
 
 	if g != groupGoogle {
@@ -1171,13 +1189,13 @@ func CreateRequestWithSRV(versions []Version, entropy io.Reader, srv []byte) (no
 
 	msg, err := encode(tags)
 	if err != nil {
-		return nil, nil, fmt.Errorf("protocol: encode request: %w", err)
+		return nil, fmt.Errorf("protocol: encode request: %w", err)
 	}
 
 	if usesRoughtimHeader(g) {
-		return nonce, wrapPacket(msg), nil
+		return wrapPacket(msg), nil
 	}
-	return nonce, msg, nil
+	return msg, nil
 }
 
 // VerifyReply authenticates a server response and returns the midpoint and

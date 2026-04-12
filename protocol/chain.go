@@ -99,7 +99,7 @@ func (c *Chain) NextRequest(versions []Version, rootPK ed25519.PublicKey, entrop
 	}
 
 	srv := ComputeSRV(rootPK)
-	_, request, err := CreateRequestWithSRV(versions, bytes.NewReader(nonce), srv)
+	_, request, err := CreateRequest(versions, bytes.NewReader(nonce), srv)
 	if err != nil {
 		return ChainLink{}, fmt.Errorf("protocol: create chained request: %w", err)
 	}
@@ -174,12 +174,16 @@ func (c *Chain) Verify() error {
 		}
 	}
 
-	// Check causal ordering for all pairs (i, j) where i < j.
-	for i := range len(results) {
-		for j := i + 1; j < len(results); j++ {
-			if results[i].lower.After(results[j].upper) {
-				return fmt.Errorf("protocol: chain links %d and %d: %w", i, j, ErrCausalOrder)
-			}
+	// Check causal ordering (Section 8.2): for every pair (i, j) where i < j,
+	// lower[i] must be <= upper[j]. Tracking the running maximum of lower[]
+	// reduces this from O(n²) to O(n) while detecting the same violations.
+	maxLowerIdx := 0
+	for j := 1; j < len(results); j++ {
+		if results[maxLowerIdx].lower.After(results[j].upper) {
+			return fmt.Errorf("protocol: chain links %d and %d: %w", maxLowerIdx, j, ErrCausalOrder)
+		}
+		if results[j].lower.After(results[maxLowerIdx].lower) {
+			maxLowerIdx = j
 		}
 	}
 

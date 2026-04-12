@@ -209,16 +209,43 @@ client use. See the [package
 documentation](https://pkg.go.dev/github.com/tannerryan/roughtime/protocol) for
 the full API and wire group details.
 
+### Client
+
+Build a request, send it over UDP, and verify the signed response:
+
 ```go
-nonce, request, err := protocol.CreateRequest(
-    []protocol.Version{protocol.VersionDraft12},
-    rand.Reader,
-)
-// ... send request over UDP, receive reply ...
-midpoint, radius, err := protocol.VerifyReply(
-    []protocol.Version{protocol.VersionDraft12},
-    reply, rootPublicKey, nonce, request,
-)
+nonce, request, err := protocol.CreateRequest(versions, rand.Reader, srv)
+midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPublicKey, nonce, request)
+```
+
+The optional `srv` parameter includes the SRV tag (drafts 10+) for server key
+binding. `CreateRequestWithNonce` accepts a caller-supplied nonce for use cases
+such as document timestamping, where the nonce is a cryptographic hash of the
+payload.
+
+### Chaining
+
+For multi-server measurement and malfeasance detection (Section 8.2):
+
+```go
+var chain protocol.Chain
+for _, server := range servers {
+    link, err := chain.NextRequest(versions, server.PublicKey, rand.Reader)
+    // ... send link.Request, set link.Response ...
+    chain.Append(link)
+}
+err := chain.Verify()            // checks nonce linkage + causal ordering
+report, err := chain.MalfeasanceReport() // JSON per Section 8.4
+```
+
+### Server
+
+Parse incoming requests, sign a batch of responses:
+
+```go
+cert, err := protocol.NewCertificate(mint, maxt, onlineSK, rootSK)
+req, err := protocol.ParseRequest(raw)
+replies, err := protocol.CreateReplies(version, requests, midpoint, radius, cert)
 ```
 
 ## Development

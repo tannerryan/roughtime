@@ -242,7 +242,7 @@ func verifyRoundTrip(t *testing.T, versions []Version, ver Version) {
 	cert, _ := testCert(t)
 	rootPK := cert.rootPK
 
-	nonce, req, err := CreateRequest(versions, rand.Reader)
+	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1469,7 +1469,7 @@ func TestCreateRepliesZeroMidpoint(t *testing.T) {
 		{VersionDraft12, true},
 	} {
 		t.Run(tc.ver.ShortString(), func(t *testing.T) {
-			nonce, raw, err := CreateRequest([]Version{tc.ver}, rand.Reader)
+			nonce, raw, err := CreateRequest([]Version{tc.ver}, rand.Reader, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1523,7 +1523,7 @@ func TestClientVersionPreferenceRejectsEmpty(t *testing.T) {
 // TestCreateRequestGoogle verifies that a Google-Roughtime request is exactly
 // 1024 bytes, contains NONC and PAD, and can be parsed by ParseRequest.
 func TestCreateRequestGoogle(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1541,7 +1541,7 @@ func TestCreateRequestGoogle(t *testing.T) {
 
 // TestCreateRequestDraft01 verifies a draft 01 request with 64-byte nonce.
 func TestCreateRequestDraft01(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionDraft01}, rand.Reader)
+	nonce, req, err := CreateRequest([]Version{VersionDraft01}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1561,7 +1561,7 @@ func TestCreateRequestDraft01(t *testing.T) {
 // ROUGHTIM header), contain VER, and can be parsed by ParseRequest.
 func TestCreateRequestIETF(t *testing.T) {
 	versions := []Version{VersionDraft08, VersionDraft10}
-	nonce, req, err := CreateRequest(versions, rand.Reader)
+	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1581,7 +1581,7 @@ func TestCreateRequestIETF(t *testing.T) {
 // client always sends TYPE to signal draft-14+ support; if the server responds
 // without TYPE the client falls back to groupD12.
 func TestCreateRequestDraft12(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1600,7 +1600,7 @@ func TestCreateRequestDraft12(t *testing.T) {
 // TestCreateRequestRejectsEmpty verifies that an empty version list is
 // rejected.
 func TestCreateRequestRejectsEmpty(t *testing.T) {
-	if _, _, err := CreateRequest(nil, rand.Reader); err == nil {
+	if _, _, err := CreateRequest(nil, rand.Reader, nil); err == nil {
 		t.Fatal("expected error")
 	}
 }
@@ -1621,7 +1621,7 @@ func TestVerifyReplyAllVersions(t *testing.T) {
 // rejected.
 func TestVerifyReplyRejectsBadRootPK(t *testing.T) {
 	cert, _ := testCert(t)
-	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	replies, _ := CreateReplies(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert)
 
@@ -1636,7 +1636,7 @@ func TestVerifyReplyRejectsBadRootPK(t *testing.T) {
 func TestVerifyReplyRejectsBadNonce(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.rootPK
-	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	replies, _ := CreateReplies(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert)
 
@@ -1671,7 +1671,7 @@ func TestVerifyReplyRejectsEmptyVersions(t *testing.T) {
 func TestVerifyReplyRejectsMissingRequestBytes(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.rootPK
-	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	replies, _ := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
 
@@ -1688,7 +1688,7 @@ func TestVerifyReplyRejectsExpiredCert(t *testing.T) {
 	past := time.Now().Add(-48 * time.Hour)
 	cert, _ := NewCertificate(past.Add(-time.Hour), past, onlineSK, rootSK)
 
-	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	replies, _ := CreateReplies(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert)
 
@@ -1707,7 +1707,7 @@ func TestVerifyReplyBatchIndex(t *testing.T) {
 	reqs := make([]Request, 4)
 	var targetNonce, targetReq []byte
 	for i := range 4 {
-		n, r, err := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+		n, r, err := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1742,7 +1742,7 @@ func TestVerifyReplyBatchDraft12(t *testing.T) {
 	nonces := make([][]byte, 5)
 	rawReqs := make([][]byte, 5)
 	for i := range 5 {
-		n, r, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+		n, r, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1774,7 +1774,7 @@ func TestVerifyReplyBatchDraft12(t *testing.T) {
 func TestCreateRepliesRejectsMixedHasType(t *testing.T) {
 	cert, _ := testCert(t)
 
-	_, req0, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	_, req0, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1785,7 +1785,7 @@ func TestCreateRepliesRejectsMixedHasType(t *testing.T) {
 	// Simulate a draft 12-13 client (no TYPE).
 	parsed0.HasType = false
 
-	_, req1, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	_, req1, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1884,7 +1884,7 @@ func validReply(t *testing.T, ver Version, versions []Version) (reply, rootPK, n
 	cert, _ := testCert(t)
 	rootPK = cert.rootPK
 
-	nonce, req, err := CreateRequest(versions, rand.Reader)
+	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1967,7 +1967,7 @@ func TestParseRequestRejectsTruncatedIETF(t *testing.T) {
 // TestCreateRequestRejectsReadError verifies that an entropy read failure is
 // propagated.
 func TestCreateRequestRejectsReadError(t *testing.T) {
-	if _, _, err := CreateRequest([]Version{VersionDraft08}, &failReader{}); err == nil {
+	if _, _, err := CreateRequest([]Version{VersionDraft08}, &failReader{}, nil); err == nil {
 		t.Fatal("expected error for entropy read failure")
 	}
 }
@@ -2542,7 +2542,7 @@ func TestVerifyCertRejectsCorruptDELE(t *testing.T) {
 // §5/§6 "Roughtime Packet Format" of every draft.
 func TestCreateRequestEarlyDraftHeader(t *testing.T) {
 	for _, v := range []Version{VersionDraft01, VersionDraft02, VersionDraft03, VersionDraft04} {
-		_, req, err := CreateRequest([]Version{v}, rand.Reader)
+		_, req, err := CreateRequest([]Version{v}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2576,7 +2576,7 @@ func TestCreateRepliesEarlyDraftHeader(t *testing.T) {
 // not at the top level (drafts 12–19, Figure 3).
 func TestDraft12NoTopLevelVER(t *testing.T) {
 	cert, _ := testCert(t)
-	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	replies, _ := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
 	inner, err := unwrapPacket(replies[0])
@@ -2646,7 +2646,7 @@ func TestVerifyReplyDetectsDowngrade(t *testing.T) {
 	rootPK := cert.rootPK
 	// Client offers Draft11 and Draft12; the highest mutual is Draft12.
 	clientVers := []Version{VersionDraft11, VersionDraft12}
-	nonce, req, _ := CreateRequest(clientVers, rand.Reader)
+	nonce, req, _ := CreateRequest(clientVers, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	// Force the server to claim Draft11 inside the signed SREP, while still
 	// using draft-12 wire format. This simulates a server (or compromised
@@ -2693,7 +2693,7 @@ func TestVerifyReplyRejectsResponseTYPENot1(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.rootPK
 	clientVers := []Version{VersionDraft12}
-	nonce, req, _ := CreateRequest(clientVers, rand.Reader)
+	nonce, req, _ := CreateRequest(clientVers, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	g := groupD14
 	tree := newMerkleTree(g, [][]byte{parsed.RawPacket})
@@ -2838,7 +2838,7 @@ func TestCreateRequestPaddingTag(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, req, err := CreateRequest(tt.ver, rand.Reader)
+			_, req, err := CreateRequest(tt.ver, rand.Reader, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2941,7 +2941,7 @@ func TestCreateRepliesBatchDraft03(t *testing.T) {
 	nonces := make([][]byte, n)
 	rawReqs := make([][]byte, n)
 	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionDraft03}, rand.Reader)
+		nonce, req, err := CreateRequest([]Version{VersionDraft03}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2988,7 +2988,7 @@ func TestExtractVersionFromReply(t *testing.T) {
 	for _, ver := range []Version{VersionDraft08, VersionDraft12} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
 			cert, _ := testCert(t)
-			nonce, req, err := CreateRequest([]Version{ver}, rand.Reader)
+			nonce, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3016,7 +3016,7 @@ func TestExtractVersionFromReply(t *testing.T) {
 	// Google-Roughtime has no VER tag.
 	t.Run("Google", func(t *testing.T) {
 		cert, _ := testCert(t)
-		_, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+		_, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3039,7 +3039,7 @@ func TestExtractVersionFromReply(t *testing.T) {
 func TestVerifyReplyRejectsMismatchedNONC(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.rootPK
-	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3089,7 +3089,7 @@ func TestVerifyReplyMidpointAtDELEBoundary(t *testing.T) {
 	}
 
 	// MIDP=MINT: create reply at exactly the MINT boundary.
-	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3107,7 +3107,7 @@ func TestVerifyReplyMidpointAtDELEBoundary(t *testing.T) {
 
 	// MIDP near MAXT boundary.
 	maxtTime := now.Add(time.Hour)
-	nonce2, req2, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	nonce2, req2, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3129,7 +3129,7 @@ func TestVerifyReplyMidpointAtDELEBoundary(t *testing.T) {
 func TestVerifyReplyToleratesUnknownTags(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.rootPK
-	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3246,7 +3246,7 @@ func TestCreateRepliesBatchDraft08(t *testing.T) {
 	nonces := make([][]byte, n)
 	rawReqs := make([][]byte, n)
 	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader)
+		nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3417,7 +3417,7 @@ func TestCreateRepliesBatchDraft14(t *testing.T) {
 	nonces := make([][]byte, n)
 	rawReqs := make([][]byte, n)
 	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+		nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3613,7 +3613,7 @@ func TestCreateRepliesBatchGoogle(t *testing.T) {
 	nonces := make([][]byte, n)
 	rawReqs := make([][]byte, n)
 	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+		nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3640,14 +3640,14 @@ func TestCreateRepliesBatchGoogle(t *testing.T) {
 	}
 }
 
-// TestCreateRequestWithSRVOmittedForOldDrafts verifies that
-// CreateRequestWithSRV omits the SRV tag for pre-draft-10 versions.
-func TestCreateRequestWithSRVOmittedForOldDrafts(t *testing.T) {
+// TestCreateRequestSRVOmittedForOldDrafts verifies that CreateRequest omits the
+// SRV tag for pre-draft-10 versions.
+func TestCreateRequestSRVOmittedForOldDrafts(t *testing.T) {
 	pk := make(ed25519.PublicKey, ed25519.PublicKeySize)
 	srv := ComputeSRV(pk)
 	for _, ver := range []Version{VersionGoogle, VersionDraft01, VersionDraft05, VersionDraft08} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
-			_, req, err := CreateRequestWithSRV([]Version{ver}, rand.Reader, srv)
+			_, req, err := CreateRequest([]Version{ver}, rand.Reader, srv)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3672,14 +3672,14 @@ func TestCreateRequestWithSRVOmittedForOldDrafts(t *testing.T) {
 	}
 }
 
-// TestCreateRequestWithSRVIncludedForDraft10Plus verifies that
-// CreateRequestWithSRV includes the SRV tag for draft-10+ versions.
-func TestCreateRequestWithSRVIncludedForDraft10Plus(t *testing.T) {
+// TestCreateRequestSRVIncludedForDraft10Plus verifies that CreateRequest
+// includes the SRV tag for draft-10+ versions.
+func TestCreateRequestSRVIncludedForDraft10Plus(t *testing.T) {
 	pk := make(ed25519.PublicKey, ed25519.PublicKeySize)
 	srv := ComputeSRV(pk)
 	for _, ver := range []Version{VersionDraft10, VersionDraft11, VersionDraft12} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
-			_, req, err := CreateRequestWithSRV([]Version{ver}, rand.Reader, srv)
+			_, req, err := CreateRequest([]Version{ver}, rand.Reader, srv)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3739,7 +3739,7 @@ func TestMerkleTreeLargeBatchD14(t *testing.T) {
 func TestCreateRequestZZZZAllZero(t *testing.T) {
 	for _, ver := range []Version{VersionDraft08, VersionDraft10, VersionDraft12} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
-			_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+			_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3768,7 +3768,7 @@ func TestCreateRequestZZZZAllZero(t *testing.T) {
 // contains the VERS tag with all supported versions in ascending order.
 func TestSREPContainsVERSForDraft12(t *testing.T) {
 	cert, _ := testCert(t)
-	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3909,15 +3909,15 @@ func FuzzDecode(f *testing.F) {
 // never panic regardless of the input.
 func FuzzParseRequest(f *testing.F) {
 	// Seed with a valid Google-Roughtime request.
-	_, googleReq, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	_, googleReq, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 	f.Add(googleReq)
 
 	// Seed with a valid IETF request (with ROUGHTIM header).
-	_, ietfReq, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	_, ietfReq, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	f.Add(ietfReq)
 
 	// Seed with a valid early draft request.
-	_, d01Req, _ := CreateRequest([]Version{VersionDraft01}, rand.Reader)
+	_, d01Req, _ := CreateRequest([]Version{VersionDraft01}, rand.Reader, nil)
 	f.Add(d01Req)
 
 	f.Add([]byte{})
@@ -3939,7 +3939,7 @@ func FuzzVerifyReply(f *testing.F) {
 	rootPK := rootSK.Public().(ed25519.PublicKey)
 	now := time.Now()
 	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
-	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	parsed, _ := ParseRequest(req)
 	replies, _ := CreateReplies(VersionDraft12, []Request{*parsed}, now, time.Second, cert)
 	f.Add(replies[0], []byte(rootPK), nonce, req)
@@ -3969,7 +3969,7 @@ func FuzzVerifyReplyAllVersions(f *testing.F) {
 
 	for _, ver := range versions {
 		clientVers := []Version{ver}
-		nonce, req, err := CreateRequest(clientVers, rand.Reader)
+		nonce, req, err := CreateRequest(clientVers, rand.Reader, nil)
 		if err != nil {
 			continue
 		}
@@ -4005,7 +4005,7 @@ func FuzzCreateReplies(f *testing.F) {
 
 	// Seed with valid requests for each version.
 	for _, ver := range versions {
-		_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
 		if err != nil {
 			continue
 		}
@@ -4040,13 +4040,13 @@ func FuzzCreateReplies(f *testing.F) {
 // on adversarial input combinations.
 func FuzzCreateRepliesBatch(f *testing.F) {
 	// Seed with two valid Draft12 requests.
-	_, req1, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
-	_, req2, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader)
+	_, req1, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	_, req2, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	f.Add(req1, req2)
 
 	// Seed with two valid Google requests.
-	_, gReq1, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
-	_, gReq2, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader)
+	_, gReq1, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
+	_, gReq2, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
 	f.Add(gReq1, gReq2)
 
 	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
@@ -4164,7 +4164,7 @@ func FuzzExtractVersion(f *testing.F) {
 	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
 
 	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
-		_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
 		if err != nil {
 			continue
 		}
@@ -4385,7 +4385,7 @@ func FuzzGrease(f *testing.F) {
 	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
 
 	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
-		_, req, err := CreateRequest([]Version{ver}, rand.Reader)
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
 		if err != nil {
 			continue
 		}
@@ -4634,6 +4634,143 @@ func TestFindTagRangeMalformed(t *testing.T) {
 		}
 		if !bytes.Equal(body[lo:hi], bytes.Repeat([]byte{0x22}, 8)) {
 			t.Fatal("PAD value mismatch")
+		}
+	})
+}
+
+// TestCreateRequestWithNonceAllVersions verifies CreateRequestWithNonce
+// produces valid requests for every supported version, and that the nonce
+// survives the round-trip through ParseRequest and VerifyReply.
+func TestCreateRequestWithNonceAllVersions(t *testing.T) {
+	for _, v := range append([]Version{VersionGoogle}, supportedVersions...) {
+		t.Run(v.ShortString(), func(t *testing.T) {
+			versions := []Version{v}
+			rootSK, onlineSK := testKeys(t)
+			rootPK := rootSK.Public().(ed25519.PublicKey)
+
+			nonce := randBytes(t, nonceSize(wireGroupOf(v, true)))
+			req, err := CreateRequestWithNonce(versions, nonce, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			parsed, err := ParseRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(parsed.Nonce, nonce) {
+				t.Fatal("nonce mismatch after ParseRequest")
+			}
+
+			// Truncate to second: drafts 08+ use Unix-seconds resolution.
+			now := time.Now().UTC().Truncate(time.Second)
+			cert, err := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replies, err := CreateReplies(v, []Request{*parsed}, now, time.Second, cert)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := VerifyReply(versions, replies[0], rootPK, nonce, req); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestCreateRequestWithNonceWithSRV verifies the SRV tag is included for drafts
+// 10+ when using CreateRequestWithNonce.
+func TestCreateRequestWithNonceWithSRV(t *testing.T) {
+	pk := make(ed25519.PublicKey, ed25519.PublicKeySize)
+	srv := ComputeSRV(pk)
+	nonce := randBytes(t, 32)
+
+	req, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := unwrapPacket(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tags, err := Decode(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvVal, ok := tags[TagSRV]
+	if !ok {
+		t.Fatal("SRV tag should be present")
+	}
+	if !bytes.Equal(srvVal, srv) {
+		t.Fatal("SRV value mismatch")
+	}
+}
+
+// TestCreateRequestWithNonceRejectsWrongSize verifies that a nonce of the wrong
+// length is rejected.
+func TestCreateRequestWithNonceRejectsWrongSize(t *testing.T) {
+	// Draft 12 expects 32 bytes; provide 31.
+	nonce := randBytes(t, 31)
+	if _, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, nil); err == nil {
+		t.Fatal("expected error for wrong nonce size")
+	}
+	// Provide 33.
+	nonce = randBytes(t, 33)
+	if _, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, nil); err == nil {
+		t.Fatal("expected error for wrong nonce size")
+	}
+}
+
+// TestCreateRequestWithNonceRejectsEmptyVersions verifies that an empty version
+// list is rejected.
+func TestCreateRequestWithNonceRejectsEmptyVersions(t *testing.T) {
+	if _, err := CreateRequestWithNonce(nil, make([]byte, 32), nil); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+// TestCreateRequestWithNonce64ByteNonce verifies that Google/draft-01 versions
+// accept the expected 64-byte nonce.
+func TestCreateRequestWithNonce64ByteNonce(t *testing.T) {
+	for _, v := range []Version{VersionGoogle, VersionDraft01} {
+		t.Run(v.ShortString(), func(t *testing.T) {
+			nonce := randBytes(t, 64)
+			req, err := CreateRequestWithNonce([]Version{v}, nonce, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(parsed.Nonce, nonce) {
+				t.Fatal("nonce mismatch")
+			}
+		})
+	}
+}
+
+// FuzzCreateRequestWithNonce exercises CreateRequestWithNonce with arbitrary
+// nonce values, verifying that valid-length nonces always produce parseable
+// requests with the exact nonce embedded.
+func FuzzCreateRequestWithNonce(f *testing.F) {
+	f.Add(make([]byte, 32))
+	f.Add(bytes.Repeat([]byte{0xff}, 32))
+	f.Fuzz(func(t *testing.T, nonce []byte) {
+		if len(nonce) != 32 {
+			t.Skip()
+		}
+		req, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parsed, err := ParseRequest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(parsed.Nonce, nonce) {
+			t.Fatal("nonce mismatch")
 		}
 	})
 }
