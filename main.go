@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -40,6 +41,8 @@ var (
 	rootKeySeedHexFile = flag.String("root-key", "", "hex-encoded private key seed")
 	logLevel           = flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	showVersion        = flag.Bool("version", false, "print version and exit")
+	keygen             = flag.String("keygen", "", "generate a root key pair and write the seed to the given path")
+	pubkey             = flag.String("pubkey", "", "derive and print the public key from an existing root key file")
 	batchMaxSize       = flag.Int("batch-max-size", 64, "max requests per signing batch (1 to disable)")
 	batchMaxLatency    = flag.Duration("batch-max-latency", 5*time.Millisecond, "max wait before signing an incomplete batch")
 	greaseRate         = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
@@ -142,6 +145,61 @@ var bufPool = sync.Pool{
 	},
 }
 
+// generateKeypair generates a root Ed25519 key pair, writes the hex-encoded
+// seed to path with mode 0600, and prints the public key to stdout.
+func generateKeypair(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s already exists (refusing to overwrite)", path)
+	}
+
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return fmt.Errorf("reading entropy: %w", err)
+	}
+	defer clear(seed)
+
+	sk := ed25519.NewKeyFromSeed(seed)
+	defer clear(sk)
+	pk := sk.Public().(ed25519.PublicKey)
+
+	encoded := []byte(hex.EncodeToString(seed) + "\n")
+	defer clear(encoded)
+	if err := os.WriteFile(path, encoded, 0600); err != nil {
+		return fmt.Errorf("writing seed to %s: %w", path, err)
+	}
+
+	fmt.Printf("Seed written to: %s\n", path)
+	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
+	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	return nil
+}
+
+// derivePublicKey reads an existing root key seed and prints the public key.
+func derivePublicKey(path string) error {
+	seedHex, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	defer clear(seedHex)
+
+	seed, err := hex.DecodeString(string(bytes.TrimSpace(seedHex)))
+	if err != nil {
+		return fmt.Errorf("decoding seed: %w", err)
+	}
+	defer clear(seed)
+	if len(seed) != ed25519.SeedSize {
+		return fmt.Errorf("seed has %d bytes, want %d", len(seed), ed25519.SeedSize)
+	}
+
+	sk := ed25519.NewKeyFromSeed(seed)
+	defer clear(sk)
+	pk := sk.Public().(ed25519.PublicKey)
+
+	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
+	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	return nil
+}
+
 // validateFlags checks CLI flags are within permitted ranges.
 func validateFlags() error {
 	if *rootKeySeedHexFile == "" {
@@ -167,6 +225,20 @@ func main() {
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("roughtime %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Version, version.Copyright)
+		return
+	}
+	if *keygen != "" {
+		if err := generateKeypair(*keygen); err != nil {
+			fmt.Fprintf(os.Stderr, "keygen: %s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *pubkey != "" {
+		if err := derivePublicKey(*pubkey); err != nil {
+			fmt.Fprintf(os.Stderr, "pubkey: %s\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if err := validateFlags(); err != nil {
@@ -641,7 +713,8 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 		reqs[i] = items[i].req
 	}
 
-	replies, err := protocol.CreateReplies(ver, reqs, time.Now(), radius, st.cert)
+	// Zero midpoint lets CreateReplies timestamp after tree construction.
+	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
 	if err != nil {
 		log.Warn("batch CreateReplies failed",
 			zap.Stringer("version", ver),

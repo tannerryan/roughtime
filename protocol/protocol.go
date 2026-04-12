@@ -936,7 +936,9 @@ func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 	return &merkleTree{rootHash: level[0], paths: paths}
 }
 
-// CreateReplies builds signed responses for a batch of requests.
+// CreateReplies builds signed responses for a batch of requests. If midpoint is
+// zero, the timestamp is captured after the Merkle tree is built, immediately
+// before signing.
 func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate) ([][]byte, error) {
 	if len(requests) == 0 {
 		return nil, errors.New("protocol: no requests")
@@ -970,6 +972,11 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 		}
 	}
 	tree := newMerkleTree(g, leafData)
+
+	// Capture time after tree construction, immediately before signing.
+	if midpoint.IsZero() {
+		midpoint = time.Now()
+	}
 
 	srepBytes, err := buildSREP(ver, g, requests, midpoint, radius, tree.rootHash)
 	if err != nil {

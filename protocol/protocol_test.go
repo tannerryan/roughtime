@@ -1453,6 +1453,47 @@ func TestCreateRepliesAllDrafts(t *testing.T) {
 	}
 }
 
+// TestCreateRepliesZeroMidpoint verifies that a zero midpoint causes
+// CreateReplies to self-timestamp. The resulting reply must verify and its MIDP
+// must be close to time.Now().
+func TestCreateRepliesZeroMidpoint(t *testing.T) {
+	cert, rootSK := testCert(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+
+	for _, tc := range []struct {
+		ver     Version
+		hasType bool
+	}{
+		{VersionGoogle, false},
+		{VersionDraft08, false},
+		{VersionDraft12, true},
+	} {
+		t.Run(tc.ver.ShortString(), func(t *testing.T) {
+			nonce, raw, err := CreateRequest([]Version{tc.ver}, rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseRequest(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := time.Now()
+			replies, err := CreateReplies(tc.ver, []Request{*parsed}, time.Time{}, time.Second, cert)
+			after := time.Now()
+			if err != nil || len(replies) != 1 {
+				t.Fatalf("CreateReplies: %v (len=%d)", err, len(replies))
+			}
+			midpoint, _, err := VerifyReply([]Version{tc.ver}, replies[0], rootPK, nonce, raw)
+			if err != nil {
+				t.Fatalf("VerifyReply: %v", err)
+			}
+			if midpoint.Before(before.Add(-time.Second)) || midpoint.After(after.Add(time.Second)) {
+				t.Fatalf("midpoint %v not between %v and %v (±1s for rounding)", midpoint, before, after)
+			}
+		})
+	}
+}
+
 // TestCreateRepliesRejectsEmpty verifies that an empty request slice is
 // rejected.
 func TestCreateRepliesRejectsEmpty(t *testing.T) {

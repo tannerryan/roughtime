@@ -135,7 +135,8 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 	r := probeResult{version: ver}
 	versions := []protocol.Version{ver}
 
-	nonce, request, err := protocol.CreateRequest(versions, rand.Reader)
+	srv := protocol.ComputeSRV(rootPK)
+	nonce, request, err := protocol.CreateRequestWithSRV(versions, rand.Reader, srv)
 	if err != nil {
 		r.err = fmt.Errorf("request: %w", err)
 		return r
