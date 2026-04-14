@@ -174,9 +174,8 @@ func (c *Chain) Verify() error {
 		}
 	}
 
-	// Check causal ordering (Section 8.2): for every pair (i, j) where i < j,
-	// lower[i] must be <= upper[j]. Tracking the running maximum of lower[]
-	// reduces this from O(n²) to O(n) while detecting the same violations.
+	// Causal ordering (Section 8.2): lower[i] <= upper[j] for all i < j.
+	// Tracking the running max of lower[] makes this O(n).
 	maxLowerIdx := 0
 	for j := 1; j < len(results); j++ {
 		if results[maxLowerIdx].lower.After(results[j].upper) {

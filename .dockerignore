@@ -1,0 +1,23 @@
+.git
+.gitignore
+.github
+.dockerignore
+Dockerfile
+README.md
+LICENSE
+
+# Built binaries (from `make build`)
+roughtime
+roughtime-client
+roughtime-debug
+
+# Coverage artifacts
+coverage.out
+coverage.txt
+coverage.html
+
+# Editor / OS cruft
+.idea
+.vscode
+.DS_Store
+*.swp

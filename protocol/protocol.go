@@ -711,7 +711,6 @@ var supportedVersions = []Version{
 // supportedVersions for direct inclusion in SREP.
 var supportedVersionsBytes []byte
 
-// init pre-encodes the supportedVersions list for direct wire inclusion.
 func init() {
 	supportedVersionsBytes = make([]byte, 4*len(supportedVersions))
 	for i, v := range supportedVersions {
@@ -964,7 +963,6 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 		return nil, errors.New("protocol: drafts 01–02 do not support batched responses")
 	}
 
-	// Build Merkle tree
 	leafData := make([][]byte, len(requests))
 	for i := range requests {
 		if usesFullPacketLeaf(g) {
@@ -985,7 +983,6 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 		return nil, err
 	}
 
-	// Sign SREP
 	toSign := make([]byte, len(responseCtx)+len(srepBytes))
 	copy(toSign, responseCtx)
 	copy(toSign[len(responseCtx):], srepBytes)
@@ -993,7 +990,6 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 
 	certBytes := cert.certBytes(g)
 
-	// Build per-request responses
 	replies := make([][]byte, len(requests))
 	for i := range requests {
 		reply, err := buildReply(ver, g, requests[i], i, tree, srepSig, srepBytes, certBytes)

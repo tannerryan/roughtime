@@ -10,12 +10,10 @@ synchronization, providing cryptographically signed timestamps with proof of
 server authenticity. This implementation covers Google-Roughtime and IETF drafts
 01–19.
 
-Note: drafts 14 and 15 specify a node-first Merkle leaf-to-root hashing order
-(`H(0x01 || node || hash)` when the path bit is 0) that was reversed to
-hash-first in draft 16. This implementation uses the draft-16+ hash-first order
-for all of the drafts 12–19 wire group, so it is not strictly conformant to
-drafts 14 and 15 for multi-request batches. Single-request replies (the
-overwhelming majority in practice) are unaffected.
+Note: the drafts 12–19 wire group uses the draft-16+ hash-first Merkle order, so
+multi-request batches are not strictly conformant to drafts 14–15 (which
+specified node-first before draft 16 reversed it). Single-request replies are
+unaffected.
 
 Interoperability testing is available at
 [ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
@@ -37,9 +35,7 @@ Generate a root key pair with `-keygen`. The seed is written to the given path
 (mode `0600`) and the public key is printed in hex and base64. Use `-pubkey` to
 derive the public key from an existing seed file.
 
-The root key file must be mode `0600` or stricter. Responses that would exceed
-the request size are dropped per the amplification protection requirement. The
-server shuts down gracefully on SIGINT/SIGTERM.
+The root key file must be mode `0600` or stricter.
 
 | Flag                 | Default | Description                                     |
 | -------------------- | ------- | ----------------------------------------------- |
@@ -246,6 +242,27 @@ Parse incoming requests, sign a batch of responses:
 cert, err := protocol.NewCertificate(mint, maxt, onlineSK, rootSK)
 req, err := protocol.ParseRequest(raw)
 replies, err := protocol.CreateReplies(version, requests, midpoint, radius, cert)
+```
+
+## Docker
+
+Build the image, generate a root key into `./keys`, and run the server with the
+key mounted read-only:
+
+```
+docker build -t roughtime:latest .
+mkdir -p keys
+docker run --rm -v "$PWD/keys:/keys" roughtime:latest -keygen /keys/root.key
+docker run --rm -v "$PWD/keys:/keys:ro" roughtime:latest -pubkey /keys/root.key
+docker run -d \
+  --name roughtime \
+  --restart unless-stopped \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -p 2002:2002/udp \
+  -v "$PWD/keys:/keys:ro" \
+  roughtime:latest -root-key /keys/root.key
 ```
 
 ## Development

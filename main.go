@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -33,7 +32,6 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// logger is the package-wide structured logger, initialized in main.
 var logger *zap.Logger
 
 var (
@@ -86,9 +84,9 @@ const (
 	// reduces packet drops under burst traffic.
 	socketRecvBuffer = 4 * 1024 * 1024
 
-	// workerQueueSize is the capacity of the dispatch channel. Requests beyond
+	// batchQueueSize is the capacity of the batcher channel. Requests beyond
 	// this are dropped to provide backpressure under extreme load.
-	workerQueueSize = 4096
+	batchQueueSize = 4096
 
 	// statsInterval is how often the periodic stats log line is emitted.
 	statsInterval = 60 * time.Second
@@ -114,15 +112,8 @@ type certState struct {
 	srvHash []byte
 }
 
-// request is a unit of work dispatched from the read loop to a worker.
-type request struct {
-	bufPtr *[]byte
-	len    int
-	peer   *net.UDPAddr
-}
-
 // validatedRequest is a parsed, validated request ready for batch signing.
-// Ownership of bufPtr transfers from the worker to the batcher.
+// Ownership of bufPtr transfers from the read loop to the batcher.
 type validatedRequest struct {
 	req         protocol.Request
 	peer        *net.UDPAddr
@@ -264,8 +255,7 @@ func main() {
 	logger.Info("starting roughtime server",
 		zap.Int("pid", os.Getpid()),
 		zap.Int("port", *port),
-		zap.Int("workers", runtime.NumCPU()),
-		zap.Int("queue_size", workerQueueSize),
+		zap.Int("queue_size", batchQueueSize),
 		zap.Int("recv_buffer", socketRecvBuffer),
 		zap.Duration("radius", radius),
 		zap.Stringer("log_level", lvl),
@@ -451,9 +441,9 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 	}
 }
 
-// listen runs the UDP server: a CPU-sized worker pool consumes a bounded queue,
-// excess requests are dropped, and the loop drains in-flight work on ctx
-// cancellation.
+// listen runs the UDP server: the read loop validates each packet inline and
+// hands valid requests to the batcher over a bounded channel. Excess requests
+// are dropped, and the loop drains in-flight work on ctx cancellation.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
 
@@ -468,14 +458,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		)
 	}
 
-	work := make(chan request, workerQueueSize)
-	batchCh := make(chan validatedRequest, workerQueueSize)
-
-	var wg sync.WaitGroup
-	workerLog := logger.Named("worker")
-	for range runtime.NumCPU() {
-		wg.Go(func() { worker(workerLog, state, work, batchCh) })
-	}
+	batchCh := make(chan validatedRequest, batchQueueSize)
 
 	var batcherWg sync.WaitGroup
 	batcherLog := logger.Named("batcher")
@@ -489,7 +472,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	)
 
 	// On shutdown, set a past read deadline so the read loop unblocks cleanly
-	// without closing the socket from underneath in-flight workers.
+	// without closing the socket from underneath in-flight work.
 	go func() {
 		<-ctx.Done()
 		listenLog.Info("shutdown initiated, unblocking reads")
@@ -518,22 +501,25 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			}
 			continue
 		}
+		vr, ok := validateRequest(listenLog, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, state.Load())
+		if !ok {
+			bufPool.Put(bufPtr)
+			continue
+		}
 		select {
-		case work <- request{bufPtr: bufPtr, len: reqLen, peer: peer}:
+		case batchCh <- vr:
 		default:
 			bufPool.Put(bufPtr)
 			statsDropped.Add(1)
-			listenLog.Warn("dropped request: worker queue full",
+			listenLog.Warn("dropped request: batcher queue full",
 				zap.Stringer("peer", peer),
 				zap.Int("size", reqLen),
-				zap.Int("queue_size", workerQueueSize),
+				zap.Int("queue_size", batchQueueSize),
 			)
 		}
 	}
 
 	drainStart := time.Now()
-	close(work)
-	wg.Wait()
 	close(batchCh)
 	batcherWg.Wait()
 	_ = conn.Close()
@@ -546,29 +532,6 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		zap.Duration("drain_duration", time.Since(drainStart)),
 	)
 	return nil
-}
-
-// worker drains the work channel, validates requests, and forwards them to the
-// batcher for bulk signing. On validation failure the buffer is returned to the
-// pool; on success ownership transfers to the batcher.
-func worker(log *zap.Logger, state *atomic.Pointer[certState], work <-chan request, batchCh chan<- validatedRequest) {
-	for req := range work {
-		func() {
-			sent := false
-			defer func() {
-				if !sent {
-					bufPool.Put(req.bufPtr)
-				}
-			}()
-			defer recoverGoroutine(log, "worker")
-			vr, ok := validateRequest(log, (*req.bufPtr)[:req.len], req.peer, req.len, req.bufPtr, state.Load())
-			if !ok {
-				return
-			}
-			batchCh <- vr
-			sent = true
-		}()
-	}
 }
 
 // validateRequest parses a request, validates SRV, and negotiates a version. On
@@ -660,7 +623,6 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 		select {
 		case vr, ok := <-incoming:
 			if !ok {
-				// Channel closed — flush all remaining batches.
 				for key := range batches {
 					flush(key)
 				}

@@ -120,7 +120,6 @@ func (r result) inSync() bool {
 	return drift <= r.Radius+r.RTT/2
 }
 
-// main parses flags and runs the client.
 func main() {
 	flag.Parse()
 	if *showVersion {

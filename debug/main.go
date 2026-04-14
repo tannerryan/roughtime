@@ -51,7 +51,6 @@ type probeResult struct {
 	err      error
 }
 
-// main parses flags and runs the debug probe.
 func main() {
 	flag.Parse()
 	if *showVersion {
