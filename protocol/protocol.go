@@ -15,10 +15,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	mrand "math/rand/v2"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -345,7 +347,9 @@ func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 		return 0, errors.New("protocol: RADI must be 4 bytes")
 	}
 	v := binary.LittleEndian.Uint32(buf)
-	if v == 0 && g >= groupD10 {
+	// Drafts 08+ §5.2.2 / §6.2.5: RADI MUST NOT be zero. Earlier drafts and
+	// Google-Roughtime did not define a lower bound, so only enforce on 08+.
+	if v == 0 && g >= groupD08 {
 		return 0, errors.New("protocol: RADI must not be zero")
 	}
 	if g == groupGoogle || usesMJDMicroseconds(g) {
@@ -360,21 +364,38 @@ func DecodeTimestamp(ver Version, buf []byte) (time.Time, error) {
 	return decodeTimestamp(buf, wireGroupOf(ver, false))
 }
 
-// newHasher returns the hash function for a wire group: SHA-512/256 for drafts
-// 02 and 07, SHA-512 for all others.
-func newHasher(g wireGroup) interface {
-	Write([]byte) (int, error)
-	Sum([]byte) []byte
-} {
+// Hasher pools: SHA-512/256 for drafts 02 and 07, SHA-512 otherwise. Merkle
+// construction allocates a hasher per leaf and per internal node.
+var (
+	sha512Pool     = sync.Pool{New: func() any { return sha512.New() }}
+	sha512_256Pool = sync.Pool{New: func() any { return sha512.New512_256() }}
+)
+
+// getHasher returns a Reset hasher for g. Pair every call with putHasher.
+func getHasher(g wireGroup) hash.Hash {
+	var h hash.Hash
 	if usesSHA512_256(g) {
-		return sha512.New512_256()
+		h = sha512_256Pool.Get().(hash.Hash)
+	} else {
+		h = sha512Pool.Get().(hash.Hash)
 	}
-	return sha512.New()
+	h.Reset()
+	return h
+}
+
+// putHasher returns h to its pool. The caller must not touch h after.
+func putHasher(g wireGroup, h hash.Hash) {
+	if usesSHA512_256(g) {
+		sha512_256Pool.Put(h)
+	} else {
+		sha512Pool.Put(h)
+	}
 }
 
 // leafHash computes H(0x00 || data), truncated to the wire group's hash size.
 func leafHash(g wireGroup, data []byte) []byte {
-	h := newHasher(g)
+	h := getHasher(g)
+	defer putHasher(g, h)
 	_, _ = h.Write([]byte{0x00})
 	_, _ = h.Write(data)
 	return h.Sum(nil)[:hashSize(g)]
@@ -383,7 +404,8 @@ func leafHash(g wireGroup, data []byte) []byte {
 // nodeHash computes H(0x01 || left || right), truncated to the wire group's
 // hash size.
 func nodeHash(g wireGroup, left, right []byte) []byte {
-	h := newHasher(g)
+	h := getHasher(g)
+	defer putHasher(g, h)
 	_, _ = h.Write([]byte{0x01})
 	_, _ = h.Write(left)
 	_, _ = h.Write(right)
@@ -393,6 +415,13 @@ func nodeHash(g wireGroup, left, right []byte) []byte {
 // encode serializes a tag-value map into a Roughtime message. All value lengths
 // must be multiples of 4 bytes; tags are emitted in ascending order.
 func encode(msg map[uint32][]byte) ([]byte, error) {
+	return encodeTo(msg, 0)
+}
+
+// encodeTo is encode with a reserved prefix of `prefix` zero bytes at the start
+// of the returned slice. Used by encodeWrapped to pack the 12-byte ROUGHTIM
+// header in the same allocation as the message body.
+func encodeTo(msg map[uint32][]byte, prefix int) ([]byte, error) {
 	if len(msg) == 0 {
 		return nil, errors.New("protocol: empty message")
 	}
@@ -420,29 +449,42 @@ func encode(msg map[uint32][]byte) ([]byte, error) {
 	}
 
 	totalLen := uint64(headerLen) + uint64(valsLen)
-	if totalLen > math.MaxInt {
+	if totalLen > math.MaxInt-uint64(prefix) {
 		return nil, errors.New("protocol: message too large")
 	}
 
-	out := make([]byte, totalLen)
-	binary.LittleEndian.PutUint32(out[0:4], n)
+	out := make([]byte, uint64(prefix)+totalLen)
+	body := out[prefix:]
+	binary.LittleEndian.PutUint32(body[0:4], n)
 
 	off := uint32(0)
 	for i := uint32(1); i < n; i++ {
 		off += uint32(len(msg[tags[i-1]]))
-		binary.LittleEndian.PutUint32(out[4+4*(i-1):4+4*i], off)
+		binary.LittleEndian.PutUint32(body[4+4*(i-1):4+4*i], off)
 	}
 
 	tBase := 4 + 4*(n-1) // start of tag section
 	for i, t := range tags {
-		binary.LittleEndian.PutUint32(out[tBase+uint32(4*i):tBase+uint32(4*i)+4], t)
+		binary.LittleEndian.PutUint32(body[tBase+uint32(4*i):tBase+uint32(4*i)+4], t)
 	}
 
 	pos := headerLen
 	for _, t := range tags {
-		copy(out[pos:], msg[t])
+		copy(body[pos:], msg[t])
 		pos += uint32(len(msg[t]))
 	}
+	return out, nil
+}
+
+// encodeWrapped encodes msg and prepends the 12-byte ROUGHTIM header in a
+// single allocation.
+func encodeWrapped(msg map[uint32][]byte) ([]byte, error) {
+	out, err := encodeTo(msg, 12)
+	if err != nil {
+		return nil, err
+	}
+	copy(out[0:8], packetMagic[:])
+	binary.LittleEndian.PutUint32(out[8:12], uint32(len(out)-12))
 	return out, nil
 }
 
@@ -518,15 +560,6 @@ func decodeValues(data []byte, tags, offsets []uint32, headerLen uint32) (map[ui
 		msg[tags[i]] = data[headerLen+start : headerLen+end]
 	}
 	return msg, nil
-}
-
-// wrapPacket prepends the 12-byte ROUGHTIM header.
-func wrapPacket(message []byte) []byte {
-	pkt := make([]byte, 12+len(message))
-	copy(pkt[0:8], packetMagic[:])
-	binary.LittleEndian.PutUint32(pkt[8:12], uint32(len(message)))
-	copy(pkt[12:], message)
-	return pkt
 }
 
 // unwrapPacket validates and strips the 12-byte ROUGHTIM header.
@@ -739,21 +772,22 @@ func ComputeSRV(rootPK ed25519.PublicKey) []byte {
 	return h.Sum(nil)[:32]
 }
 
-// SelectVersion picks the best mutually supported version. For Google-Roughtime
-// clients (no VER tag, 64-byte nonce), pass an empty clientVersions slice.
+// SelectVersion picks the best mutually supported version whose nonce size
+// matches nonceLen. Google-Roughtime and drafts 01–04 require a 64-byte nonce;
+// drafts 05+ require 32. For Google-Roughtime clients (no VER tag) pass an
+// empty clientVersions slice.
 func SelectVersion(clientVersions []Version, nonceLen int) (Version, error) {
 	if len(clientVersions) == 0 {
-		if nonceLen == 64 {
+		if nonceLen == nonceSize(groupGoogle) {
 			return VersionGoogle, nil
 		}
 		return 0, errors.New("protocol: no supported version")
 	}
-	set := make(map[Version]bool, len(clientVersions))
-	for _, v := range clientVersions {
-		set[v] = true
-	}
 	for _, sv := range serverPreference {
-		if set[sv] {
+		if nonceSize(wireGroupOf(sv, false)) != nonceLen {
+			continue
+		}
+		if slices.Contains(clientVersions, sv) {
 			return sv, nil
 		}
 	}
@@ -1072,12 +1106,15 @@ func buildReply(ver Version, g wireGroup, req Request, i int, tree *merkleTree, 
 		resp[TagTYPE] = tBuf[:]
 	}
 
-	replyMsg, err := encode(resp)
+	var replyMsg []byte
+	var err error
+	if usesRoughtimHeader(g) {
+		replyMsg, err = encodeWrapped(resp)
+	} else {
+		replyMsg, err = encode(resp)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("protocol: encode reply %d: %w", i, err)
-	}
-	if usesRoughtimHeader(g) {
-		replyMsg = wrapPacket(replyMsg)
 	}
 	return replyMsg, nil
 }
@@ -1183,13 +1220,16 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		tags[padTag] = make([]byte, padLen)
 	}
 
+	if usesRoughtimHeader(g) {
+		msg, err := encodeWrapped(tags)
+		if err != nil {
+			return nil, fmt.Errorf("protocol: encode request: %w", err)
+		}
+		return msg, nil
+	}
 	msg, err := encode(tags)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: encode request: %w", err)
-	}
-
-	if usesRoughtimHeader(g) {
-		return wrapPacket(msg), nil
 	}
 	return msg, nil
 }
@@ -1301,6 +1341,10 @@ func verifyNoVersionDowngrade(srep map[uint32][]byte, clientVersions []Version) 
 		}
 		prev = v
 		serverSupports[v] = true
+	}
+	// Drafts 12+ §5.3.5 MUST: chosen VER must appear in signed VERS.
+	if !serverSupports[chosen] {
+		return fmt.Errorf("protocol: server chose version %s not present in signed VERS list", chosen)
 	}
 	var best Version
 	var found bool

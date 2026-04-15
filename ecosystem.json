@@ -38,6 +38,15 @@
       "publicKeyType": "ed25519",
       "publicKey": "84pMADvKUcSOq5RNbVRjVrjiU16Dxo2XV2Qkm+4DRTg=",
       "addresses": [{ "protocol": "udp", "address": "time.teax.dev:2002" }]
+    },
+    {
+      "name": "roughtime.sturdystatistics.com",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "NqIjwLopQn6yQChtE21Mb97dAbAPe5UOuTa0tOakgD8=",
+      "addresses": [
+        { "protocol": "udp", "address": "roughtime.sturdystatistics.com:2002" }
+      ]
     }
   ]
 }

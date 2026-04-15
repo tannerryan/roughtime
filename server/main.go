@@ -21,7 +21,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -36,7 +35,7 @@ var logger *zap.Logger
 
 var (
 	port               = flag.Int("port", 2002, "port to listen on")
-	rootKeySeedHexFile = flag.String("root-key", "", "hex-encoded private key seed")
+	rootKeySeedHexFile = flag.String("root-key-file", "", "path to file containing hex-encoded root private key seed")
 	logLevel           = flag.String("log-level", "info", "log level (debug, info, warn, error)")
 	showVersion        = flag.Bool("version", false, "print version and exit")
 	keygen             = flag.String("keygen", "", "generate a root key pair and write the seed to the given path")
@@ -62,6 +61,24 @@ const (
 	// DELE window is 24h (certStartOffset + certEndOffset).
 	certEndOffset = 18 * time.Hour
 
+	// maxPacketSize is the read buffer size for incoming UDP packets. Sized to
+	// the standard IPv4 Ethernet MTU payload (1500 - 20 IP - 8 UDP = 1472) so
+	// that clients sending larger-than-1280 requests (e.g. draft-14+ clients
+	// padding to the MTU) are not truncated.
+	maxPacketSize = 1472
+
+	// socketRecvBuffer is the kernel UDP receive buffer size per worker socket.
+	// Linux clamps to net.core.rmem_max.
+	socketRecvBuffer = 8 * 1024 * 1024
+
+	// batchQueueSize is the capacity of the batcher channel. Requests beyond
+	// this are dropped to provide backpressure under extreme load.
+	batchQueueSize = 4096
+)
+
+// Timer intervals for the certificate refresh and stats loops. Declared as var
+// (not const) so tests can shrink them; never mutated in production.
+var (
 	// certRefreshThreshold is the remaining validity at which a new certificate
 	// is provisioned.
 	certRefreshThreshold = 3 * time.Hour
@@ -73,20 +90,6 @@ const (
 	// refreshRetryCooldown is the minimum delay between failed refresh
 	// attempts.
 	refreshRetryCooldown = 5 * time.Minute
-
-	// maxPacketSize is the read buffer size for incoming UDP packets. Sized to
-	// the standard IPv4 Ethernet MTU payload (1500 - 20 IP - 8 UDP = 1472) so
-	// that clients sending larger-than-1280 requests (e.g. draft-14+ clients
-	// padding to the MTU) are not truncated.
-	maxPacketSize = 1472
-
-	// socketRecvBuffer is the kernel UDP receive buffer size. A larger buffer
-	// reduces packet drops under burst traffic.
-	socketRecvBuffer = 4 * 1024 * 1024
-
-	// batchQueueSize is the capacity of the batcher channel. Requests beyond
-	// this are dropped to provide backpressure under extreme load.
-	batchQueueSize = 4096
 
 	// statsInterval is how often the periodic stats log line is emitted.
 	statsInterval = 60 * time.Second
@@ -101,10 +104,11 @@ var (
 	statsPanics      atomic.Uint64
 	statsBatches     atomic.Uint64
 	statsBatchedReqs atomic.Uint64
+	statsBatchErrs   atomic.Uint64
 )
 
 // certState holds the current online certificate, its expiry, and the
-// pre-computed SRV hash of the long-term root key. Swapped atomically so the
+// precomputed SRV hash of the long-term root key. Swapped atomically so the
 // request path is lock-free.
 type certState struct {
 	cert    *protocol.Certificate
@@ -112,12 +116,13 @@ type certState struct {
 	srvHash []byte
 }
 
-// validatedRequest is a parsed, validated request ready for batch signing.
-// Ownership of bufPtr transfers from the read loop to the batcher.
+// validatedRequest is a parsed request ready for batch signing. bufPtr is set
+// only on the pooled read path (listen_other.go) and must be returned to the
+// pool after signing; on the batched read path (listen_linux.go) it is nil.
 type validatedRequest struct {
 	req         protocol.Request
 	peer        *net.UDPAddr
-	requestSize int // original wire size, for amplification check
+	requestSize int
 	bufPtr      *[]byte
 	version     protocol.Version
 }
@@ -128,12 +133,10 @@ type batchKey struct {
 	hasType bool
 }
 
-// bufPool recycles read buffers to reduce GC pressure under high packet rates.
-var bufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, maxPacketSize)
-		return &b
-	},
+// readyReply is a grease/amplification-filtered response awaiting send.
+type readyReply struct {
+	peer  *net.UDPAddr
+	bytes []byte
 }
 
 // generateKeypair generates a root Ed25519 key pair, writes the hex-encoded
@@ -194,13 +197,16 @@ func derivePublicKey(path string) error {
 // validateFlags checks CLI flags are within permitted ranges.
 func validateFlags() error {
 	if *rootKeySeedHexFile == "" {
-		return fmt.Errorf("usage: roughtime -root-key <path> [-port <port>] [-log-level <level>]")
+		return fmt.Errorf("usage: roughtime -root-key-file <path> [-port <port>] [-log-level <level>]")
 	}
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("-port %d out of range (must be 1-65535)", *port)
 	}
 	if *batchMaxSize < 1 {
 		return fmt.Errorf("-batch-max-size %d must be >= 1", *batchMaxSize)
+	}
+	if *batchMaxSize > batchQueueSize {
+		return fmt.Errorf("-batch-max-size %d must be <= %d", *batchMaxSize, batchQueueSize)
 	}
 	if *batchMaxLatency <= 0 {
 		return fmt.Errorf("-batch-max-latency %s must be > 0", *batchMaxLatency)
@@ -253,14 +259,27 @@ func main() {
 	logger = base.Named("roughtime")
 
 	logger.Info("starting roughtime server",
+		zap.String("version", version.Version),
 		zap.Int("pid", os.Getpid()),
 		zap.Int("port", *port),
-		zap.Int("queue_size", batchQueueSize),
-		zap.Int("recv_buffer", socketRecvBuffer),
-		zap.Duration("radius", radius),
+		zap.String("root_key", *rootKeySeedHexFile),
 		zap.Stringer("log_level", lvl),
 		zap.Int("batch_max_size", *batchMaxSize),
 		zap.Duration("batch_max_latency", *batchMaxLatency),
+		zap.Float64("grease_rate", *greaseRate),
+		zap.Object("tunables", zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
+			enc.AddInt("recv_buffer", socketRecvBuffer)
+			enc.AddInt("max_packet_size", maxPacketSize)
+			enc.AddInt("min_request_size", minRequestSize)
+			enc.AddInt("batch_queue_size", batchQueueSize)
+			enc.AddDuration("radius", radius)
+			enc.AddDuration("cert_start_offset", certStartOffset)
+			enc.AddDuration("cert_end_offset", certEndOffset)
+			enc.AddDuration("cert_refresh_threshold", certRefreshThreshold)
+			enc.AddDuration("cert_check_interval", certCheckInterval)
+			enc.AddDuration("stats_interval", statsInterval)
+			return nil
+		})),
 	)
 
 	certLog := logger.Named("cert")
@@ -278,13 +297,17 @@ func main() {
 	state := &atomic.Pointer[certState]{}
 	state.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
 
+	// Capture the initial root public key so refreshLoop can detect, and
+	// refuse, a silent identity change (operator overwrote the seed file).
+	initialRootPK := append(ed25519.PublicKey(nil), rootPK...)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go refreshLoop(ctx, certLog, state)
-	go statsLoop(ctx, logger.Named("stats"), state)
+	go superviseLoop(ctx, certLog, "refreshLoop", func() { refreshLoop(ctx, certLog, state, initialRootPK) })
+	go superviseLoop(ctx, logger.Named("stats"), "statsLoop", func() { statsLoop(ctx, logger.Named("stats"), state) })
 
-	if err := listen(ctx, state); err != nil {
+	if err := listen(ctx, state, *batchMaxSize, *batchMaxLatency); err != nil {
 		logger.Fatal("running UDP server", zap.Error(err))
 	}
 }
@@ -337,12 +360,11 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 // statsLoop emits a periodic Info-level summary of server activity until ctx is
 // cancelled.
 func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState]) {
-	defer recoverGoroutine(log, "stats")
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
 	log.Info("stats loop started", zap.Duration("interval", statsInterval))
 
-	var lastReceived, lastResponded, lastDropped, lastPanics, lastBatchCount, lastBatchTotal uint64
+	var lastReceived, lastResponded, lastDropped, lastPanics, lastBatchCount, lastBatchTotal, lastBatchErrs uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -355,6 +377,7 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 		p := statsPanics.Load()
 		bc := statsBatches.Load()
 		bt := statsBatchedReqs.Load()
+		be := statsBatchErrs.Load()
 		intervalBatches := bc - lastBatchCount
 		var avgBatch float64
 		if intervalBatches > 0 {
@@ -366,17 +389,19 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 			zap.Uint64("dropped", d-lastDropped),
 			zap.Uint64("panics", p-lastPanics),
 			zap.Uint64("batches", intervalBatches),
+			zap.Uint64("batch_errs", be-lastBatchErrs),
 			zap.Float64("avg_batch_size", avgBatch),
 			zap.Duration("cert_remaining", time.Until(state.Load().expiry)),
 		)
 		lastReceived, lastResponded, lastDropped, lastPanics = r, s, d, p
-		lastBatchCount, lastBatchTotal = bc, bt
+		lastBatchCount, lastBatchTotal, lastBatchErrs = bc, bt, be
 	}
 }
 
 // recoverGoroutine logs and absorbs a panic so a single bad request or refresh
-// failure cannot crash the server.
-func recoverGoroutine(log *zap.Logger, where string) {
+// failure cannot crash the server. Returns true if a panic was recovered so
+// callers can decide whether to restart the goroutine.
+func recoverGoroutine(log *zap.Logger, where string) bool {
 	if r := recover(); r != nil {
 		statsPanics.Add(1)
 		log.Error("goroutine panic recovered",
@@ -384,13 +409,32 @@ func recoverGoroutine(log *zap.Logger, where string) {
 			zap.Any("panic", r),
 			zap.Stack("stack"),
 		)
+		return true
+	}
+	return false
+}
+
+// superviseLoop runs fn, restarting on panic, until ctx is cancelled. Use for
+// long-lived background goroutines whose silent death would degrade the server.
+func superviseLoop(ctx context.Context, log *zap.Logger, where string, fn func()) {
+	for ctx.Err() == nil {
+		func() {
+			defer recoverGoroutine(log, where)
+			fn()
+		}()
+		if ctx.Err() != nil {
+			return
+		}
+		log.Warn("goroutine exited before shutdown, restarting", zap.String("where", where))
 	}
 }
 
 // refreshLoop replaces the certificate as it approaches expiry, with a cooldown
-// between failed attempts. Exits when ctx is cancelled.
-func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState]) {
-	defer recoverGoroutine(log, "refreshLoop")
+// between failed attempts. If the root public key derived from disk no longer
+// matches initialRootPK, the refresh is rejected — a changed root key would
+// silently change the server's identity and break every client that cached the
+// previous key. Exits when ctx is cancelled.
+func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK ed25519.PublicKey) {
 	ticker := time.NewTicker(certCheckInterval)
 	defer ticker.Stop()
 	var lastAttempt time.Time
@@ -422,121 +466,54 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 			zap.Time("current_expiry", cur.expiry),
 			zap.Duration("remaining", time.Until(cur.expiry)),
 		)
-		newCert, newOnlinePK, newRootPK, newExpiry, err := provisionCertificateKey()
+		newState, newOnlinePK, err := tryRefreshCert(initialRootPK)
 		if err != nil {
-			log.Error("certificate refresh failed",
-				zap.Error(err),
-				zap.Time("current_expiry", cur.expiry),
-				zap.Duration("retry_cooldown", refreshRetryCooldown),
-			)
+			// Escalate when remaining validity is below the retry cooldown: the
+			// next attempt won't land before expiry, so replies will start
+			// being rejected by clients.
+			remaining := time.Until(cur.expiry)
+			lvl := zap.ErrorLevel
+			if remaining < refreshRetryCooldown {
+				lvl = zap.DPanicLevel
+			}
+			if ce := log.Check(lvl, "certificate refresh failed"); ce != nil {
+				ce.Write(
+					zap.Error(err),
+					zap.Time("current_expiry", cur.expiry),
+					zap.Duration("remaining", remaining),
+					zap.Duration("retry_cooldown", refreshRetryCooldown),
+				)
+			}
 			continue
 		}
-		state.Store(&certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)})
+		state.Store(newState)
 		log.Info("certificate refreshed",
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),
 			zap.Time("previous_expiry", cur.expiry),
-			zap.Time("expiry", newExpiry),
-			zap.Duration("validity", time.Until(newExpiry)),
+			zap.Time("expiry", newState.expiry),
+			zap.Duration("validity", time.Until(newState.expiry)),
 		)
 	}
 }
 
-// listen runs the UDP server: the read loop validates each packet inline and
-// hands valid requests to the batcher over a bounded channel. Excess requests
-// are dropped, and the loop drains in-flight work on ctx cancellation.
-func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
-	listenLog := logger.Named("listener")
-
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
+// tryRefreshCert reads the root key from disk, rejects any change to the root
+// public key (operator overwrote the seed since startup), and returns a fresh
+// certState plus the new online public key for logging.
+func tryRefreshCert(initialRootPK ed25519.PublicKey) (*certState, ed25519.PublicKey, error) {
+	newCert, newOnlinePK, newRootPK, newExpiry, err := provisionCertificateKey()
 	if err != nil {
-		return fmt.Errorf("starting UDP server: %w", err)
+		return nil, nil, err
 	}
-	if err := conn.SetReadBuffer(socketRecvBuffer); err != nil {
-		listenLog.Warn("setting UDP receive buffer failed",
-			zap.Int("requested", socketRecvBuffer),
-			zap.Error(err),
-		)
+	if !bytes.Equal(newRootPK, initialRootPK) {
+		return nil, nil, fmt.Errorf("root public key on disk has changed since startup (want %s, got %s); restart required",
+			hex.EncodeToString(initialRootPK), hex.EncodeToString(newRootPK))
 	}
-
-	batchCh := make(chan validatedRequest, batchQueueSize)
-
-	var batcherWg sync.WaitGroup
-	batcherLog := logger.Named("batcher")
-	batcherWg.Go(func() {
-		batcher(batcherLog, conn, state, batchCh, *batchMaxSize, *batchMaxLatency)
-	})
-
-	listenLog.Info("listening",
-		zap.String("addr", conn.LocalAddr().String()),
-		zap.Int("port", *port),
-	)
-
-	// On shutdown, set a past read deadline so the read loop unblocks cleanly
-	// without closing the socket from underneath in-flight work.
-	go func() {
-		<-ctx.Done()
-		listenLog.Info("shutdown initiated, unblocking reads")
-		_ = conn.SetReadDeadline(time.Unix(1, 0))
-	}()
-
-	for {
-		bufPtr := bufPool.Get().(*[]byte)
-		reqLen, peer, err := conn.ReadFromUDP(*bufPtr)
-		if err != nil {
-			bufPool.Put(bufPtr)
-			if ctx.Err() != nil {
-				break
-			}
-			listenLog.Warn("UDP read error", zap.Error(err))
-			continue
-		}
-		statsReceived.Add(1)
-		// Drop undersize packets without dispatching: responding to requests
-		// shorter than 1024 bytes is OPTIONAL per all drafts (§5/§6).
-		if reqLen < minRequestSize {
-			bufPool.Put(bufPtr)
-			statsDropped.Add(1)
-			if ce := listenLog.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
-				ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen))
-			}
-			continue
-		}
-		vr, ok := validateRequest(listenLog, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, state.Load())
-		if !ok {
-			bufPool.Put(bufPtr)
-			continue
-		}
-		select {
-		case batchCh <- vr:
-		default:
-			bufPool.Put(bufPtr)
-			statsDropped.Add(1)
-			listenLog.Warn("dropped request: batcher queue full",
-				zap.Stringer("peer", peer),
-				zap.Int("size", reqLen),
-				zap.Int("queue_size", batchQueueSize),
-			)
-		}
-	}
-
-	drainStart := time.Now()
-	close(batchCh)
-	batcherWg.Wait()
-	_ = conn.Close()
-	listenLog.Info("shutdown complete",
-		zap.Uint64("received_total", statsReceived.Load()),
-		zap.Uint64("responded_total", statsResponded.Load()),
-		zap.Uint64("dropped_total", statsDropped.Load()),
-		zap.Uint64("panics_total", statsPanics.Load()),
-		zap.Uint64("batches_total", statsBatches.Load()),
-		zap.Duration("drain_duration", time.Since(drainStart)),
-	)
-	return nil
+	return &certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
 }
 
-// validateRequest parses a request, validates SRV, and negotiates a version. On
-// success the returned validatedRequest owns bufPtr. On failure the caller must
-// return bufPtr to the pool.
+// validateRequest parses a request, validates SRV, and negotiates a version.
+// bufPtr, when non-nil, is stored into the returned struct so the pooled read
+// path can return it after signing.
 func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, bool) {
 	req, err := protocol.ParseRequest(requestBytes)
 	if err != nil {
@@ -573,103 +550,11 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 	}, true
 }
 
-// batcher accumulates validated requests grouped by (version, hasType) and
-// flushes them in bulk signing batches. It fires when a batch reaches maxSize
-// or when maxLatency has elapsed since the first request in a batch arrived.
-func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], incoming <-chan validatedRequest, maxSize int, maxLatency time.Duration) {
-	defer recoverGoroutine(log, "batcher")
-
-	type pending struct {
-		items []validatedRequest
-		start time.Time
-	}
-	batches := make(map[batchKey]*pending)
-
-	timer := time.NewTimer(0)
-	if !timer.Stop() {
-		<-timer.C
-	}
-	timerRunning := false
-
-	resetTimer := func() {
-		var earliest time.Time
-		for _, b := range batches {
-			deadline := b.start.Add(maxLatency)
-			if earliest.IsZero() || deadline.Before(earliest) {
-				earliest = deadline
-			}
-		}
-		if earliest.IsZero() {
-			if timerRunning {
-				timer.Stop()
-				timerRunning = false
-			}
-			return
-		}
-		timer.Reset(max(time.Until(earliest), 0))
-		timerRunning = true
-	}
-
-	flush := func(key batchKey) {
-		b := batches[key]
-		if b == nil || len(b.items) == 0 {
-			return
-		}
-		flushBatch(log, conn, state, key.version, b.items)
-		delete(batches, key)
-	}
-
-	for {
-		select {
-		case vr, ok := <-incoming:
-			if !ok {
-				for key := range batches {
-					flush(key)
-				}
-				return
-			}
-			key := batchKey{version: vr.version, hasType: vr.req.HasType}
-			b, exists := batches[key]
-			if !exists {
-				b = &pending{items: make([]validatedRequest, 0, maxSize), start: time.Now()}
-				batches[key] = b
-			}
-			b.items = append(b.items, vr)
-
-			// Drafts 01-02 place NONC inside SREP, preventing multi-request
-			// batches. Flush immediately to avoid the noncInSREP rejection.
-			if protocol.NoncInSREP(vr.version, vr.req.HasType) || len(b.items) >= maxSize {
-				flush(key)
-			}
-			resetTimer()
-
-		case <-timer.C:
-			timerRunning = false
-			now := time.Now()
-			for key, b := range batches {
-				if now.Sub(b.start) >= maxLatency {
-					flush(key)
-				}
-			}
-			resetTimer()
-		}
-	}
-}
-
-// flushBatch signs a batch of requests and sends individual replies. Buffers
-// are returned to the pool after sending regardless of outcome.
-func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) {
-	defer func() {
-		for i := range items {
-			if items[i].bufPtr != nil {
-				bufPool.Put(items[i].bufPtr)
-				items[i].bufPtr = nil
-			}
-		}
-	}()
-	defer recoverGoroutine(log, "flushBatch")
-
-	st := state.Load()
+// signAndBuildReplies signs a homogeneous batch (same version and TYPE-tag
+// presence) and returns grease-applied, amplification-filtered replies. Callers
+// are responsible for recording statsResponded after a successful write; this
+// helper updates only batch-level counters.
+func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, items []validatedRequest) []readyReply {
 	reqs := make([]protocol.Request, len(items))
 	for i := range items {
 		reqs[i] = items[i].req
@@ -678,17 +563,19 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 	// Zero midpoint lets CreateReplies timestamp after tree construction.
 	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
 	if err != nil {
+		statsBatchErrs.Add(1)
 		log.Warn("batch CreateReplies failed",
 			zap.Stringer("version", ver),
 			zap.Int("batch_size", len(items)),
 			zap.Error(err),
 		)
-		return
+		return nil
 	}
 
 	statsBatches.Add(1)
 	statsBatchedReqs.Add(uint64(len(items)))
 
+	out := make([]readyReply, 0, len(replies))
 	for i, reply := range replies {
 		// Grease (Section 7): apply a random grease transformation so clients
 		// learn to reject invalid responses and ignore undefined tags.
@@ -712,20 +599,7 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 			}
 			continue
 		}
-		if _, err := conn.WriteToUDP(reply, items[i].peer); err != nil {
-			log.Warn("UDP write failed",
-				zap.Stringer("peer", items[i].peer),
-				zap.Error(err),
-			)
-			continue
-		}
-		statsResponded.Add(1)
-		if ce := log.Check(zap.DebugLevel, "sent response"); ce != nil {
-			ce.Write(
-				zap.Stringer("peer", items[i].peer),
-				zap.Int("size", len(reply)),
-				zap.Stringer("version", ver),
-			)
-		}
+		out = append(out, readyReply{peer: items[i].peer, bytes: reply})
 	}
+	return out
 }

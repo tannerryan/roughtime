@@ -32,11 +32,23 @@ var (
 	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "per-version probe timeout")
 	retries     = flag.Int("retries", 3, "max retry attempts per version (exponential backoff)")
+	forceVer    = flag.String("ver", "", "probe only this version (e.g. draft-12, Google) and dump request/response even on failure")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
 // probeVersions lists every distinct VER value, newest first.
 var probeVersions = protocol.Supported()
+
+// parseShortVersion maps a ShortString label ("Google", "draft-12") back to the
+// wire Version. Unknown or malformed inputs return an error.
+func parseShortVersion(s string) (protocol.Version, error) {
+	for _, v := range protocol.Supported() {
+		if v.ShortString() == s {
+			return v, nil
+		}
+	}
+	return 0, fmt.Errorf("unknown version %q (try: Google, draft-01 ... draft-12)", s)
+}
 
 // probeResult holds the outcome of a single version probe.
 type probeResult struct {
@@ -70,13 +82,20 @@ func main() {
 // validateFlags checks CLI flags are within permitted ranges.
 func validateFlags() error {
 	if *addr == "" || *pubkey == "" {
-		return fmt.Errorf("usage: debug -addr <host:port> -pubkey <base64>")
+		return fmt.Errorf("usage: debug -addr <host:port> -pubkey <base64-or-hex>")
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout %s must be > 0", *timeout)
 	}
 	if *retries < 1 {
 		return fmt.Errorf("-retries %d must be >= 1", *retries)
+	}
+	if *forceVer != "" {
+		v, err := parseShortVersion(*forceVer)
+		if err != nil {
+			return err
+		}
+		probeVersions = []protocol.Version{v}
 	}
 	return nil
 }
@@ -86,6 +105,19 @@ func run() error {
 	rootPK, err := decodePubKey(*pubkey)
 	if err != nil {
 		return fmt.Errorf("decoding public key: %w", err)
+	}
+
+	if *forceVer != "" {
+		r := probe(rootPK, probeVersions[0])
+		fmt.Printf("=== Forced Version: %s ===\n", r.version)
+		if r.err != nil {
+			fmt.Printf("Probe error: %s\n\n", r.err)
+		}
+		printDiagnostic(r)
+		if r.err != nil {
+			return r.err
+		}
+		return nil
 	}
 
 	fmt.Printf("=== Version Probe: %s ===\n", *addr)
@@ -164,7 +196,7 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 				err = fmt.Errorf("verify: %w", err)
 			}
 			r.err = err
-			return r
+			break
 		}
 	}
 	r.reply = reply
@@ -240,7 +272,9 @@ func printDiagnostic(r probeResult) {
 
 	printRequest(r, reqTags)
 	printResponse(r, respTags)
-	printVerified(r)
+	if r.err == nil {
+		printVerified(r)
+	}
 	printResponseDetail(r, respTags)
 	printSREP(r, respTags)
 	printCert(r, respTags)

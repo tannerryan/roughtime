@@ -51,7 +51,7 @@ var (
 	serversFile = flag.String("servers", "", "path to JSON server list")
 	nameFilter  = flag.String("name", "", "query only the named server from the JSON list")
 	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
-	pubkey      = flag.String("pubkey", "", "base64-encoded Ed25519 root public key (with -addr)")
+	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex, with -addr)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "UDP read/write timeout")
 	retries     = flag.Int("retries", 3, "max retry attempts per server (exponential backoff)")
 	chain       = flag.Bool("chain", true, "chain queries: derive each nonce from the previous reply")
@@ -317,7 +317,7 @@ func loadServers() ([]serverConfig, error) {
 			}{{Protocol: "udp", Address: cleanAddr}},
 		}}, nil
 	}
-	return nil, fmt.Errorf("provide -servers <file> or -addr <host:port> -pubkey <base64>")
+	return nil, fmt.Errorf("provide -servers <file> or -addr <host:port> -pubkey <base64-or-hex>")
 }
 
 // loadServersFile reads and parses a JSON server list.
@@ -445,11 +445,8 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 		backoff := *timeout
 		ok := false
 		for attempt := range *retries {
-			var networkErr bool
 			reply, rtt, localNow, err = sendRequest(r.Address, link.Request, backoff)
-			if err != nil {
-				networkErr = true
-			} else {
+			if err == nil {
 				midpoint, radius, err = protocol.VerifyReply(versions, reply, rootPK, parsed.Nonce, link.Request)
 			}
 			if err == nil {
@@ -457,10 +454,10 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 				break
 			}
 			if attempt < *retries-1 {
-				if networkErr {
-					time.Sleep(backoff)
-					backoff = time.Duration(float64(backoff) * 1.5)
-				}
+				// Back off on any retry: a verify failure may be grease (§7),
+				// so retrying can succeed but must not hammer the server.
+				time.Sleep(backoff)
+				backoff = time.Duration(float64(backoff) * 1.5)
 			}
 		}
 		if !ok {
@@ -554,10 +551,10 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 			r.Err = err
 			return r
 		}
-		if networkErr {
-			time.Sleep(backoff)
-			backoff = time.Duration(float64(backoff) * 1.5)
-		}
+		// Back off on any retry: a verify failure may be grease (§7), so
+		// retrying can succeed but must not hammer the server.
+		time.Sleep(backoff)
+		backoff = time.Duration(float64(backoff) * 1.5)
 	}
 	r.RTT = rtt
 	r.LocalNow = localNow

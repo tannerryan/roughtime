@@ -26,8 +26,7 @@ refreshes them before expiry.
 
 ```
 roughtime -keygen /path/to/root.key
-roughtime -pubkey /path/to/root.key
-roughtime -root-key /path/to/root.key [-port 2002] [-log-level info] [-grease-rate 0.01]
+roughtime -root-key-file /path/to/root.key [-port 2002] [-log-level info] [-grease-rate 0.01]
 roughtime -version
 ```
 
@@ -253,7 +252,6 @@ key mounted read-only:
 docker build -t roughtime:latest .
 mkdir -p keys
 docker run --rm -v "$PWD/keys:/keys" roughtime:latest -keygen /keys/root.key
-docker run --rm -v "$PWD/keys:/keys:ro" roughtime:latest -pubkey /keys/root.key
 docker run -d \
   --name roughtime \
   --restart unless-stopped \
@@ -262,8 +260,23 @@ docker run -d \
   --security-opt no-new-privileges \
   -p 2002:2002/udp \
   -v "$PWD/keys:/keys:ro" \
-  roughtime:latest -root-key /keys/root.key
+  roughtime:latest -root-key-file /keys/root.key
 ```
+
+## Benchmark
+
+`roughtime-bench` is a closed-loop UDP load generator for stress-testing a
+running server. Each worker owns one socket, fires a well-formed request, waits
+for the reply, and repeats. It reports throughput, latency percentiles, and an
+error breakdown.
+
+```
+go run bench/main.go -addr <host:port> -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s
+```
+
+With `-verify`, every reply is signature-checked against the root public key.
+Verification adds ~100µs/reply of client CPU, so leave it off for pure
+throughput numbers.
 
 ## Development
 
@@ -271,7 +284,7 @@ A Makefile is provided for building, testing, linting, and fuzzing.
 
 ```
 make deps             # install dev tools
-make build            # build roughtime, roughtime-client, roughtime-debug
+make build            # build roughtime, roughtime-client, roughtime-debug, roughtime-bench
 make test             # unit tests
 make test-race        # unit tests with race detector
 make test-cover       # unit tests with coverage (protocol package)

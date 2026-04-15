@@ -10,6 +10,7 @@ LICENSE
 roughtime
 roughtime-client
 roughtime-debug
+roughtime-bench
 
 # Coverage artifacts
 coverage.out

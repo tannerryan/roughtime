@@ -17,6 +17,15 @@ import (
 	"time"
 )
 
+// wrapPacket prepends the 12-byte ROUGHTIM header to a raw message.
+func wrapPacket(msg []byte) []byte {
+	pkt := make([]byte, 12+len(msg))
+	copy(pkt[0:8], packetMagic[:])
+	binary.LittleEndian.PutUint32(pkt[8:12], uint32(len(msg)))
+	copy(pkt[12:], msg)
+	return pkt
+}
+
 // testKeys generates a fresh root and online Ed25519 key pair.
 func testKeys(t *testing.T) (ed25519.PrivateKey, ed25519.PrivateKey) {
 	t.Helper()
@@ -758,14 +767,14 @@ func TestDecodeRadiusRejectsShort(t *testing.T) {
 
 // TestDecodeRadiusRejectsZero verifies that RADI=0 is rejected per §5.2.5.
 func TestDecodeRadiusRejectsZero(t *testing.T) {
-	// Drafts 10+ forbid RADI == 0 (§6.2.5 MUST).
-	for _, g := range []wireGroup{groupD10, groupD12, groupD14} {
+	// Drafts 08+ forbid RADI == 0 (§5.2.2 and §6.2.5 MUST).
+	for _, g := range []wireGroup{groupD08, groupD10, groupD12, groupD14} {
 		if _, err := decodeRadius(make([]byte, 4), g); err == nil {
 			t.Fatalf("expected error for RADI=0 with group %d", g)
 		}
 	}
-	// Pre-draft-10 and Google do not forbid RADI == 0.
-	for _, g := range []wireGroup{groupGoogle, groupD01, groupD05, groupD08} {
+	// Pre-draft-08 and Google do not forbid RADI == 0.
+	for _, g := range []wireGroup{groupGoogle, groupD01, groupD05, groupD07} {
 		if _, err := decodeRadius(make([]byte, 4), g); err != nil {
 			t.Fatalf("RADI=0 should be accepted for group %d: %v", g, err)
 		}
@@ -4773,4 +4782,56 @@ func FuzzCreateRequestWithNonce(f *testing.F) {
 			t.Fatal("nonce mismatch")
 		}
 	})
+}
+
+// TestSelectVersionRejectsNonceSizeMismatch verifies that SelectVersion won't
+// return a version whose required nonce size differs from the request's actual
+// nonce length, even if that version is in the client's offered list.
+func TestSelectVersionRejectsNonceSizeMismatch(t *testing.T) {
+	// Client sends a 64-byte nonce but only offers Draft12 (requires 32).
+	if _, err := SelectVersion([]Version{VersionDraft12}, 64); err == nil {
+		t.Fatal("expected error: Draft12 with 64-byte nonce")
+	}
+	// Client sends a 32-byte nonce but only offers Draft04 (requires 64).
+	if _, err := SelectVersion([]Version{VersionDraft04}, 32); err == nil {
+		t.Fatal("expected error: Draft04 with 32-byte nonce")
+	}
+	// Client offers both Draft04 (64) and Draft12 (32); with a 64-byte nonce
+	// the selector must pick Draft04 despite Draft12 having higher preference.
+	v, err := SelectVersion([]Version{VersionDraft04, VersionDraft12}, 64)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != VersionDraft04 {
+		t.Fatalf("got %v, want VersionDraft04 (only version matching 64-byte nonce)", v)
+	}
+	// And with a 32-byte nonce it must pick Draft12.
+	v, err = SelectVersion([]Version{VersionDraft04, VersionDraft12}, 32)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v != VersionDraft12 {
+		t.Fatalf("got %v, want VersionDraft12", v)
+	}
+}
+
+// TestVerifyNoVersionDowngradeRejectsChosenNotInVERS verifies the explicit
+// §5.3.5 MUST: the chosen SREP.VER must appear in the signed VERS list.
+func TestVerifyNoVersionDowngradeRejectsChosenNotInVERS(t *testing.T) {
+	// Build a SREP where VER (chosen) is Draft12 but VERS lists only Draft11.
+	var verBuf [4]byte
+	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
+	var versBuf [4]byte
+	binary.LittleEndian.PutUint32(versBuf[:], uint32(VersionDraft11))
+	srep := map[uint32][]byte{
+		TagVER:  verBuf[:],
+		TagVERS: versBuf[:],
+	}
+	err := verifyNoVersionDowngrade(srep, []Version{VersionDraft11, VersionDraft12})
+	if err == nil {
+		t.Fatal("expected error: chosen version not in VERS")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("not present in signed VERS")) {
+		t.Fatalf("error message should call out VERS mismatch, got: %v", err)
+	}
 }

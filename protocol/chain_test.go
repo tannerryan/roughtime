@@ -1186,3 +1186,56 @@ func TestParseMalfeasanceReportRejectsBadRand(t *testing.T) {
 		t.Fatal("expected error for bad rand")
 	}
 }
+
+// TestVerifyCausalOrderFiveLinks exercises the running-max causal-order
+// algorithm (chain.go) on a 5-link chain, ensuring detection of a non-monotonic
+// midpoint that is not the immediate predecessor. The existing 3-link test
+// catches adjacent violations; this covers the "prior peak" case where the
+// violator's midpoint is earlier than an older link's upper bound.
+func TestVerifyCausalOrderFiveLinks(t *testing.T) {
+	ver := VersionDraft12
+	versions := []Version{ver}
+
+	servers := make([]chainServer, 5)
+	for i := range servers {
+		servers[i] = newChainServer(t, ver)
+	}
+
+	// Midpoints: link 2 is the peak (far future); link 4 is earlier than link
+	// 2's lower-bound, which the running-max algorithm must catch even though
+	// link 3 (immediately before) is not earlier than link 4.
+	base := time.Now().Truncate(time.Second)
+	midpoints := []time.Time{
+		base.Add(-10 * time.Minute), // link 0
+		base.Add(-5 * time.Minute),  // link 1
+		base.Add(30 * time.Minute),  // link 2 — peak
+		base.Add(10 * time.Minute),  // link 3 — below peak (acceptable vs running max if radius overlaps)
+		base.Add(-15 * time.Minute), // link 4 — far below peak, clearly violates running max
+	}
+
+	var c Chain
+	for i, srv := range servers {
+		link, err := c.NextRequest(versions, srv.rootPK, rand.Reader)
+		if err != nil {
+			t.Fatalf("next request %d: %v", i, err)
+		}
+		req, err := ParseRequest(link.Request)
+		if err != nil {
+			t.Fatalf("parse %d: %v", i, err)
+		}
+		replies, err := CreateReplies(ver, []Request{*req}, midpoints[i], time.Second, srv.cert)
+		if err != nil {
+			t.Fatalf("create reply %d: %v", i, err)
+		}
+		link.Response = replies[0]
+		c.Append(link)
+	}
+
+	err := c.Verify()
+	if err == nil {
+		t.Fatal("expected causal ordering error")
+	}
+	if !errors.Is(err, ErrCausalOrder) {
+		t.Fatalf("expected ErrCausalOrder, got: %v", err)
+	}
+}

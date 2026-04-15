@@ -1,12 +1,26 @@
 # roughtime - https://github.com/tannerryan/roughtime
 
 # Binaries
-BINARIES     = roughtime roughtime-client roughtime-debug
-FUZZ_TARGETS = FuzzDecode FuzzParseRequest FuzzVerifyReply \
-               FuzzVerifyReplyAllVersions FuzzCreateReplies \
-               FuzzCreateRepliesBatch FuzzDecodeTimestamp FuzzEncode \
-               FuzzExtractVersion FuzzSelectVersion FuzzParseMalfeasanceReport \
-               FuzzChainNonce FuzzChainVerify FuzzGrease
+BINARIES     = roughtime roughtime-client roughtime-debug roughtime-bench
+# Fuzz targets, grouped by package. `name:pkg` — the fuzz rule splits on ':'.
+FUZZ_TARGETS = \
+    FuzzDecode:./protocol/ \
+    FuzzParseRequest:./protocol/ \
+    FuzzVerifyReply:./protocol/ \
+    FuzzVerifyReplyAllVersions:./protocol/ \
+    FuzzCreateReplies:./protocol/ \
+    FuzzCreateRepliesBatch:./protocol/ \
+    FuzzCreateRequestWithNonce:./protocol/ \
+    FuzzDecodeTimestamp:./protocol/ \
+    FuzzEncode:./protocol/ \
+    FuzzExtractVersion:./protocol/ \
+    FuzzSelectVersion:./protocol/ \
+    FuzzGrease:./protocol/ \
+    FuzzParseMalfeasanceReport:./protocol/ \
+    FuzzChainNonce:./protocol/ \
+    FuzzChainVerify:./protocol/ \
+    FuzzValidateRequest:./server/ \
+    FuzzServeOnce:./server/
 FUZZ_TIME   ?= 30s
 
 .PHONY: all deps build test test-verbose test-race test-cover test-race-cover \
@@ -25,9 +39,10 @@ deps:
 
 # Build all binaries
 build:
-	go build -o roughtime .
+	go build -o roughtime ./server
 	go build -o roughtime-client ./client
 	go build -o roughtime-debug ./debug
+	go build -o roughtime-bench ./bench
 
 # Run unit tests
 test:
@@ -41,13 +56,13 @@ test-verbose:
 test-race:
 	go test -race ./...
 
-# Run unit tests with coverage (protocol package only)
+# Run unit tests with coverage (protocol + server packages)
 test-cover:
-	go test -cover ./protocol/
+	go test -cover ./protocol/ ./server/
 
 # Run unit tests with race detector and coverage profile (used by CI)
 test-race-cover:
-	go test -race -covermode=atomic -coverprofile=coverage.out ./protocol/
+	go test -race -covermode=atomic -coverprofile=coverage.out ./protocol/ ./server/
 
 # Verify module checksums match go.sum
 verify:
@@ -63,11 +78,13 @@ coverage-report: test-race-cover
 # Run all test variants (verbose + race + cover)
 test-all: test-verbose test-race test-cover
 
-# Run all fuzz targets sequentially (FUZZ_TIME=30s by default)
+# Run all fuzz targets sequentially (FUZZ_TIME=30s by default). Each entry
+# encodes name:pkg so the dispatch covers both ./protocol/ and ./server/.
 fuzz:
-	@for target in $(FUZZ_TARGETS); do \
-		echo "=== fuzzing $$target ($(FUZZ_TIME)) ==="; \
-		go test -fuzz="^$${target}$$" -fuzztime=$(FUZZ_TIME) ./protocol/ || exit 1; \
+	@for entry in $(FUZZ_TARGETS); do \
+		name=$${entry%%:*}; pkg=$${entry#*:}; \
+		echo "=== fuzzing $$name ($$pkg, $(FUZZ_TIME)) ==="; \
+		go test -fuzz="^$${name}$$" -fuzztime=$(FUZZ_TIME) $$pkg || exit 1; \
 	done
 
 # Run gofmt and goimports
@@ -83,7 +100,7 @@ vet:
 lint: vet
 	staticcheck ./...
 	golangci-lint run ./...
-	gopls check ./protocol/protocol.go ./protocol/chain.go ./main.go ./debug/main.go ./client/main.go
+	gopls check ./protocol/protocol.go ./protocol/chain.go ./server/main.go ./server/listen_linux.go ./server/listen_other.go ./debug/main.go ./client/main.go ./bench/main.go
 
 # Run full check suite: module verify, format, vet, lint, build, test with race
 # + coverage, report card

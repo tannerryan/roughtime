@@ -1,6 +1,7 @@
 roughtime
 roughtime-client
 roughtime-debug
+roughtime-bench
 coverage.out
 coverage.txt
 coverage.html
