@@ -239,6 +239,7 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 	for _, r := range replies {
 		if _, err := conn.WriteToUDP(r.bytes, r.peer); err != nil {
 			log.Warn("UDP write failed", zap.Stringer("peer", r.peer), zap.Error(err))
+			statsDropped.Add(1)
 			continue
 		}
 		statsResponded.Add(1)

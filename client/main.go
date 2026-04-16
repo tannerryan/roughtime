@@ -19,18 +19,24 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -53,8 +59,9 @@ var (
 	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
 	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex, with -addr)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "UDP read/write timeout")
-	retries     = flag.Int("retries", 3, "max retry attempts per server (exponential backoff)")
+	retries     = flag.Int("retries", 3, "max retry attempts per server (1.5× linear backoff)")
 	chain       = flag.Bool("chain", true, "chain queries: derive each nonce from the previous reply")
+	all         = flag.Bool("all", false, "query every server in the ecosystem (default: random 3)")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
@@ -130,7 +137,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "client: %s\n", err)
 		os.Exit(1)
 	}
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "client: %s\n", err)
 		os.Exit(1)
 	}
@@ -148,14 +157,14 @@ func validateFlags() error {
 }
 
 // run queries the configured servers and prints results.
-func run() error {
+func run(ctx context.Context) error {
 	servers, err := loadServers()
 	if err != nil {
 		return err
 	}
 
 	if len(servers) == 1 {
-		r := queryServer(servers[0])
+		r := queryServer(ctx, servers[0])
 		if r.Err != nil {
 			return fmt.Errorf("%s: %w", r.Name, r.Err)
 		}
@@ -163,20 +172,29 @@ func run() error {
 		return nil
 	}
 
-	const rowFmt = "%-30s  %-30s  %-14s  %-20s  %-8s  %-10s  %-12s  %s\n"
+	// Size columns to the widest value, floored at the header width.
+	nameW, addrW := 30, 30
+	for _, s := range servers {
+		nameW = max(nameW, len(s.Name))
+		if len(s.Addresses) > 0 {
+			addrW = max(addrW, len(s.Addresses[0].Address))
+		}
+	}
+	rowFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-8s  %%-20s  %%-8s  %%-6s  %%-8s  %%s\n", nameW, addrW)
 	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
+	errFmt := fmt.Sprintf("%%-%ds  %%-%ds  error: %%s\n", nameW, addrW)
 
 	var results []result
 	var pchain *protocol.Chain
 	if *chain {
 		// Section 8.2: repeat the query sequence twice in the same order so
 		// every server is checked against every other in both directions.
-		results, pchain = queryChained(append(servers, servers...))
+		results, pchain = queryChained(ctx, append(servers, servers...))
 	} else {
 		ch := make(chan result, len(servers))
 		for _, srv := range servers {
 			go func(srv serverConfig) {
-				ch <- queryServer(srv)
+				ch <- queryServer(ctx, srv)
 			}(srv)
 		}
 		for range servers {
@@ -185,15 +203,21 @@ func run() error {
 	}
 
 	var drifts []time.Duration
+	// Dedupe so chain mode's two-pass sequence doesn't double-weight servers.
+	seen := make(map[string]bool)
 	var succeeded, failed int
 	for _, r := range results {
 		if r.Err != nil {
-			fmt.Printf("%-30s  %-30s  error: %s\n", r.Name, r.Address, r.Err)
+			fmt.Printf(errFmt, r.Name, r.Address, r.Err)
 			failed++
 			continue
 		}
 		drift := r.Midpoint.Sub(r.LocalNow)
-		drifts = append(drifts, drift)
+		key := r.Name + "|" + r.Address
+		if !seen[key] {
+			drifts = append(drifts, drift)
+			seen[key] = true
+		}
 		status := "out-of-sync"
 		if r.inSync() {
 			status = "in-sync"
@@ -289,6 +313,10 @@ func medianDuration(d []time.Duration) time.Duration {
 	return (s[n/2-1] + s[n/2]) / 2
 }
 
+// defaultSampleSize is the number of servers randomly selected from the
+// ecosystem when -all is not set.
+const defaultSampleSize = 3
+
 // loadServers returns the server list from flags.
 func loadServers() ([]serverConfig, error) {
 	if *serversFile != "" {
@@ -303,6 +331,12 @@ func loadServers() ([]serverConfig, error) {
 				}
 			}
 			return nil, fmt.Errorf("server %q not found in %s", *nameFilter, *serversFile)
+		}
+		if !*all && len(servers) > defaultSampleSize {
+			mrand.Shuffle(len(servers), func(i, j int) {
+				servers[i], servers[j] = servers[j], servers[i]
+			})
+			servers = servers[:defaultSampleSize]
 		}
 		return servers, nil
 	}
@@ -376,7 +410,7 @@ func decodePubKey(s string) ([]byte, error) {
 
 // queryServer queries a single Roughtime server. For IETF servers it advertises
 // every supported version in one VER tag and lets the server pick.
-func queryServer(srv serverConfig) result {
+func queryServer(ctx context.Context, srv serverConfig) result {
 	r := result{Name: srv.Name}
 
 	if len(srv.Addresses) == 0 {
@@ -392,20 +426,28 @@ func queryServer(srv serverConfig) result {
 	}
 
 	if strings.EqualFold(string(srv.Version), "Google-Roughtime") {
-		return queryOnce(srv.Name, r.Address, rootPK, []protocol.Version{protocol.VersionGoogle}, *timeout)
+		return queryOnce(ctx, srv.Name, r.Address, rootPK, []protocol.Version{protocol.VersionGoogle}, *timeout)
 	}
 
-	return queryOnce(srv.Name, r.Address, rootPK, ietfVersions, *timeout)
+	return queryOnce(ctx, srv.Name, r.Address, rootPK, ietfVersions, *timeout)
 }
 
 // queryChained queries servers sequentially using protocol.Chain, deriving each
 // nonce from the previous response per Section 8.2. Results are returned in
 // server order.
-func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
+func queryChained(ctx context.Context, servers []serverConfig) ([]result, *protocol.Chain) {
 	var c protocol.Chain
 	results := make([]result, len(servers))
 
 	for i, srv := range servers {
+		if ctx.Err() != nil {
+			results[i].Name = srv.Name
+			if len(srv.Addresses) > 0 {
+				results[i].Address = srv.Addresses[0].Address
+			}
+			results[i].Err = ctx.Err()
+			continue
+		}
 		r := &results[i]
 		r.Name = srv.Name
 		if len(srv.Addresses) == 0 {
@@ -445,7 +487,11 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 		backoff := *timeout
 		ok := false
 		for attempt := range *retries {
-			reply, rtt, localNow, err = sendRequest(r.Address, link.Request, backoff)
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				break
+			}
+			reply, rtt, localNow, err = sendRequest(ctx, r.Address, link.Request, backoff)
 			if err == nil {
 				midpoint, radius, err = protocol.VerifyReply(versions, reply, rootPK, parsed.Nonce, link.Request)
 			}
@@ -456,7 +502,10 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 			if attempt < *retries-1 {
 				// Back off on any retry: a verify failure may be grease (§7),
 				// so retrying can succeed but must not hammer the server.
-				time.Sleep(backoff)
+				if !sleepCtx(ctx, backoff) {
+					err = ctx.Err()
+					break
+				}
 				backoff = time.Duration(float64(backoff) * 1.5)
 			}
 		}
@@ -476,17 +525,35 @@ func queryChained(servers []serverConfig) ([]result, *protocol.Chain) {
 		r.Radius = radius
 		if ver, ok := protocol.ExtractVersion(reply); ok {
 			r.Version = ver
-		} else {
-			r.Version = slices.Max(versions)
+		} else if len(versions) == 1 {
+			r.Version = versions[0]
 		}
 	}
 
 	return results, &c
 }
 
-// sendRequest sends a raw Roughtime request packet and returns the reply, RTT,
-// and the local time captured immediately after receiving the response.
-func sendRequest(address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
+// replyBufPool pools 65535-byte UDP read buffers (max UDP datagram size).
+var replyBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 65535); return &b },
+}
+
+// sleepCtx sleeps for d but returns false immediately if ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// sendRequest sends a Roughtime request and returns the reply, RTT, and local
+// time. If ctx is cancelled mid-flight the socket is closed to unblock the
+// read.
+func sendRequest(ctx context.Context, address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
 	raddr, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("resolving %s: %w", address, err)
@@ -496,6 +563,17 @@ func sendRequest(address string, request []byte, timeout time.Duration) (reply [
 		return nil, 0, time.Time{}, fmt.Errorf("dialing %s: %w", address, err)
 	}
 	defer conn.Close()
+
+	// Close on ctx cancellation to unblock an in-flight Read.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
 
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("set write deadline: %w", err)
@@ -508,16 +586,23 @@ func sendRequest(address string, request []byte, timeout time.Duration) (reply [
 	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("set read deadline: %w", err)
 	}
-	buf := make([]byte, 65535)
-	n, err := conn.Read(buf)
+	bufp := replyBufPool.Get().(*[]byte)
+	defer replyBufPool.Put(bufp)
+	n, err := conn.Read(*bufp)
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+			return nil, 0, time.Time{}, ctx.Err()
+		}
 		return nil, 0, time.Time{}, fmt.Errorf("reading: %w", err)
 	}
-	return buf[:n], time.Since(start), time.Now(), nil
+	// Copy out of the pooled buffer before returning it.
+	out := make([]byte, n)
+	copy(out, (*bufp)[:n])
+	return out, time.Since(start), time.Now(), nil
 }
 
 // queryOnce sends one Roughtime request and verifies the response.
-func queryOnce(name, address string, rootPK []byte, versions []protocol.Version, timeout time.Duration) result {
+func queryOnce(ctx context.Context, name, address string, rootPK []byte, versions []protocol.Version, timeout time.Duration) result {
 	r := result{Name: name, Address: address}
 
 	srv := protocol.ComputeSRV(rootPK)
@@ -534,8 +619,12 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 	var radius time.Duration
 	backoff := timeout
 	for attempt := range *retries {
+		if ctx.Err() != nil {
+			r.Err = ctx.Err()
+			return r
+		}
 		var networkErr bool
-		reply, rtt, localNow, err = sendRequest(address, request, backoff)
+		reply, rtt, localNow, err = sendRequest(ctx, address, request, backoff)
 		if err != nil {
 			networkErr = true
 		} else {
@@ -553,7 +642,10 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 		}
 		// Back off on any retry: a verify failure may be grease (§7), so
 		// retrying can succeed but must not hammer the server.
-		time.Sleep(backoff)
+		if !sleepCtx(ctx, backoff) {
+			r.Err = ctx.Err()
+			return r
+		}
 		backoff = time.Duration(float64(backoff) * 1.5)
 	}
 	r.RTT = rtt
@@ -563,8 +655,8 @@ func queryOnce(name, address string, rootPK []byte, versions []protocol.Version,
 	r.Radius = radius
 	if ver, ok := protocol.ExtractVersion(reply); ok {
 		r.Version = ver
-	} else {
-		r.Version = slices.Max(versions)
+	} else if len(versions) == 1 {
+		r.Version = versions[0]
 	}
 	return r
 }

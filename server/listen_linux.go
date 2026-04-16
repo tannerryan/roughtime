@@ -29,6 +29,15 @@ import (
 // shutdown is prompt.
 const idleReadTimeout = 500 * time.Millisecond
 
+// reqBufPool recycles per-packet copy buffers so payloads survive the next
+// recvmmsg into the shared scratch buffers.
+var reqBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, maxPacketSize)
+		return &b
+	},
+}
+
 // statsWorkerExits counts worker goroutines that returned before ctx was
 // cancelled (one worker per SO_REUSEPORT socket). If this climbs during normal
 // operation the pool is silently shrinking; surfaced in the shutdown log.
@@ -160,8 +169,9 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 	return batch
 }
 
-// harvest validates each datagram, copying its payload so it survives the next
-// ReadBatch into the shared buffers.
+// harvest validates each datagram, copying payloads into pooled buffers so they
+// survive the next ReadBatch. respond() returns the pooled buffers after
+// signing.
 func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]validatedRequest) {
 	for i := range msgs {
 		n := msgs[i].N
@@ -178,11 +188,12 @@ func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]valid
 			statsDropped.Add(1)
 			continue
 		}
-		data := make([]byte, n)
-		copy(data, msgs[i].Buffers[0][:n])
+		bufPtr := reqBufPool.Get().(*[]byte)
+		copy(*bufPtr, msgs[i].Buffers[0][:n])
 
-		vr, ok := validateRequest(log, data, peer, n, nil, st)
+		vr, ok := validateRequest(log, (*bufPtr)[:n], peer, n, bufPtr, st)
 		if !ok {
+			reqBufPool.Put(bufPtr)
 			continue
 		}
 		*batch = append(*batch, vr)
@@ -196,6 +207,15 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 	// Recover inside respond so a panicking batch does not take down the
 	// worker.
 	defer recoverGoroutine(log, "respond")
+	// Return pooled request buffers after signing is complete.
+	defer func() {
+		for i := range items {
+			if items[i].bufPtr != nil {
+				reqBufPool.Put(items[i].bufPtr)
+				items[i].bufPtr = nil
+			}
+		}
+	}()
 
 	type group struct {
 		ver   protocol.Version
@@ -234,11 +254,13 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 		n, err := p.WriteBatch(out, 0)
 		if err != nil {
 			log.Warn("WriteBatch failed", zap.Error(err), zap.Int("dropped", len(out)))
+			statsDropped.Add(uint64(len(out)))
 			return
 		}
 		if n <= 0 {
 			// Defensive: guard against an infinite loop on degenerate returns.
 			log.Warn("WriteBatch wrote 0", zap.Int("dropped", len(out)))
+			statsDropped.Add(uint64(len(out)))
 			return
 		}
 		statsResponded.Add(uint64(n))

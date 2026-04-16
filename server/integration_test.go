@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
+	"go.uber.org/goleak"
 	"go.uber.org/zap"
 )
 
@@ -61,9 +62,40 @@ func TestListenEndToEnd(t *testing.T) {
 	}
 }
 
+// TestListenShutdownLeaksNoGoroutines verifies that no goroutines leak after a
+// clean context cancellation.
+func TestListenShutdownLeaksNoGoroutines(t *testing.T) {
+	// Snapshot goroutines before listen() so runtime workers are ignored.
+	baseline := goleak.IgnoreCurrent()
+
+	statsReceived.Store(0)
+	statsResponded.Store(0)
+	statsPanics.Store(0)
+
+	rootPK, st := newTestCertState(t)
+	chosen, done, cancel := startListen(t, st)
+	waitForServerReady(t, chosen, rootPK)
+
+	sendAndVerify(t, chosen, rootPK, 8)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("listen returned: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("listen did not exit after cancel")
+	}
+
+	if err := goleak.Find(baseline); err != nil {
+		t.Fatalf("goroutine leak after shutdown: %v", err)
+	}
+}
+
 // newTestCertState builds an in-memory certState wrapped in the atomic pointer
-// the listener expects. Returns the root public key so callers can forge SRV
-// and verify replies.
+// the listener expects. Returns the root public key so callers can compute the
+// SRV hash and verify replies.
 func newTestCertState(t *testing.T) (ed25519.PublicKey, *atomic.Pointer[certState]) {
 	t.Helper()
 	rootPK, rootSK, err := ed25519.GenerateKey(rand.Reader)
@@ -343,6 +375,62 @@ func TestListenConcurrentBatches(t *testing.T) {
 	}
 	if got := statsPanics.Load(); got != 0 {
 		t.Fatalf("statsPanics=%d want 0", got)
+	}
+}
+
+// TestListenNoncInSREPSingletons exercises draft-01/02 requests which place
+// NONC inside SREP and must be signed individually (no batching).
+func TestListenNoncInSREPSingletons(t *testing.T) {
+	prevGrease := *greaseRate
+	*greaseRate = 0
+	t.Cleanup(func() { *greaseRate = prevGrease })
+
+	p, rootPK := startServer(t)
+	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
+	srv := protocol.ComputeSRV(rootPK)
+
+	for _, v := range []protocol.Version{protocol.VersionDraft01, protocol.VersionDraft02} {
+		t.Run(v.ShortString(), func(t *testing.T) {
+			const senders = 4
+			const perSender = 8
+			var wg sync.WaitGroup
+			for range senders {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for range perSender {
+						conn, err := net.DialUDP("udp", nil, addr)
+						if err != nil {
+							t.Errorf("dial: %v", err)
+							return
+						}
+						nonce, req, err := protocol.CreateRequest([]protocol.Version{v}, rand.Reader, srv)
+						if err != nil {
+							t.Errorf("CreateRequest: %v", err)
+							_ = conn.Close()
+							return
+						}
+						_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+						if _, err := conn.Write(req); err != nil {
+							t.Errorf("write: %v", err)
+							_ = conn.Close()
+							return
+						}
+						buf := make([]byte, 1500)
+						n, err := conn.Read(buf)
+						_ = conn.Close()
+						if err != nil {
+							t.Errorf("read: %v", err)
+							return
+						}
+						if _, _, err := protocol.VerifyReply([]protocol.Version{v}, buf[:n], rootPK, nonce, req); err != nil {
+							t.Errorf("verify %s: %v", v, err)
+						}
+					}
+				}()
+			}
+			wg.Wait()
+		})
 	}
 }
 

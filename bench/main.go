@@ -18,18 +18,21 @@
 //
 // Example:
 //
-//	roughtime-bench -addr server:2002 -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s
+//	go run bench/main.go -addr server:2002 -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -59,18 +62,27 @@ var (
 // so the server exercises its batch-signing path.
 var ietfVersions = func() []protocol.Version {
 	s := protocol.Supported()
-	return s[:len(s)-1]
+	out := make([]protocol.Version, 0, len(s))
+	for _, v := range s {
+		if v != protocol.VersionGoogle {
+			out = append(out, v)
+		}
+	}
+	return out
 }()
 
-// workerResult is the private, per-goroutine accumulation. Merging at the end
-// avoids lock contention on the hot path.
-//
-// Under -verify, a reply that fails verification is counted as greased rather
-// than errored because the server's only expected source of invalid replies is
-// deliberate grease.
+// reservoirSize caps per-worker latency samples (Algorithm R).
+const reservoirSize = 100_000
+
+// workerResult accumulates per-goroutine stats; merged after the run to avoid
+// lock contention. Under -verify, greased counts grease-plausible failures (bad
+// signature, missing tag) while errVerify counts real faults (Merkle mismatch,
+// delegation window).
 type workerResult struct {
 	latencies []time.Duration
+	received  uint64
 	greased   uint64
+	errVerify uint64
 	errWrite  uint64
 	errRead   uint64
 	timeouts  uint64
@@ -117,8 +129,9 @@ func main() {
 	fmt.Printf("  workers=%d duration=%s warmup=%s timeout=%s verify=%t\n",
 		*workers, *duration, *warmup, *timeout, *verify)
 
-	// Warmup: drive load without collecting, so JIT-like warmups (cert refresh
-	// loop, kernel queue fill, Go scheduler) stabilize before measuring.
+	// Warmup: drive load without collecting, so runtime warm-up effects (cert
+	// refresh loop, kernel queue fill, Go scheduler) stabilize before
+	// measuring.
 	if *warmup > 0 {
 		warmCtx, warmCancel := context.WithTimeout(ctx, *warmup)
 		runWorkers(warmCtx, raddr, rootPK, srv, *workers, false)
@@ -189,32 +202,46 @@ func decodePubKey(s string) ([]byte, error) {
 	return nil, fmt.Errorf("public key %q is not 32 bytes of base64 or hex", s)
 }
 
-// runWorkers spins up n goroutines, waits for ctx, and returns merged results.
-// When collect is false, samples are discarded (used for the warmup phase).
+// runWorkers spins up n goroutines, waits for ctx, and returns per-worker
+// results. When collect is false, samples are discarded (used for the warmup
+// phase).
 func runWorkers(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, srv []byte, n int, collect bool) []workerResult {
 	results := make([]workerResult, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
-	// started counts workers that successfully dialled; the reporter divides by
-	// this if all workers fail outright.
-	var started atomic.Int32
+	var dialed atomic.Int32
 	for i := range n {
 		go func(idx int) {
 			defer wg.Done()
 			if worker(ctx, raddr, rootPK, srv, &results[idx], collect) {
-				started.Add(1)
+				dialed.Add(1)
 			}
 		}(i)
 	}
 	wg.Wait()
-	if started.Load() == 0 {
+	if dialed.Load() == 0 {
 		fmt.Fprintln(os.Stderr, "bench: all workers failed to start")
 	}
 	return results
 }
 
+// recordLatency adds an RTT sample via Algorithm R reservoir sampling.
+func recordLatency(out *workerResult, rtt time.Duration) {
+	out.received++
+	if len(out.latencies) < reservoirSize {
+		out.latencies = append(out.latencies, rtt)
+		return
+	}
+	// Replace index j with probability reservoirSize/received.
+	j := mrand.Uint64N(out.received)
+	if j < reservoirSize {
+		out.latencies[j] = rtt
+	}
+}
+
 // worker runs the closed-loop send/recv cycle on a single UDP socket until ctx
-// is cancelled. Returns false if it could not dial.
+// is cancelled. Returns false if it could not dial. The request is built once;
+// each iteration rewrites only the NONC bytes in place.
 func worker(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, srv []byte, out *workerResult, collect bool) bool {
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
@@ -222,15 +249,25 @@ func worker(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, s
 	}
 	defer conn.Close()
 
+	nonce, req, err := protocol.CreateRequest(ietfVersions, rand.Reader, srv)
+	if err != nil {
+		return false
+	}
+	// Locate the nonce inside the encoded request so we can rewrite it in
+	// place.
+	nonceOff := bytes.Index(req, nonce)
+	if nonceOff < 0 {
+		return false
+	}
+
 	buf := make([]byte, 1500)
 	for ctx.Err() == nil {
-		nonce, req, err := protocol.CreateRequest(ietfVersions, rand.Reader, srv)
-		if err != nil {
-			// CreateRequest only fails on entropy source failure; bucket with
-			// writes so it surfaces as a hard error.
-			out.errWrite++
-			continue
+		// Refresh nonce in place (math/rand suffices; server doesn't check
+		// entropy).
+		for i := 0; i < len(nonce); i += 8 {
+			binary.LittleEndian.PutUint64(nonce[i:], mrand.Uint64())
 		}
+		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
 		_ = conn.SetWriteDeadline(time.Now().Add(*timeout))
 		start := time.Now()
@@ -253,34 +290,37 @@ func worker(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, s
 
 		if *verify {
 			if _, _, err := protocol.VerifyReply(ietfVersions, buf[:n], rootPK, nonce, req); err != nil {
-				out.greased++
+				if errors.Is(err, protocol.ErrMerkleMismatch) || errors.Is(err, protocol.ErrDelegationWindow) {
+					out.errVerify++
+				} else {
+					out.greased++
+				}
 				continue
 			}
 		}
 
 		if collect {
-			out.latencies = append(out.latencies, rtt)
+			recordLatency(out, rtt)
 		}
 	}
 	return true
 }
 
-// report aggregates per-worker results and prints a single summary block. The
-// Greased / Grease rate lines are emitted only when -verify is set, because
-// grease can only be distinguished from a valid reply by signature check.
+// report aggregates per-worker results and prints a single summary block.
 func report(results []workerResult, elapsed time.Duration) {
 	var all []time.Duration
-	var greased, errWrite, errRead, timeouts uint64
+	var received, greased, errVerify, errWrite, errRead, timeouts uint64
 	for i := range results {
 		all = append(all, results[i].latencies...)
+		received += results[i].received
 		greased += results[i].greased
+		errVerify += results[i].errVerify
 		errWrite += results[i].errWrite
 		errRead += results[i].errRead
 		timeouts += results[i].timeouts
 	}
 
-	received := uint64(len(all))
-	errs := errWrite + errRead
+	errs := errVerify + errWrite + errRead
 	sent := received + greased + errs + timeouts
 
 	var successRate, greaseRate, throughput float64
@@ -302,6 +342,7 @@ func report(results []workerResult, elapsed time.Duration) {
 	fmt.Printf("Received:     %d\n", received)
 	if *verify {
 		fmt.Printf("Greased:      %d\n", greased)
+		fmt.Printf("Verify fail:  %d\n", errVerify)
 	}
 	fmt.Printf("Errors:       %d\n", errs)
 	fmt.Printf("Timeouts:     %d\n", timeouts)

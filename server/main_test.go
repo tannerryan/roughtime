@@ -239,8 +239,6 @@ func TestValidateRequestRejectsUnsupportedVersion(t *testing.T) {
 // TestValidateRequestStoresBufPtr asserts the pooled-read buffer pointer is
 // round-tripped so listen_other.go can return it after signing.
 func TestValidateRequestStoresBufPtr(t *testing.T) {
-	// bufPtr must be round-tripped into validatedRequest so the pooled-read
-	// path (listen_other.go) can return it after signing.
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
 	_, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)

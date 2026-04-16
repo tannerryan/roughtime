@@ -2,10 +2,7 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Package protocol implements the Roughtime wire protocol for both server and
-// client use. It supports Google-Roughtime and IETF drafts 01-19. Drafts 12-19
-// share wire version 0x8000000c but differ in wire behavior: drafts 14-19
-// include a TYPE tag, which changes the Merkle leaf hash and delegation context
-// group.
+// client use. It supports Google-Roughtime and IETF drafts 01-19.
 package protocol
 
 import (
@@ -108,7 +105,7 @@ const (
 	groupD08                     // Drafts 08–09 (Unix seconds, ZZZZ padding)
 	groupD10                     // Drafts 10–11 (RADI ≥ 3, SRV tag)
 	groupD12                     // Drafts 12–13 (full-packet leaf, VERS in SREP); also fallback for 14–19 without TYPE
-	groupD14                     // Drafts 14–19 with TYPE tag present (changes Merkle leaf and delegation context)
+	groupD14                     // Drafts 14–19 with TYPE tag present (adds TYPE to request/response)
 )
 
 // wireGroupOf returns the wire format group for a version and TYPE presence.
@@ -176,7 +173,8 @@ const (
 	maxVersionList = 32
 )
 
-// packetMagic is the 8-byte ROUGHTIM header present in all IETF draft packets.
+// packetMagic is the 8-byte magic prefix of the 12-byte ROUGHTIM header present
+// in all IETF draft packets.
 var packetMagic = [8]byte{'R', 'O', 'U', 'G', 'H', 'T', 'I', 'M'}
 
 // hashSize returns the Merkle hash output length: 64 for Google (SHA-512), 32
@@ -241,6 +239,13 @@ var (
 	responseCtx      = []byte("RoughTime v1 response signature\x00")     // all versions
 )
 
+// Sentinel errors returned by [VerifyReply] for faults that grease cannot
+// produce, letting callers distinguish real failures from grease.
+var (
+	ErrMerkleMismatch   = errors.New("protocol: Merkle root mismatch")
+	ErrDelegationWindow = errors.New("protocol: midpoint outside delegation window")
+)
+
 // delegationContext returns the delegation signature context for a wire group.
 // Draft 07 and drafts 12+ use the shorter context without trailing hyphens.
 func delegationContext(g wireGroup) []byte {
@@ -298,15 +303,11 @@ func radiMicroseconds(d time.Duration) uint32 {
 	return uint32(min(max(d.Microseconds(), 1), math.MaxUint32))
 }
 
-// radiSeconds encodes a duration as a RADI value in seconds (drafts 08+). The
-// spec requires RADI MUST NOT be zero. Drafts 10–11 require RADI >= 3 (MUST);
-// drafts 12+ relax this to SHOULD when the server lacks leap second info.
-func radiSeconds(d time.Duration, g wireGroup) uint32 {
+// radiSeconds encodes a duration as a RADI value in seconds (drafts 08+). Floor
+// of 3s satisfies the MUST in drafts 10–11 and the SHOULD in 12+.
+func radiSeconds(d time.Duration) uint32 {
 	sec := int64(d / time.Second)
-	floor := int64(1)
-	if g == groupD10 {
-		floor = 3 // drafts 10–11 §6.2.5: RADI MUST be at least 3 seconds
-	}
+	const floor = int64(3)
 	return uint32(min(max(sec, floor), math.MaxUint32))
 }
 
@@ -330,26 +331,29 @@ func decodeTimestamp(buf []byte, g wireGroup) (time.Time, error) {
 	v := binary.LittleEndian.Uint64(buf)
 	switch {
 	case g == groupGoogle:
+		if v > math.MaxInt64 {
+			return time.Time{}, fmt.Errorf("protocol: Google timestamp 0x%x exceeds int64", v)
+		}
 		return time.UnixMicro(int64(v)).UTC(), nil
 	case usesMJDMicroseconds(g):
 		return mjdMicroToTime(v), nil
 	default:
+		if v > math.MaxInt64 {
+			return time.Time{}, fmt.Errorf("protocol: timestamp 0x%x exceeds int64", v)
+		}
 		return time.Unix(int64(v), 0).UTC(), nil
 	}
 }
 
-// decodeRadius converts a wire-format RADI value to a [time.Duration]. Drafts
-// 10+ §6.2.5 say RADI "MUST be at least 3 seconds"; we enforce only the
-// non-zero floor to tolerate deployed servers that send 1s–2s radii. Earlier
-// drafts and Google-Roughtime do not define a lower bound.
+// decodeRadius converts a wire-format RADI value to a [time.Duration]. Rejects
+// zero for drafts 10+ (MUST >= 3s); earlier drafts and Google have no minimum.
 func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 	if len(buf) != 4 {
 		return 0, errors.New("protocol: RADI must be 4 bytes")
 	}
 	v := binary.LittleEndian.Uint32(buf)
-	// Drafts 08+ §5.2.2 / §6.2.5: RADI MUST NOT be zero. Earlier drafts and
-	// Google-Roughtime did not define a lower bound, so only enforce on 08+.
-	if v == 0 && g >= groupD08 {
+	// Drafts 10+: RADI MUST be >= 3s; we enforce non-zero only.
+	if v == 0 && g >= groupD10 {
 		return 0, errors.New("protocol: RADI must not be zero")
 	}
 	if g == groupGoogle || usesMJDMicroseconds(g) {
@@ -625,6 +629,14 @@ func ParseRequest(raw []byte) (*Request, error) {
 	if framed && len(req.Versions) == 0 {
 		return nil, errors.New("protocol: framed request missing VER tag")
 	}
+	// Unframed + VER is neither valid Google nor valid IETF.
+	if !framed && len(req.Versions) > 0 {
+		return nil, errors.New("protocol: unframed request contains VER tag")
+	}
+	// VersionGoogle (0) is signalled by VER absence, not presence in VER.
+	if slices.Contains(req.Versions, VersionGoogle) {
+		return nil, errors.New("protocol: VER list contains VersionGoogle (0)")
+	}
 
 	// Determine the highest declared version for cross-checks. An empty VER
 	// list implies Google-Roughtime (unframed; framed case rejected above).
@@ -716,6 +728,16 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 			return fmt.Errorf("protocol: TYPE=%d in request (must be 0)", v)
 		}
 		req.HasType = true
+	}
+	// Padding tags MUST be all zero bytes.
+	for _, tag := range [3]uint32{TagZZZZ, TagPAD, tagPADIETF} {
+		if pad, ok := msg[tag]; ok {
+			for _, b := range pad {
+				if b != 0 {
+					return fmt.Errorf("protocol: padding tag 0x%08x contains non-zero byte", tag)
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -909,14 +931,20 @@ func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }
 
+// maxMerkleLeaves bounds the per-batch leaf count (2^32 → 32-deep tree).
+const maxMerkleLeaves = 1 << 32
+
 // newMerkleTree builds the Merkle tree and per-leaf paths in one bottom-up
 // pass. The node-hash argument order matches the verification algorithm for
 // each wire group: groupD05–groupD12 use (node, hash) when bit=0, all others
-// use (hash, node).
+// use (hash, node). Panics if len(leafInputs) exceeds [maxMerkleLeaves].
 func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 	n := len(leafInputs)
 	hs := hashSize(g)
 
+	if uint64(n) > maxMerkleLeaves {
+		panic(fmt.Sprintf("protocol: Merkle tree with %d leaves exceeds 2^32 (PATH > 32 hash values)", n))
+	}
 	if n == 0 {
 		return &merkleTree{rootHash: make([]byte, hs)}
 	}
@@ -981,11 +1009,14 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 
 	g := wireGroupOf(ver, requests[0].HasType)
 
-	// All requests in a batch must resolve to the same wire group so the shared
-	// SREP, CERT, and Merkle tree are consistent.
-	for i := 1; i < len(requests); i++ {
-		if wireGroupOf(ver, requests[i].HasType) != g {
+	// All requests must share one wire group and have correct nonce size.
+	ns := nonceSize(g)
+	for i := range requests {
+		if i > 0 && wireGroupOf(ver, requests[i].HasType) != g {
 			return nil, errors.New("protocol: batch contains requests with incompatible wire groups")
+		}
+		if len(requests[i].Nonce) != ns {
+			return nil, fmt.Errorf("protocol: request %d nonce is %d bytes, want %d", i, len(requests[i].Nonce), ns)
 		}
 	}
 
@@ -1043,7 +1074,7 @@ func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time,
 	if g == groupGoogle || usesMJDMicroseconds(g) {
 		binary.LittleEndian.PutUint32(radiBuf[:], radiMicroseconds(radius))
 	} else {
-		binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(radius, g))
+		binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(radius))
 	}
 
 	srepTags := map[uint32][]byte{
@@ -1174,8 +1205,14 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 	tags := map[uint32][]byte{TagNONC: nonce}
 
 	if g != groupGoogle {
-		sorted := make([]Version, len(versions))
-		copy(sorted, versions)
+		sorted := make([]Version, 0, len(versions))
+		for _, v := range versions {
+			// VersionGoogle is signalled by VER absence, not presence.
+			if v == VersionGoogle {
+				continue
+			}
+			sorted = append(sorted, v)
+		}
 		slices.Sort(sorted)
 		// Drop duplicates: drafts 12+ require strictly ascending VER values.
 		sorted = slices.Compact(sorted)
@@ -1303,6 +1340,7 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 
 	// Drafts 12+ §5.2.5: SREP signs the server's VERS list. Verify the
 	// negotiated version is the highest common version to detect downgrades.
+	// Only draft-12+ servers emit VER/VERS in SREP.
 	if g >= groupD12 {
 		if err := verifyNoVersionDowngrade(srep, versions); err != nil {
 			return time.Time{}, 0, err
@@ -1517,7 +1555,8 @@ func validateDelegationWindow(midpoint time.Time, radius time.Duration, mintBuf,
 		return time.Time{}, 0, fmt.Errorf("protocol: decode MAXT: %w", err)
 	}
 	if midpoint.Before(mintTime) || midpoint.After(maxtTime) {
-		return time.Time{}, 0, fmt.Errorf("protocol: midpoint outside delegation window (MIDP=%s, MINT=%s, MAXT=%s)",
+		return time.Time{}, 0, fmt.Errorf("%w (MIDP=%s, MINT=%s, MAXT=%s)",
+			ErrDelegationWindow,
 			midpoint.Format(time.RFC3339), mintTime.Format(time.RFC3339), maxtTime.Format(time.RFC3339))
 	}
 	return midpoint, radius, nil
@@ -1617,7 +1656,7 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 	}
 
 	if !bytes.Equal(hash, rootHash) {
-		return errors.New("protocol: Merkle root mismatch")
+		return ErrMerkleMismatch
 	}
 	return nil
 }
@@ -1625,6 +1664,9 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 // Grease applies a random grease transformation to a signed reply per Section
 // 7. It corrupts a signature with incorrect times, drops a mandatory tag,
 // replaces the version with an unsupported number, or adds an undefined tag.
+//
+// Grease may mutate reply in place or return a new buffer. Callers must use
+// only the returned buffer.
 func Grease(reply []byte, ver Version) []byte {
 	mode := mrand.IntN(4)
 	switch mode {
@@ -1708,7 +1750,7 @@ func greaseCorruptSig(reply []byte, ver Version) {
 }
 
 // greaseDropTag removes a randomly chosen mandatory tag from the top-level
-// response message. Returns the modified reply or nil on failure.
+// response, or from SREP/CERT. Returns the modified reply, or nil on failure.
 func greaseDropTag(reply []byte, ver Version) []byte {
 	header, body := greaseSplit(reply, ver)
 	if body == nil {
@@ -1718,19 +1760,65 @@ func greaseDropTag(reply []byte, ver Version) []byte {
 	if err != nil {
 		return nil
 	}
-	candidates := []uint32{TagSIG, TagSREP, TagCERT, TagPATH, TagINDX}
-	mrand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
-	for _, tag := range candidates {
-		if _, ok := msg[tag]; ok {
-			delete(msg, tag)
-			out, err := encode(msg)
-			if err != nil {
-				return nil
+	// Pick a scope: top-level, SREP, or CERT.
+	scopes := []uint32{0, TagSREP, TagCERT}
+	mrand.Shuffle(len(scopes), func(i, j int) { scopes[i], scopes[j] = scopes[j], scopes[i] })
+	for _, scope := range scopes {
+		if scope == 0 {
+			candidates := []uint32{TagSIG, TagSREP, TagCERT, TagPATH, TagINDX}
+			if out, ok := dropOneTag(msg, candidates); ok {
+				encoded, err := encode(out)
+				if err != nil {
+					return nil
+				}
+				return greaseJoin(header, encoded)
 			}
-			return greaseJoin(header, out)
+			continue
 		}
+		inner, ok := msg[scope]
+		if !ok {
+			continue
+		}
+		innerMsg, err := Decode(inner)
+		if err != nil {
+			continue
+		}
+		var candidates []uint32
+		if scope == TagSREP {
+			candidates = []uint32{TagRADI, TagMIDP, TagROOT}
+		} else { // TagCERT
+			candidates = []uint32{TagSIG, TagDELE}
+		}
+		modified, ok := dropOneTag(innerMsg, candidates)
+		if !ok {
+			continue
+		}
+		reencoded, err := encode(modified)
+		if err != nil {
+			return nil
+		}
+		msg[scope] = reencoded
+		out, err := encode(msg)
+		if err != nil {
+			return nil
+		}
+		return greaseJoin(header, out)
 	}
 	return nil
+}
+
+// dropOneTag removes one randomly chosen tag from msg if any of the candidates
+// is present. Returns the modified msg and true on success.
+func dropOneTag(msg map[uint32][]byte, candidates []uint32) (map[uint32][]byte, bool) {
+	shuffled := append([]uint32(nil), candidates...)
+	mrand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+	for _, tag := range shuffled {
+		if _, ok := msg[tag]; ok {
+			delete(msg, tag)
+			return msg, true
+		}
+	}
+	return nil, false
 }
 
 // greaseWrongVersion overwrites the top-level VER tag with an unsupported
@@ -1780,7 +1868,7 @@ func findTagRange(msg []byte, tag uint32) (lo, hi uint32, ok bool) {
 		return 0, 0, false
 	}
 	n := binary.LittleEndian.Uint32(msg[:4])
-	if n == 0 || n > 512 {
+	if n == 0 || n > maxDecodeTags {
 		return 0, 0, false
 	}
 

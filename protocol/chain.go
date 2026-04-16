@@ -27,6 +27,9 @@ var (
 	ErrCausalOrder = errors.New("protocol: causal ordering violation")
 )
 
+// maxChainLinks caps the per-chain link count to prevent CPU-DoS on Verify.
+const maxChainLinks = 1024
+
 // ChainLink is one server query in a Roughtime measurement chain (Section 8.4).
 // The fields map 1:1 to the malfeasance report JSON format.
 type ChainLink struct {
@@ -117,11 +120,14 @@ func (c *Chain) Append(link ChainLink) {
 }
 
 // Verify checks nonce linkage, signature validity, and causal ordering (Section
-// 8.2). Nonce or signature failures return a plain error. Causal ordering
-// failures wrap [ErrCausalOrder].
+// 8.2). Nonce failures wrap [ErrChainNonce], causal ordering failures wrap
+// [ErrCausalOrder], and signature failures return an unwrapped error.
 func (c *Chain) Verify() error {
 	if len(c.Links) == 0 {
 		return errors.New("protocol: empty chain")
+	}
+	if len(c.Links) > maxChainLinks {
+		return fmt.Errorf("protocol: chain has %d links (max %d)", len(c.Links), maxChainLinks)
 	}
 
 	type timeResult struct {
@@ -240,8 +246,6 @@ func (c *Chain) MalfeasanceReport() ([]byte, error) {
 // populated but no Request or PublicKey, so [Chain.Verify] cannot be used on
 // them.
 func ParseMalfeasanceReport(data []byte) (*Chain, error) {
-	const maxChainLinks = 1024
-
 	// Detect format: the drafts 12+ format has an object in responses[0]; the
 	// legacy format has a string in responses[0] and a top-level "nonces" key.
 	var probe struct {

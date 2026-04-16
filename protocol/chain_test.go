@@ -77,7 +77,8 @@ func buildChain(t *testing.T, ver Version, n int) (*Chain, []chainServer) {
 	return &c, servers
 }
 
-// TestChainNonceFirst verifies that the first nonce is random with nil rand.
+// TestChainNonceFirst verifies that the first link (nil prevResponse) returns a
+// random nonce and nil blind.
 func TestChainNonceFirst(t *testing.T) {
 	nonce, blind, err := ChainNonce(nil, rand.Reader, []Version{VersionDraft12})
 	if err != nil {
@@ -1184,6 +1185,19 @@ func TestParseMalfeasanceReportRejectsBadRand(t *testing.T) {
 	data, _ := json.Marshal(map[string]any{"responses": []any{entry}})
 	if _, err := ParseMalfeasanceReport(data); err == nil {
 		t.Fatal("expected error for bad rand")
+	}
+}
+
+// TestVerifyRejectsTooManyLinks verifies that Chain.Verify rejects chains
+// longer than [maxChainLinks].
+func TestVerifyRejectsTooManyLinks(t *testing.T) {
+	c := &Chain{Links: make([]ChainLink, maxChainLinks+1)}
+	err := c.Verify()
+	if err == nil {
+		t.Fatal("expected error for chain length > maxChainLinks")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("max")) {
+		t.Fatalf("error should mention max link count, got: %v", err)
 	}
 }
 

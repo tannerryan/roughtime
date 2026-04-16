@@ -31,7 +31,7 @@ var (
 	addr        = flag.String("addr", "", "host:port of the Roughtime server")
 	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "per-version probe timeout")
-	retries     = flag.Int("retries", 3, "max retry attempts per version (exponential backoff)")
+	retries     = flag.Int("retries", 3, "max retry attempts per version (back-to-back, no backoff — this is a probe tool)")
 	forceVer    = flag.String("ver", "", "probe only this version (e.g. draft-12, Google) and dump request/response even on failure")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -247,6 +247,9 @@ func isIETF(pkt []byte) bool {
 // msgBody strips the 12-byte ROUGHTIM header if present.
 func msgBody(pkt []byte) []byte {
 	if isIETF(pkt) {
+		if len(pkt) < 12 {
+			return nil
+		}
 		return pkt[12:]
 	}
 	return pkt

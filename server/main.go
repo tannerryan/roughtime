@@ -31,8 +31,10 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
+// logger is the server-wide structured logger.
 var logger *zap.Logger
 
+// CLI flags.
 var (
 	port               = flag.Int("port", 2002, "port to listen on")
 	rootKeySeedHexFile = flag.String("root-key-file", "", "path to file containing hex-encoded root private key seed")
@@ -58,7 +60,7 @@ const (
 	certStartOffset = -6 * time.Hour
 
 	// certEndOffset is how far after now the certificate validity ends. Total
-	// DELE window is 24h (certStartOffset + certEndOffset).
+	// DELE window is 24h (|certStartOffset| + certEndOffset).
 	certEndOffset = 18 * time.Hour
 
 	// maxPacketSize is the read buffer size for incoming UDP packets. Sized to
@@ -117,8 +119,7 @@ type certState struct {
 }
 
 // validatedRequest is a parsed request ready for batch signing. bufPtr is set
-// only on the pooled read path (listen_other.go) and must be returned to the
-// pool after signing; on the batched read path (listen_linux.go) it is nil.
+// by both listen paths and must be returned to the pool after signing.
 type validatedRequest struct {
 	req         protocol.Request
 	peer        *net.UDPAddr
@@ -468,20 +469,14 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 		)
 		newState, newOnlinePK, err := tryRefreshCert(initialRootPK)
 		if err != nil {
-			// Escalate when remaining validity is below the retry cooldown: the
-			// next attempt won't land before expiry, so replies will start
-			// being rejected by clients.
 			remaining := time.Until(cur.expiry)
-			lvl := zap.ErrorLevel
-			if remaining < refreshRetryCooldown {
-				lvl = zap.DPanicLevel
-			}
-			if ce := log.Check(lvl, "certificate refresh failed"); ce != nil {
+			if ce := log.Check(zap.ErrorLevel, "certificate refresh failed"); ce != nil {
 				ce.Write(
 					zap.Error(err),
 					zap.Time("current_expiry", cur.expiry),
 					zap.Duration("remaining", remaining),
 					zap.Duration("retry_cooldown", refreshRetryCooldown),
+					zap.Bool("imminent_expiry", remaining < refreshRetryCooldown), // next retry won't land before expiry
 				)
 			}
 			continue

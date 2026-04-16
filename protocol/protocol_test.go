@@ -651,6 +651,19 @@ func TestDecodeTimestampPublic(t *testing.T) {
 	}
 }
 
+// TestDecodeTimestampZero verifies all-zero MIDP buffers decode without error
+// across every timestamp format.
+func TestDecodeTimestampZero(t *testing.T) {
+	zero := make([]byte, 8)
+	for _, ver := range []Version{VersionGoogle, VersionDraft01, VersionDraft08, VersionDraft12} {
+		t.Run(ver.String(), func(t *testing.T) {
+			if _, err := DecodeTimestamp(ver, zero); err != nil {
+				t.Fatalf("zero MIDP rejected for %s: %v", ver, err)
+			}
+		})
+	}
+}
+
 // TestDecodeTimestampPublicRejectsShort verifies that short buffers are
 // rejected by the public API.
 func TestDecodeTimestampPublicRejectsShort(t *testing.T) {
@@ -702,32 +715,22 @@ func TestRadiMicroseconds(t *testing.T) {
 	}
 }
 
-// TestRadiSeconds verifies second RADI clamping: floor is 1 for most drafts
-// (RADI MUST NOT be zero), and floor is 3 for drafts 10–11 (§6.2.5 MUST).
+// TestRadiSeconds verifies second RADI clamping: floor is 3 for all drafts 08+
+// (drafts 10–11 MUST; drafts 08–09 and 12+ SHOULD by default).
 func TestRadiSeconds(t *testing.T) {
-	if radiSeconds(500*time.Millisecond, groupD08) != 1 {
-		t.Fatal("D08: sub-second should clamp to 1")
+	if radiSeconds(500*time.Millisecond) != 3 {
+		t.Fatal("sub-second should clamp to 3")
 	}
-	if radiSeconds(2*time.Second, groupD08) != 2 {
-		t.Fatal("D08: 2s should be 2")
+	if radiSeconds(2*time.Second) != 3 {
+		t.Fatal("2s should clamp to 3")
 	}
-	if radiSeconds(time.Second, groupD10) != 3 {
-		t.Fatal("D10: 1s should clamp to 3 (MUST be at least 3)")
+	if radiSeconds(3*time.Second) != 3 {
+		t.Fatal("3s should be 3")
 	}
-	if radiSeconds(2*time.Second, groupD10) != 3 {
-		t.Fatal("D10: 2s should clamp to 3 (MUST be at least 3)")
+	if radiSeconds(5*time.Second) != 5 {
+		t.Fatal("5s should be 5")
 	}
-	if radiSeconds(3*time.Second, groupD10) != 3 {
-		t.Fatal("D10: 3s should be 3")
-	}
-	if radiSeconds(5*time.Second, groupD10) != 5 {
-		t.Fatal("D10: 5s should be 5")
-	}
-	// groupD12 does not enforce the floor of 3 (SHOULD, not MUST).
-	if radiSeconds(time.Second, groupD12) != 1 {
-		t.Fatal("D12: 1s should be 1 (no MUST floor)")
-	}
-	if radiSeconds(time.Duration(math.MaxInt64), groupD08) != math.MaxUint32 {
+	if radiSeconds(time.Duration(math.MaxInt64)) != math.MaxUint32 {
 		t.Fatal("overflow should clamp to MaxUint32")
 	}
 }
@@ -765,16 +768,17 @@ func TestDecodeRadiusRejectsShort(t *testing.T) {
 	}
 }
 
-// TestDecodeRadiusRejectsZero verifies that RADI=0 is rejected per §5.2.5.
+// TestDecodeRadiusRejectsZero verifies that RADI=0 is rejected for drafts 10+
+// (§6.2.5 MUST be at least 3 seconds). Earlier drafts and Google-Roughtime have
+// no explicit lower bound.
 func TestDecodeRadiusRejectsZero(t *testing.T) {
-	// Drafts 08+ forbid RADI == 0 (§5.2.2 and §6.2.5 MUST).
-	for _, g := range []wireGroup{groupD08, groupD10, groupD12, groupD14} {
+	for _, g := range []wireGroup{groupD10, groupD12, groupD14} {
 		if _, err := decodeRadius(make([]byte, 4), g); err == nil {
 			t.Fatalf("expected error for RADI=0 with group %d", g)
 		}
 	}
-	// Pre-draft-08 and Google do not forbid RADI == 0.
-	for _, g := range []wireGroup{groupGoogle, groupD01, groupD05, groupD07} {
+	// Drafts 01–09 and Google do not forbid RADI == 0.
+	for _, g := range []wireGroup{groupGoogle, groupD01, groupD05, groupD07, groupD08} {
 		if _, err := decodeRadius(make([]byte, 4), g); err != nil {
 			t.Fatalf("RADI=0 should be accepted for group %d: %v", g, err)
 		}
@@ -1147,7 +1151,7 @@ func TestParseRequestSRV(t *testing.T) {
 }
 
 // TestParseRequestRejectsSRVWrongLengthD10 verifies that drafts 10+ reject an
-// SRV tag whose length is not 32 bytes (the SHA-512/256 hash length).
+// SRV tag whose length is not 32 bytes.
 func TestParseRequestRejectsSRVWrongLengthD10(t *testing.T) {
 	nonce := randBytes(t, 32)
 	msg, _ := encode(map[uint32][]byte{
@@ -1169,9 +1173,9 @@ func TestParseRequestAcceptsShortSRVPreD10(t *testing.T) {
 		TagNONC: nonce,
 		TagVER:  {0x08, 0x00, 0x00, 0x80}, // draft-08
 		TagSRV:  make([]byte, 16),
-		TagPAD:  make([]byte, 900),
+		TagZZZZ: make([]byte, 900),
 	})
-	if _, err := ParseRequest(msg); err != nil {
+	if _, err := ParseRequest(wrapPacket(msg)); err != nil {
 		t.Fatalf("expected draft-08 short SRV to be accepted: %v", err)
 	}
 }
@@ -1200,6 +1204,34 @@ func TestParseRequestRejectsFramedMissingVER(t *testing.T) {
 	})
 	if _, err := ParseRequest(wrapPacket(msg)); err == nil {
 		t.Fatal("expected framed-request-missing-VER rejection")
+	}
+}
+
+// TestParseRequestRejectsUnframedWithVER verifies that an unframed request
+// carrying a VER tag is rejected.
+func TestParseRequestRejectsUnframedWithVER(t *testing.T) {
+	nonce := randBytes(t, 32)
+	msg, _ := encode(map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  {0x0c, 0x00, 0x00, 0x80},
+		TagZZZZ: make([]byte, 900),
+	})
+	if _, err := ParseRequest(msg); err == nil {
+		t.Fatal("expected unframed-request-with-VER rejection")
+	}
+}
+
+// TestParseRequestRejectsVersionGoogleInVER verifies that VersionGoogle (0)
+// inside a VER list is rejected.
+func TestParseRequestRejectsVersionGoogleInVER(t *testing.T) {
+	nonce := randBytes(t, 32)
+	// VER = [draft-12, VersionGoogle(0)]
+	ver := []byte{0x0c, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00}
+	msg, _ := encode(map[uint32][]byte{
+		TagNONC: nonce, TagVER: ver, TagZZZZ: make([]byte, 900),
+	})
+	if _, err := ParseRequest(wrapPacket(msg)); err == nil {
+		t.Fatal("expected VersionGoogle-in-VER rejection")
 	}
 }
 
@@ -1623,6 +1655,20 @@ func TestVerifyReplyAllVersions(t *testing.T) {
 		t.Run(v.ShortString(), func(t *testing.T) {
 			verifyRoundTrip(t, []Version{v}, v)
 		})
+	}
+}
+
+// TestVerifyNoVersionDowngradeSingleEntryVERS verifies that a single-entry VERS
+// list passes the downgrade check when it matches the chosen version.
+func TestVerifyNoVersionDowngradeSingleEntryVERS(t *testing.T) {
+	verBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(verBuf, uint32(VersionDraft12))
+	srep := map[uint32][]byte{
+		TagVER:  verBuf,
+		TagVERS: verBuf,
+	}
+	if err := verifyNoVersionDowngrade(srep, []Version{VersionDraft12}); err != nil {
+		t.Fatalf("single-entry VERS should verify: %v", err)
 	}
 }
 
@@ -2664,7 +2710,7 @@ func TestVerifyReplyDetectsDowngrade(t *testing.T) {
 	tree := newMerkleTree(g, [][]byte{parsed.RawPacket})
 	midpBuf := encodeTimestamp(time.Now(), g)
 	var radiBuf [4]byte
-	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second, g))
+	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second))
 	var verBuf [4]byte
 	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft11)) // wrong!
 	srepTags := map[uint32][]byte{
@@ -2708,7 +2754,7 @@ func TestVerifyReplyRejectsResponseTYPENot1(t *testing.T) {
 	tree := newMerkleTree(g, [][]byte{parsed.RawPacket})
 	midpBuf := encodeTimestamp(time.Now(), g)
 	var radiBuf [4]byte
-	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second, g))
+	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second))
 	var verBuf [4]byte
 	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
 	srepTags := map[uint32][]byte{
@@ -2758,7 +2804,7 @@ func TestVerifyNoVersionDowngradeRejectsLargeVERS(t *testing.T) {
 
 	midpBuf := encodeTimestamp(time.Now(), g)
 	var radiBuf [4]byte
-	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second, g))
+	binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(time.Second))
 	var verBuf [4]byte
 	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
 
@@ -3208,7 +3254,7 @@ func TestVerifyNoVersionDowngradeRejectsUnsortedVERS(t *testing.T) {
 	}
 }
 
-// TestExtractResponseVERPrefersSSREP verifies that when both top-level VER and
+// TestExtractResponseVERPrefersSREP verifies that when both top-level VER and
 // SREP VER are present, the SREP VER takes precedence.
 func TestExtractResponseVERPrefersSREP(t *testing.T) {
 	// Build a response with VER in both SREP and top level.
@@ -3551,16 +3597,19 @@ func TestDecodeRadiusMJDMicroseconds(t *testing.T) {
 	}
 }
 
-// TestRadiSecondsGroupD14 verifies that radiSeconds for groupD14 returns the
-// same floor-of-1 behavior as groupD12.
-func TestRadiSecondsGroupD14(t *testing.T) {
-	got := radiSeconds(time.Second, groupD14)
-	if got != 1 {
-		t.Fatalf("radiSeconds(1s, groupD14) = %d, want 1", got)
+// TestRadiSecondsFloor verifies radiSeconds clamps sub-3s durations to 3.
+func TestRadiSecondsFloor(t *testing.T) {
+	got := radiSeconds(time.Second)
+	if got != 3 {
+		t.Fatalf("radiSeconds(1s) = %d, want 3", got)
 	}
-	got = radiSeconds(500*time.Millisecond, groupD14)
-	if got != 1 {
-		t.Fatalf("radiSeconds(500ms, groupD14) = %d, want 1 (floor)", got)
+	got = radiSeconds(500 * time.Millisecond)
+	if got != 3 {
+		t.Fatalf("radiSeconds(500ms) = %d, want 3", got)
+	}
+	got = radiSeconds(10 * time.Second)
+	if got != 10 {
+		t.Fatalf("radiSeconds(10s) = %d, want 10", got)
 	}
 }
 
@@ -4374,6 +4423,28 @@ func TestGreaseAllModesReachable(t *testing.T) {
 	t.Logf("distribution: sig=%d drop=%d ver=%d undef=%d", sigCorrupt, tagDrop, wrongVer, undefinedTag)
 }
 
+// TestGreaseNeverProducesSentinels verifies grease never produces
+// ErrMerkleMismatch or ErrDelegationWindow.
+func TestGreaseNeverProducesSentinels(t *testing.T) {
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(ver.ShortString(), func(t *testing.T) {
+			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
+			for range 500 {
+				cp := make([]byte, len(reply))
+				copy(cp, reply)
+				out := Grease(cp, ver)
+				_, _, err := VerifyReply([]Version{ver}, out, rootPK, nonce, req)
+				if err == nil {
+					continue
+				}
+				if errors.Is(err, ErrMerkleMismatch) || errors.Is(err, ErrDelegationWindow) {
+					t.Fatalf("grease produced sentinel error: %v", err)
+				}
+			}
+		})
+	}
+}
+
 // TestGreaseMalformedInput verifies that Grease does not panic on malformed
 // input.
 func TestGreaseMalformedInput(t *testing.T) {
@@ -4834,4 +4905,149 @@ func TestVerifyNoVersionDowngradeRejectsChosenNotInVERS(t *testing.T) {
 	if !bytes.Contains([]byte(err.Error()), []byte("not present in signed VERS")) {
 		t.Fatalf("error message should call out VERS mismatch, got: %v", err)
 	}
+}
+
+// TestParseRequestRejectsNonZeroPadding verifies that padding tags containing
+// any non-zero byte are rejected.
+func TestParseRequestRejectsNonZeroPadding(t *testing.T) {
+	cases := []struct {
+		name    string
+		padTag  uint32
+		version Version
+	}{
+		{"ZZZZ draft08", TagZZZZ, VersionDraft08},
+		{"ZZZZ draft12", TagZZZZ, VersionDraft12},
+		{"PAD google", TagPAD, VersionGoogle},
+		{"PADIETF draft01", tagPADIETF, VersionDraft01},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nonce := randBytes(t, nonceSize(wireGroupOf(tc.version, false)))
+			tags := map[uint32][]byte{TagNONC: nonce}
+			if tc.version != VersionGoogle {
+				vb := make([]byte, 4)
+				binary.LittleEndian.PutUint32(vb, uint32(tc.version))
+				tags[TagVER] = vb
+			}
+			pad := make([]byte, 64)
+			pad[7] = 0x01 // single non-zero byte
+			tags[tc.padTag] = pad
+			msg, err := encode(tags)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pkt := msg
+			if tc.version != VersionGoogle {
+				pkt = wrapPacket(msg)
+			}
+			if _, err := ParseRequest(pkt); err == nil {
+				t.Fatal("expected error for non-zero padding byte")
+			}
+		})
+	}
+}
+
+// TestParseRequestAcceptsZeroPadding verifies all-zero ZZZZ parses
+// successfully.
+func TestParseRequestAcceptsZeroPadding(t *testing.T) {
+	nonce := randBytes(t, 32)
+	vb := make([]byte, 4)
+	binary.LittleEndian.PutUint32(vb, uint32(VersionDraft12))
+	tags := map[uint32][]byte{
+		TagNONC: nonce,
+		TagVER:  vb,
+		TagZZZZ: make([]byte, 64),
+	}
+	msg, err := encode(tags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseRequest(wrapPacket(msg)); err != nil {
+		t.Fatalf("unexpected parse error on zero padding: %v", err)
+	}
+}
+
+// TestVerifyMerkleReturnsErrMerkleMismatch verifies that Merkle-root mismatches
+// return the [ErrMerkleMismatch] sentinel.
+func TestVerifyMerkleReturnsErrMerkleMismatch(t *testing.T) {
+	var indx [4]byte
+	resp := map[uint32][]byte{
+		TagINDX: indx[:],
+		TagPATH: nil,
+	}
+	leaf := make([]byte, 32)
+	root := bytes.Repeat([]byte{0xFF}, 32) // will not match H(0x00||leaf)
+	err := verifyMerkle(resp, leaf, root, groupD12)
+	if err == nil {
+		t.Fatal("expected Merkle mismatch error")
+	}
+	if !errors.Is(err, ErrMerkleMismatch) {
+		t.Fatalf("expected ErrMerkleMismatch, got %v", err)
+	}
+}
+
+// TestValidateDelegationWindowReturnsErrDelegationWindow verifies that a
+// midpoint outside [MINT, MAXT] returns [ErrDelegationWindow].
+func TestValidateDelegationWindowReturnsErrDelegationWindow(t *testing.T) {
+	g := groupD14
+	mint := time.Now().Add(time.Hour) // window starts in the future
+	maxt := time.Now().Add(2 * time.Hour)
+	mintBuf := encodeTimestamp(mint, g)
+	maxtBuf := encodeTimestamp(maxt, g)
+	// Midpoint well before MINT.
+	midpoint := time.Now().Add(-time.Hour)
+	_, _, err := validateDelegationWindow(midpoint, time.Second, mintBuf[:], maxtBuf[:], g)
+	if err == nil {
+		t.Fatal("expected delegation-window error")
+	}
+	if !errors.Is(err, ErrDelegationWindow) {
+		t.Fatalf("expected ErrDelegationWindow, got %v", err)
+	}
+}
+
+// TestGreaseDropTagSubTagsReachable verifies that greaseDropTag can reach
+// SREP/CERT sub-tag drops in addition to top-level drops.
+func TestGreaseDropTagSubTagsReachable(t *testing.T) {
+	reply, _, _, _ := validReply(t, VersionDraft12, []Version{VersionDraft12})
+
+	var topOnly, subTag int
+	origBody, _ := unwrapPacket(reply)
+	origMsg, _ := Decode(origBody)
+	origSREP := origMsg[TagSREP]
+	origCERT := origMsg[TagCERT]
+
+	for range 500 {
+		cp := make([]byte, len(reply))
+		copy(cp, reply)
+		out := greaseDropTag(cp, VersionDraft12)
+		if out == nil {
+			t.Fatal("greaseDropTag returned nil")
+		}
+		outBody, err := unwrapPacket(out)
+		if err != nil {
+			t.Fatalf("unwrap grease output: %v", err)
+		}
+		outMsg, err := Decode(outBody)
+		if err != nil {
+			t.Fatalf("decode grease output: %v", err)
+		}
+		// Classify: changed SREP/CERT → sub-tag drop, missing → top-level.
+		switch {
+		case outMsg[TagSREP] == nil, outMsg[TagCERT] == nil,
+			outMsg[TagPATH] == nil && origMsg[TagPATH] != nil,
+			len(outMsg) < len(origMsg):
+			topOnly++
+		case !bytes.Equal(outMsg[TagSREP], origSREP), !bytes.Equal(outMsg[TagCERT], origCERT):
+			subTag++
+		default:
+			topOnly++
+		}
+	}
+	if subTag == 0 {
+		t.Error("sub-tag drop mode never fired (SREP/CERT sub-tag drop unreachable)")
+	}
+	if topOnly == 0 {
+		t.Error("top-level drop mode never fired")
+	}
+	t.Logf("distribution: top-level=%d sub-tag=%d", topOnly, subTag)
 }

@@ -10,10 +10,10 @@ synchronization, providing cryptographically signed timestamps with proof of
 server authenticity. This implementation covers Google-Roughtime and IETF drafts
 01–19.
 
-Note: the drafts 12–19 wire group uses the draft-16+ hash-first Merkle order, so
-multi-request batches are not strictly conformant to drafts 14–15 (which
-specified node-first before draft 16 reversed it). Single-request replies are
-unaffected.
+Note: Drafts 05–13 use node-first Merkle order; drafts 14–19 use hash-first
+(draft-16 reversed the convention, and the implementation follows the latest
+spec across the 14–19 range). Multi-request batches are therefore not strictly
+conformant to drafts 14–15. Single-request replies are unaffected.
 
 Interoperability testing is available at
 [ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
@@ -46,11 +46,16 @@ The root key file must be mode `0600` or stricter.
 
 The `client` command queries one or more Roughtime servers and prints
 authenticated timestamps with clock drift. Multi-server queries are chained by
-default per Section 8.2.
+default.
+
+When using `-servers`, the client randomly selects 3 servers from the ecosystem
+and queries them twice in the same order so all pairwise inconsistencies can be
+detected. Pass `-all` to query every server instead.
 
 ```
 go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 go run client/main.go -servers ecosystem.json
+go run client/main.go -servers ecosystem.json -all
 go run client/main.go -servers ecosystem.json -chain=false [-retries 3]
 go run client/main.go -version
 ```
@@ -81,12 +86,12 @@ Single server:
 $ go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 Address:   time.txryan.com:2002
 Version:   draft-ietf-ntp-roughtime-12
-Midpoint:  2026-04-12T02:10:00Z
+Midpoint:  2026-04-16T03:31:06Z
 Radius:    3s
-Window:    [2026-04-12T02:09:57Z, 2026-04-12T02:10:03Z]
-RTT:       50ms
-Local:     2026-04-12T02:10:00.92334Z
-Drift:     -923ms
+Window:    [2026-04-16T03:31:03Z, 2026-04-16T03:31:09Z]
+RTT:       48ms
+Local:     2026-04-16T03:31:06.455974Z
+Drift:     -456ms
 Status:    in-sync
 ```
 
@@ -94,23 +99,19 @@ Multiple servers:
 
 ```
 $ go run client/main.go -servers ecosystem.json
-NAME                            ADDRESS                         VERSION         MIDPOINT              RADIUS    RTT         DRIFT         STATUS
-time.txryan.com                 time.txryan.com:2002            draft-12        2026-04-12T02:10:01Z  ±3s       52ms        -49ms         in-sync
-Cloudflare-Roughtime-2          roughtime.cloudflare.com:2003   draft-11        2026-04-12T02:10:01Z  ±1s       18ms        -70ms         in-sync
-roughtime.se                    roughtime.se:2002               draft-12        2026-04-12T02:10:01Z  ±1s       142ms       -213ms        in-sync
-sth1.roughtime.netnod.se        sth1.roughtime.netnod.se:2002   draft-07        2026-04-12T02:10:01Z  ±62µs     132ms       -62ms         in-sync
-time.teax.dev                   time.teax.dev:2002              draft-12        2026-04-12T02:10:01Z  ±3s       148ms       -498ms        in-sync
-time.txryan.com                 time.txryan.com:2002            draft-12        2026-04-12T02:10:01Z  ±3s       48ms        -548ms        in-sync
-Cloudflare-Roughtime-2          roughtime.cloudflare.com:2003   draft-11        2026-04-12T02:10:01Z  ±1s       15ms        -567ms        in-sync
-roughtime.se                    roughtime.se:2002               draft-12        2026-04-12T02:10:01Z  ±1s       142ms       -711ms        in-sync
-sth1.roughtime.netnod.se        sth1.roughtime.netnod.se:2002   draft-07        2026-04-12T02:10:01Z  ±62µs     133ms       -63ms         in-sync
-time.teax.dev                   time.teax.dev:2002              draft-12        2026-04-12T02:10:01Z  ±3s       148ms       -998ms        in-sync
+NAME                            ADDRESS                              VERSION   MIDPOINT              RADIUS    RTT     DRIFT     STATUS
+roughtime.sturdystatistics.com  roughtime.sturdystatistics.com:2002  draft-12  2026-04-16T03:31:06Z  ±10s      180ms   -700ms    in-sync
+roughtime.se                    roughtime.se:2002                    draft-12  2026-04-16T03:31:06Z  ±1s       141ms   -844ms    in-sync
+time.txryan.com                 time.txryan.com:2002                 draft-12  2026-04-16T03:31:06Z  ±3s       50ms    -898ms    in-sync
+roughtime.sturdystatistics.com  roughtime.sturdystatistics.com:2002  draft-12  2026-04-16T03:31:07Z  ±10s      182ms   -84ms     in-sync
+roughtime.se                    roughtime.se:2002                    draft-12  2026-04-16T03:31:07Z  ±1s       141ms   -229ms    in-sync
+time.txryan.com                 time.txryan.com:2002                 draft-12  2026-04-16T03:31:07Z  ±3s       52ms    -285ms    in-sync
 
-10/10 servers responded
-Consensus drift:    -356ms (median of 10 samples)
-Consensus midpoint: 2026-04-12T02:10:01Z
-Drift spread:       949ms (min=-998ms, max=-49ms)
-Chain:              ok (10 links verified)
+6/6 servers responded
+Consensus drift:    -844ms (median of 3 samples)
+Consensus midpoint: 2026-04-16T03:31:06Z
+Drift spread:       198ms (min=-898ms, max=-700ms)
+Chain:              ok (6 links verified)
 ```
 
 ### Debug
@@ -147,7 +148,7 @@ Size: 1024 bytes
 --- Request Tags ---
   VER: 0c000080
   SRV: a8f7e4051782a37194a6cb51d94ac8f13d2c3c9e32d0c049ec3de42b40bc6c66
-  NONC: ed8cd882163bce5b80eafcd5d7fe7df2f0b9b231e6bf8aed841b52f930776665
+  NONC: 9931117699a2b0b729d4cb422cb28dfed8e9e2ad0072f3d574167820d145f808
   TYPE: 00000000
   ZZZZ: (900 bytes of padding)
 
@@ -159,8 +160,8 @@ Size: 460 bytes
 ...
 
 --- Response Tags ---
-  SIG: c214f9ebb43aac39e032565a0584555282fe83438034208985c62b56dd2b78c490fab4dcd50040ca4a9a6a2968c8fc078dfde98dc1b421dc6cb4ab15839b2c0c
-  NONC: ed8cd882163bce5b80eafcd5d7fe7df2f0b9b231e6bf8aed841b52f930776665
+  SIG: 440215c33763c7b1893a7d576f67b58b5a82f36600c884c7de4f01d7e6e08c7ae013f203b6a0f5151a120090806afc7a6063edb23a84a15a387a06cb67847907
+  NONC: 9931117699a2b0b729d4cb422cb28dfed8e9e2ad0072f3d574167820d145f808
   PATH: (empty)
   SREP: (136 bytes)
   CERT: (152 bytes)
@@ -168,32 +169,32 @@ Size: 460 bytes
   TYPE: 01000000
 
 === Verified Result ===
-Round-trip time: 49.332333ms
-Midpoint:        2026-04-12T02:10:02Z
+Round-trip time: 49.931125ms
+Midpoint:        2026-04-16T03:31:07Z
 Radius:          3s
-Local time:      2026-04-12T02:10:02.352742Z
-Clock drift:     -353ms
+Local time:      2026-04-16T03:31:07.421811Z
+Clock drift:     -422ms
 Amplification:   ok (reply 460 ≤ request 1024)
 
 === Response Details ===
-Signature:       c214f9ebb43aac39e032565a0584555282fe83438034208985c62b56dd2b78c490fab4dcd50040ca4a9a6a2968c8fc078dfde98dc1b421dc6cb4ab15839b2c0c
-Nonce:           ed8cd882163bce5b80eafcd5d7fe7df2f0b9b231e6bf8aed841b52f930776665
+Signature:       440215c33763c7b1893a7d576f67b58b5a82f36600c884c7de4f01d7e6e08c7ae013f203b6a0f5151a120090806afc7a6063edb23a84a15a387a06cb67847907
+Nonce:           9931117699a2b0b729d4cb422cb28dfed8e9e2ad0072f3d574167820d145f808
 Merkle index:    0
 Merkle path:     0 node(s)
 
 === Signed Response (SREP) ===
-Merkle root:     253382b5ee9072759359ba33029892007efec73351f4242bfe34ec52a558f256
-Midpoint (raw):  1775959802 (2026-04-12T02:10:02Z)
+Merkle root:     bcfea9809630e18bf48285cdfb0a069923838a1db3f9b6792c02cc183423f110
+Midpoint (raw):  1776310267 (2026-04-16T03:31:07Z)
 Radius (raw):    3
 VER in SREP:     0x8000000c (draft-ietf-ntp-roughtime-12)
 VERS in SREP:    draft-01, draft-02, draft-03, draft-04, draft-05, draft-06, draft-07, draft-08, draft-09, draft-10, draft-11, draft-12
 
 === Certificate ===
-Signature:       8a2b409ca1332d073fc96973539bc05817f1ab8e984bdb333ec7d21a04e09d04022194d55f2042961a9505a7ac8d5c67e24b1ac069f18a62592aba474e2fd00c
-Online key:      413221d151ccee029e836bc5b4a566594748983452f1a7ec972573f533b24e0b
-Not before:      2026-04-11T20:08:24Z
-Not after:       2026-04-12T20:08:24Z
-Expires in:      17h58m21s
+Signature:       d97b5bbed2b7acfa853285713de7072cb0ef1d8672486bc09c02ff6a2c771e72ea721370c79b162c05b344dc12da7514695ab43385cd1771a16802ef4a011f0f
+Online key:      a593d831d1a4ceaf0048c737ae7a2ceaa98a94ca476ca73894192d34d7e95e8e
+Not before:      2026-04-15T21:30:40Z
+Not after:       2026-04-16T21:30:40Z
+Expires in:      17h59m32s
 Cert validity:   ok (midpoint within window)
 ```
 
@@ -220,7 +221,7 @@ payload.
 
 ### Chaining
 
-For multi-server measurement and malfeasance detection (Section 8.2):
+For multi-server measurement and malfeasance detection:
 
 ```go
 var chain protocol.Chain
@@ -230,7 +231,7 @@ for _, server := range servers {
     chain.Append(link)
 }
 err := chain.Verify()            // checks nonce linkage + causal ordering
-report, err := chain.MalfeasanceReport() // JSON per Section 8.4
+report, err := chain.MalfeasanceReport() // JSON malfeasance report
 ```
 
 ### Server
@@ -265,10 +266,9 @@ docker run -d \
 
 ## Benchmark
 
-`roughtime-bench` is a closed-loop UDP load generator for stress-testing a
-running server. Each worker owns one socket, fires a well-formed request, waits
-for the reply, and repeats. It reports throughput, latency percentiles, and an
-error breakdown.
+bench is a closed-loop UDP load generator for stress-testing a running server.
+Each worker owns one socket, fires a well-formed request, waits for the reply,
+and repeats. It reports throughput, latency percentiles, and an error breakdown.
 
 ```
 go run bench/main.go -addr <host:port> -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s
@@ -287,8 +287,8 @@ make deps             # install dev tools
 make build            # build roughtime, roughtime-client, roughtime-debug, roughtime-bench
 make test             # unit tests
 make test-race        # unit tests with race detector
-make test-cover       # unit tests with coverage (protocol package)
-make test-race-cover  # race detector + coverage profile, protocol package (used by CI)
+make test-cover       # unit tests with coverage (protocol + server)
+make test-race-cover  # race detector + coverage profile, protocol + server (used by CI)
 make fuzz             # run all fuzz targets (FUZZ_TIME=30s each)
 make verify           # go mod download + go mod verify (module integrity)
 make coverage-report  # test-race-cover + per-function summary + HTML report
