@@ -2,8 +2,7 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Command client queries one or more Roughtime servers and prints the
-// authenticated timestamps. It demonstrates how to use the protocol package for
-// client-side Roughtime operations.
+// authenticated timestamps.
 //
 // Single server:
 //
@@ -28,6 +27,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"os"
@@ -48,9 +48,7 @@ import (
 // IETF first with Google-Roughtime last.
 var supportedVersions = protocol.Supported()
 
-// ietfVersions is supportedVersions without Google-Roughtime. IETF servers
-// receive only IETF version numbers in the VER tag; Google-Roughtime uses a
-// separate code path that omits VER entirely.
+// ietfVersions is supportedVersions without Google-Roughtime.
 var ietfVersions = supportedVersions[:len(supportedVersions)-1]
 
 var (
@@ -59,13 +57,13 @@ var (
 	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
 	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex, with -addr)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "UDP read/write timeout")
-	retries     = flag.Int("retries", 3, "max retry attempts per server (1.5× linear backoff)")
+	retries     = flag.Int("retries", 3, "max retry attempts per server (backoff 1s × 1.5^(n-1), cap 24h)")
 	chain       = flag.Bool("chain", true, "chain queries: derive each nonce from the previous reply")
 	all         = flag.Bool("all", false, "query every server in the ecosystem (default: random 3)")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
-// serverConfig matches the JSON schema used by the Roughtime ecosystem.
+// serverConfig is one entry in a Roughtime ecosystem JSON file.
 type serverConfig struct {
 	Name          string      `json:"name"`
 	Version       flexVersion `json:"version"`
@@ -77,20 +75,17 @@ type serverConfig struct {
 	} `json:"addresses"`
 }
 
-// flexVersion unmarshals a JSON "version" field that may be a string (de facto
-// ecosystem convention, e.g. "IETF-Roughtime") or an integer (spec requirement,
-// e.g. 2147483660 for 0x8000000c).
+// flexVersion accepts a JSON "version" field encoded as either a string or an
+// integer.
 type flexVersion string
 
-// UnmarshalJSON accepts either a JSON string or integer for a version.
+// UnmarshalJSON decodes v from a JSON string or integer.
 func (v *flexVersion) UnmarshalJSON(b []byte) error {
-	// Try string first (the common case in real ecosystem files).
 	var s string
 	if err := json.Unmarshal(b, &s); err == nil {
 		*v = flexVersion(s)
 		return nil
 	}
-	// Fall back to integer (spec-compliant format).
 	var n uint32
 	if err := json.Unmarshal(b, &n); err == nil {
 		*v = flexVersion(fmt.Sprintf("%d", n))
@@ -99,12 +94,12 @@ func (v *flexVersion) UnmarshalJSON(b []byte) error {
 	return fmt.Errorf("version must be a string or integer, got %s", string(b))
 }
 
-// serverList is the top-level JSON structure.
+// serverList is the top-level JSON structure of an ecosystem file.
 type serverList struct {
 	Servers []serverConfig `json:"servers"`
 }
 
-// result holds the outcome of querying a single server.
+// result is the outcome of querying a single server.
 type result struct {
 	Name     string
 	Address  string
@@ -116,15 +111,23 @@ type result struct {
 	Err      error
 }
 
-// inSync reports whether the local clock falls within the server's uncertainty
-// window. The bound is radius + RTT/2 because the server's observation could
-// have happened anywhere during the round trip.
+// drift reports the signed offset between the server's midpoint and the
+// client's best estimate of its own clock at the server's processing moment
+// (LocalNow - RTT/2), removing the RTT/2 bias introduced by measuring LocalNow
+// at reply receipt.
+func (r result) drift() time.Duration {
+	ref := r.LocalNow.Add(-r.RTT / 2)
+	return r.Midpoint.Sub(ref)
+}
+
+// inSync reports whether the client's RTT-corrected clock falls within the
+// server's uncertainty window.
 func (r result) inSync() bool {
-	drift := r.Midpoint.Sub(r.LocalNow)
-	if drift < 0 {
-		drift = -drift
+	d := r.drift()
+	if d < 0 {
+		d = -d
 	}
-	return drift <= r.Radius+r.RTT/2
+	return d <= r.Radius
 }
 
 func main() {
@@ -166,13 +169,12 @@ func run(ctx context.Context) error {
 	if len(servers) == 1 {
 		r := queryServer(ctx, servers[0])
 		if r.Err != nil {
-			return fmt.Errorf("%s: %w", r.Name, r.Err)
+			return fmt.Errorf("%s: %w", sanitize(r.Name), r.Err)
 		}
 		printSingleResult(r)
 		return nil
 	}
 
-	// Size columns to the widest value, floored at the header width.
 	nameW, addrW := 30, 30
 	for _, s := range servers {
 		nameW = max(nameW, len(s.Name))
@@ -187,9 +189,9 @@ func run(ctx context.Context) error {
 	var results []result
 	var pchain *protocol.Chain
 	if *chain {
-		// Section 8.2: repeat the query sequence twice in the same order so
-		// every server is checked against every other in both directions.
-		results, pchain = queryChained(ctx, append(servers, servers...))
+		// §8.2: two passes cross-check every server in both directions.
+		// slices.Concat avoids aliasing from append(servers, servers...)
+		results, pchain = queryChained(ctx, slices.Concat(servers, servers))
 	} else {
 		ch := make(chan result, len(servers))
 		for _, srv := range servers {
@@ -203,19 +205,19 @@ func run(ctx context.Context) error {
 	}
 
 	var drifts []time.Duration
-	// Dedupe so chain mode's two-pass sequence doesn't double-weight servers.
+	// Dedupe so chain mode's two passes don't double-weight servers
 	seen := make(map[string]bool)
 	var succeeded, failed int
 	for _, r := range results {
 		if r.Err != nil {
-			fmt.Printf(errFmt, r.Name, r.Address, r.Err)
+			fmt.Printf(errFmt, sanitize(r.Name), sanitize(r.Address), r.Err)
 			failed++
 			continue
 		}
-		drift := r.Midpoint.Sub(r.LocalNow)
+		d := r.drift()
 		key := r.Name + "|" + r.Address
 		if !seen[key] {
-			drifts = append(drifts, drift)
+			drifts = append(drifts, d)
 			seen[key] = true
 		}
 		status := "out-of-sync"
@@ -223,13 +225,13 @@ func run(ctx context.Context) error {
 			status = "in-sync"
 		}
 		fmt.Printf(rowFmt,
-			r.Name,
-			r.Address,
+			sanitize(r.Name),
+			sanitize(r.Address),
 			r.Version.ShortString(),
 			r.Midpoint.UTC().Format(time.RFC3339),
 			"±"+r.Radius.String(),
 			r.RTT.Round(time.Millisecond).String(),
-			drift.Round(time.Millisecond).String(),
+			d.Round(time.Millisecond).String(),
 			status,
 		)
 		succeeded++
@@ -246,8 +248,7 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-// printSingleResult prints a verbose vertical summary of a single verified
-// server response.
+// printSingleResult prints a vertical summary of one verified server response.
 func printSingleResult(r result) {
 	safeName := sanitize(r.Name)
 	safeAddress := sanitize(r.Address)
@@ -257,7 +258,7 @@ func printSingleResult(r result) {
 	if r.inSync() {
 		status = "in-sync"
 	}
-	// In -addr mode Name and Address are identical; skip the redundant line.
+	// In -addr mode Name and Address match; skip the redundant line
 	if safeName != safeAddress {
 		fmt.Printf("Server:    %s\n", safeName)
 	}
@@ -268,12 +269,12 @@ func printSingleResult(r result) {
 	fmt.Printf("Window:    [%s, %s]\n", windowStart, windowEnd)
 	fmt.Printf("RTT:       %s\n", r.RTT.Round(time.Millisecond))
 	fmt.Printf("Local:     %s\n", r.LocalNow.UTC().Format(time.RFC3339Nano))
-	fmt.Printf("Drift:     %s\n", r.Midpoint.Sub(r.LocalNow).Round(time.Millisecond))
+	fmt.Printf("Drift:     %s\n", r.drift().Round(time.Millisecond))
 	fmt.Printf("Status:    %s\n", status)
 }
 
-// printConsensus prints the median drift, derived consensus midpoint, and drift
-// spread across a set of per-server samples. No-op when empty.
+// printConsensus prints the median drift, consensus midpoint, and drift spread
+// across per-server samples. No-op when empty.
 func printConsensus(drifts []time.Duration) {
 	if len(drifts) == 0 {
 		return
@@ -291,7 +292,7 @@ func printConsensus(drifts []time.Duration) {
 	)
 }
 
-// printChainStatus verifies the chain and prints the result.
+// printChainStatus verifies c and prints the outcome.
 func printChainStatus(c *protocol.Chain) {
 	err := c.Verify()
 	if err == nil {
@@ -301,8 +302,8 @@ func printChainStatus(c *protocol.Chain) {
 	}
 }
 
-// medianDuration returns the median of a slice of durations without mutating
-// the input. For an even count it averages the two middle values.
+// medianDuration returns the median of d without mutating it. For an even count
+// it averages the two middle values.
 func medianDuration(d []time.Duration) time.Duration {
 	s := slices.Clone(d)
 	slices.Sort(s)
@@ -313,11 +314,37 @@ func medianDuration(d []time.Duration) time.Duration {
 	return (s[n/2-1] + s[n/2]) / 2
 }
 
-// defaultSampleSize is the number of servers randomly selected from the
-// ecosystem when -all is not set.
+// defaultSampleSize is the number of servers randomly sampled when -all is
+// unset.
 const defaultSampleSize = 3
 
-// loadServers returns the server list from flags.
+// Retry backoff per drafts 14+ §6.1: initial 1s, 1.5× multiplier, capped at
+// 24h. The interval MUST NOT reset until a valid signed response is received;
+// this CLI is one-shot so each query exits on the first success, preserving
+// that invariant implicitly.
+const (
+	retryBackoffInitial = 1 * time.Second
+	retryBackoffMax     = 24 * time.Hour
+	retryBackoffFactor  = 1.5
+)
+
+// nextBackoff returns the next backoff interval, clamped to retryBackoffMax.
+func nextBackoff(cur time.Duration) time.Duration {
+	next := time.Duration(float64(cur) * retryBackoffFactor)
+	if next > retryBackoffMax {
+		return retryBackoffMax
+	}
+	return next
+}
+
+// maxEcosystemServers caps the size of a JSON server list.
+const maxEcosystemServers = 1024
+
+// maxEcosystemFileBytes caps the size of an ecosystem JSON file before decode.
+// 1 MiB is well above any plausible list of 1024 servers.
+const maxEcosystemFileBytes = 1 * 1024 * 1024
+
+// loadServers resolves the server list from flags.
 func loadServers() ([]serverConfig, error) {
 	if *serversFile != "" {
 		servers, err := loadServersFile(*serversFile)
@@ -354,20 +381,23 @@ func loadServers() ([]serverConfig, error) {
 	return nil, fmt.Errorf("provide -servers <file> or -addr <host:port> -pubkey <base64-or-hex>")
 }
 
-// loadServersFile reads and parses a JSON server list.
+// loadServersFile reads and parses a JSON server list from path.
 func loadServersFile(path string) ([]serverConfig, error) {
 	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil, fmt.Errorf("reading server list: %w", err)
 	}
 	defer f.Close()
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(io.LimitReader(f, maxEcosystemFileBytes))
 	var list serverList
 	if err := dec.Decode(&list); err != nil {
 		return nil, fmt.Errorf("parsing server list: %w", err)
 	}
 	if len(list.Servers) == 0 {
 		return nil, fmt.Errorf("no servers in %s", path)
+	}
+	if len(list.Servers) > maxEcosystemServers {
+		return nil, fmt.Errorf("server list has %d entries (max %d)", len(list.Servers), maxEcosystemServers)
 	}
 	for i := range list.Servers {
 		list.Servers[i].Name = sanitize(list.Servers[i].Name)
@@ -378,7 +408,8 @@ func loadServersFile(path string) ([]serverConfig, error) {
 	return list.Servers, nil
 }
 
-// sanitize strips control characters from untrusted input.
+// sanitize strips control characters and bidi format codes from s. The bidi
+// overrides (U+202A-E, U+2066-9) defeat Trojan Source-style display attacks.
 func sanitize(s string) string {
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\r", "")
@@ -386,13 +417,15 @@ func sanitize(s string) string {
 		if unicode.IsControl(r) {
 			return -1
 		}
+		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) {
+			return -1
+		}
 		return r
 	}, s)
 }
 
-// decodePubKey accepts an Ed25519 root public key encoded as standard base64,
-// URL base64, or lowercase hex (the three forms used by published Roughtime
-// ecosystem feeds). It returns an error unless the result is exactly 32 bytes.
+// decodePubKey decodes an Ed25519 root public key from standard base64, URL
+// base64, or hex. It errors unless the result is 32 bytes.
 func decodePubKey(s string) ([]byte, error) {
 	for _, dec := range []func(string) ([]byte, error){
 		base64.StdEncoding.DecodeString,
@@ -408,8 +441,8 @@ func decodePubKey(s string) ([]byte, error) {
 	return nil, fmt.Errorf("public key %q is not 32 bytes of base64 or hex", s)
 }
 
-// queryServer queries a single Roughtime server. For IETF servers it advertises
-// every supported version in one VER tag and lets the server pick.
+// queryServer queries a single Roughtime server. IETF servers receive every
+// supported version in one VER tag.
 func queryServer(ctx context.Context, srv serverConfig) result {
 	r := result{Name: srv.Name}
 
@@ -433,8 +466,8 @@ func queryServer(ctx context.Context, srv serverConfig) result {
 }
 
 // queryChained queries servers sequentially using protocol.Chain, deriving each
-// nonce from the previous response per Section 8.2. Results are returned in
-// server order.
+// nonce from the previous response per §8.2. Results are returned in server
+// order.
 func queryChained(ctx context.Context, servers []serverConfig) ([]result, *protocol.Chain) {
 	var c protocol.Chain
 	results := make([]result, len(servers))
@@ -484,14 +517,14 @@ func queryChained(ctx context.Context, servers []serverConfig) ([]result, *proto
 		var localNow time.Time
 		var midpoint time.Time
 		var radius time.Duration
-		backoff := *timeout
+		sleep := retryBackoffInitial
 		ok := false
 		for attempt := range *retries {
 			if ctx.Err() != nil {
 				err = ctx.Err()
 				break
 			}
-			reply, rtt, localNow, err = sendRequest(ctx, r.Address, link.Request, backoff)
+			reply, rtt, localNow, err = sendRequest(ctx, r.Address, link.Request, *timeout)
 			if err == nil {
 				midpoint, radius, err = protocol.VerifyReply(versions, reply, rootPK, parsed.Nonce, link.Request)
 			}
@@ -500,13 +533,12 @@ func queryChained(ctx context.Context, servers []serverConfig) ([]result, *proto
 				break
 			}
 			if attempt < *retries-1 {
-				// Back off on any retry: a verify failure may be grease (§7),
-				// so retrying can succeed but must not hammer the server.
-				if !sleepCtx(ctx, backoff) {
+				// Back off between retries; a verify failure may be grease (§7)
+				if !sleepCtx(ctx, sleep) {
 					err = ctx.Err()
 					break
 				}
-				backoff = time.Duration(float64(backoff) * 1.5)
+				sleep = nextBackoff(sleep)
 			}
 		}
 		if !ok {
@@ -517,8 +549,7 @@ func queryChained(ctx context.Context, servers []serverConfig) ([]result, *proto
 		r.LocalNow = localNow
 		link.Response = reply
 
-		// Append only after verification so a bad response doesn't poison the
-		// nonce derivation for subsequent links.
+		// Append only after verification to protect subsequent nonce derivation
 		c.Append(link)
 
 		r.Midpoint = midpoint
@@ -533,12 +564,12 @@ func queryChained(ctx context.Context, servers []serverConfig) ([]result, *proto
 	return results, &c
 }
 
-// replyBufPool pools 65535-byte UDP read buffers (max UDP datagram size).
+// replyBufPool pools max-sized UDP read buffers.
 var replyBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 65535); return &b },
 }
 
-// sleepCtx sleeps for d but returns false immediately if ctx is cancelled.
+// sleepCtx sleeps for d, returning false if ctx is cancelled.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -550,8 +581,8 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// sendRequest sends a Roughtime request and returns the reply, RTT, and local
-// time. If ctx is cancelled mid-flight the socket is closed to unblock the
+// sendRequest sends a Roughtime request to address and returns the reply, RTT,
+// and local receive time. Cancellation of ctx closes the socket to unblock the
 // read.
 func sendRequest(ctx context.Context, address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
 	raddr, err := net.ResolveUDPAddr("udp", address)
@@ -564,7 +595,6 @@ func sendRequest(ctx context.Context, address string, request []byte, timeout ti
 	}
 	defer conn.Close()
 
-	// Close on ctx cancellation to unblock an in-flight Read.
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -590,18 +620,21 @@ func sendRequest(ctx context.Context, address string, request []byte, timeout ti
 	defer replyBufPool.Put(bufp)
 	n, err := conn.Read(*bufp)
 	if err != nil {
-		if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-			return nil, 0, time.Time{}, ctx.Err()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, time.Time{}, ctxErr
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return nil, 0, time.Time{}, err
 		}
 		return nil, 0, time.Time{}, fmt.Errorf("reading: %w", err)
 	}
-	// Copy out of the pooled buffer before returning it.
 	out := make([]byte, n)
 	copy(out, (*bufp)[:n])
 	return out, time.Since(start), time.Now(), nil
 }
 
-// queryOnce sends one Roughtime request and verifies the response.
+// queryOnce sends one Roughtime request, verifies the response, and retries on
+// failure with linear backoff.
 func queryOnce(ctx context.Context, name, address string, rootPK []byte, versions []protocol.Version, timeout time.Duration) result {
 	r := result{Name: name, Address: address}
 
@@ -617,14 +650,14 @@ func queryOnce(ctx context.Context, name, address string, rootPK []byte, version
 	var localNow time.Time
 	var midpoint time.Time
 	var radius time.Duration
-	backoff := timeout
+	sleep := retryBackoffInitial
 	for attempt := range *retries {
 		if ctx.Err() != nil {
 			r.Err = ctx.Err()
 			return r
 		}
 		var networkErr bool
-		reply, rtt, localNow, err = sendRequest(ctx, address, request, backoff)
+		reply, rtt, localNow, err = sendRequest(ctx, address, request, timeout)
 		if err != nil {
 			networkErr = true
 		} else {
@@ -640,13 +673,12 @@ func queryOnce(ctx context.Context, name, address string, rootPK []byte, version
 			r.Err = err
 			return r
 		}
-		// Back off on any retry: a verify failure may be grease (§7), so
-		// retrying can succeed but must not hammer the server.
-		if !sleepCtx(ctx, backoff) {
+		// Back off between retries; a verify failure may be grease (§7)
+		if !sleepCtx(ctx, sleep) {
 			r.Err = ctx.Err()
 			return r
 		}
-		backoff = time.Duration(float64(backoff) * 1.5)
+		sleep = nextBackoff(sleep)
 	}
 	r.RTT = rtt
 	r.LocalNow = localNow

@@ -33,6 +33,15 @@
       ]
     },
     {
+      "name": "sth2.roughtime.netnod.se",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "T/xxX4ERUBAOpt64Z8phWamKsASZxJ0VWuiPm3GS/8g=",
+      "addresses": [
+        { "protocol": "udp", "address": "sth2.roughtime.netnod.se:2002" }
+      ]
+    },
+    {
       "name": "time.teax.dev",
       "version": "IETF-Roughtime",
       "publicKeyType": "ed25519",

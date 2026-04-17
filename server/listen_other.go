@@ -46,9 +46,8 @@ func listen(ctx context.Context, state *atomic.Pointer[certState], maxSize int, 
 	var batcherWg sync.WaitGroup
 	batcherLog := logger.Named("batcher")
 	batcherWg.Add(1)
-	// Panic recovery lives inside batcher() on a per-iteration basis: a
-	// supervisor-style restart would lose the in-memory batches map and, worse,
-	// race the shutdown's close(batchCh) into a dead re-entry.
+	// Panic recovery is per-iteration inside batcher so the batches map
+	// persists and close(batchCh) on shutdown is not raced by a restart
 	go func() {
 		defer batcherWg.Done()
 		batcher(batcherLog, conn, state, batchCh, maxSize, maxLatency)
@@ -60,18 +59,17 @@ func listen(ctx context.Context, state *atomic.Pointer[certState], maxSize int, 
 		zap.Int("queue_size", batchQueueSize),
 	)
 
-	// On shutdown, set a past read deadline so the read loop unblocks cleanly
-	// without closing the socket from underneath in-flight work.
+	// Unblock the read loop via a past deadline rather than closing the socket
+	// while in-flight work still holds it
 	go func() {
 		<-ctx.Done()
 		listenLog.Info("shutdown initiated, unblocking reads")
 		_ = conn.SetReadDeadline(time.Unix(1, 0))
 	}()
 
-	// readOne handles one read-dispatch iteration. A panic (e.g. in
-	// validateRequest) is absorbed so a single malformed request can't crash
-	// the server; the offending buffer is leaked rather than returned to the
-	// pool, which the pool tolerates. Returns true when shutdown is requested.
+	// readOne performs one read-dispatch iteration and returns true on
+	// shutdown. Panics are recovered per-iteration; the offending buffer is
+	// leaked rather than returned to the pool
 	readOne := func() bool {
 		defer recoverGoroutine(listenLog, "listen")
 
@@ -86,8 +84,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState], maxSize int, 
 			return false
 		}
 		statsReceived.Add(1)
-		// Drop undersize packets without dispatching: responding to requests
-		// shorter than 1024 bytes is OPTIONAL per all drafts (§5/§6).
+		// Undersize packets may be dropped per all drafts (§5/§6)
 		if reqLen < minRequestSize {
 			bufPool.Put(bufPtr)
 			statsDropped.Add(1)
@@ -178,9 +175,9 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 		delete(batches, key)
 	}
 
-	// One select-iteration. Returns true when the incoming channel has been
-	// closed and any residual batches have been flushed. Panic recovery is
-	// per-iteration so batches persists across a recovered panic.
+	// step runs one select iteration, returning true once incoming is closed
+	// and residual batches are flushed. Per-iteration recovery keeps batches
+	// alive across a recovered panic
 	step := func() (done bool) {
 		defer recoverGoroutine(log, "batcher")
 		select {
@@ -199,8 +196,7 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 			}
 			b.items = append(b.items, vr)
 
-			// Drafts 01-02 place NONC inside SREP, preventing multi-request
-			// batches. Flush immediately to avoid the noncInSREP rejection.
+			// NoncInSREP versions cannot batch; flush immediately
 			if protocol.NoncInSREP(vr.version, vr.req.HasType) || len(b.items) >= maxSize {
 				flush(key)
 			}

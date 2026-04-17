@@ -11,6 +11,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -31,7 +32,7 @@ var (
 	addr        = flag.String("addr", "", "host:port of the Roughtime server")
 	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "per-version probe timeout")
-	retries     = flag.Int("retries", 3, "max retry attempts per version (back-to-back, no backoff — this is a probe tool)")
+	retries     = flag.Int("retries", 3, "max retry attempts per version")
 	forceVer    = flag.String("ver", "", "probe only this version (e.g. draft-12, Google) and dump request/response even on failure")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -39,8 +40,8 @@ var (
 // probeVersions lists every distinct VER value, newest first.
 var probeVersions = protocol.Supported()
 
-// parseShortVersion maps a ShortString label ("Google", "draft-12") back to the
-// wire Version. Unknown or malformed inputs return an error.
+// parseShortVersion maps a ShortString label ("Google", "draft-12") to its wire
+// Version.
 func parseShortVersion(s string) (protocol.Version, error) {
 	for _, v := range protocol.Supported() {
 		if v.ShortString() == s {
@@ -79,7 +80,7 @@ func main() {
 	}
 }
 
-// validateFlags checks CLI flags are within permitted ranges.
+// validateFlags validates CLI flags and resolves -ver into probeVersions.
 func validateFlags() error {
 	if *addr == "" || *pubkey == "" {
 		return fmt.Errorf("usage: debug -addr <host:port> -pubkey <base64-or-hex>")
@@ -137,7 +138,7 @@ func run() error {
 			continue
 		}
 		supported = append(supported, ver)
-		// probeVersions is ordered newest-first, so the first OK is the best.
+		// probeVersions is ordered newest-first, so the first OK is the best
 		if best == nil {
 			best = &r
 		}
@@ -160,8 +161,8 @@ func run() error {
 	return nil
 }
 
-// probe sends a Roughtime request for a specific version, retrying on network
-// and verification failures (e.g. greased responses).
+// probe sends a Roughtime request for a single version, retrying on network and
+// verification failures.
 func probe(rootPK []byte, ver protocol.Version) probeResult {
 	r := probeResult{version: ver}
 	versions := []protocol.Version{ver}
@@ -210,11 +211,10 @@ func probe(rootPK []byte, ver protocol.Version) probeResult {
 // sendProbe sends a single UDP request and returns the raw reply, RTT, and
 // local time captured immediately after receiving the response.
 func sendProbe(request []byte, deadline time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
-	raddr, err := net.ResolveUDPAddr("udp", *addr)
-	if err != nil {
-		return nil, 0, time.Time{}, fmt.Errorf("resolve: %w", err)
-	}
-	conn, err := net.DialUDP("udp", nil, raddr)
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "udp", *addr)
 	if err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("dial: %w", err)
 	}
@@ -255,8 +255,7 @@ func msgBody(pkt []byte) []byte {
 	return pkt
 }
 
-// decode is a safe wrapper around [protocol.Decode] that prints decode errors
-// to stderr instead of silently dropping malformed input.
+// decode wraps [protocol.Decode] and logs errors to stderr.
 func decode(data []byte) map[uint32][]byte {
 	tags, err := protocol.Decode(data)
 	if err != nil {
@@ -266,9 +265,7 @@ func decode(data []byte) map[uint32][]byte {
 	return tags
 }
 
-// printDiagnostic prints the full diagnostic dump for a verified probe result.
-// It decodes the request and response once and passes the parsed tags to each
-// output section.
+// printDiagnostic prints the full diagnostic dump for a probe result.
 func printDiagnostic(r probeResult) {
 	reqTags := decode(msgBody(r.request))
 	respTags := decode(msgBody(r.reply))
@@ -341,8 +338,7 @@ func printResponse(r probeResult, tags map[uint32][]byte) {
 	fmt.Println()
 }
 
-// printVerified prints the verified result summary, including the amplification
-// check that Roughtime requires of every server response.
+// printVerified prints the verified result summary and amplification check.
 func printVerified(r probeResult) {
 	fmt.Printf("=== Verified Result ===\n")
 	fmt.Printf("Round-trip time: %s\n", r.rtt)
@@ -537,9 +533,8 @@ func hexDump(data []byte) {
 	}
 }
 
-// decodePubKey accepts an Ed25519 root public key encoded as standard base64,
-// URL base64, or lowercase hex (the three forms used by published Roughtime
-// ecosystem feeds). It returns an error unless the result is exactly 32 bytes.
+// decodePubKey decodes a 32-byte Ed25519 root public key from standard or URL
+// base64 (padded or raw) or lowercase hex.
 func decodePubKey(s string) ([]byte, error) {
 	for _, dec := range []func(string) ([]byte, error){
 		base64.StdEncoding.DecodeString,

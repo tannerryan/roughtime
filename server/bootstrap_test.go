@@ -20,8 +20,7 @@ import (
 )
 
 // withSeedFile writes a fresh 32-byte Ed25519 seed at mode 0600 and returns the
-// path plus the derived public key. The test's temp dir is used, so cleanup is
-// automatic.
+// path plus the derived public key.
 func withSeedFile(t *testing.T) (string, ed25519.PublicKey) {
 	t.Helper()
 	pk, sk, err := ed25519.GenerateKey(rand.Reader)
@@ -37,7 +36,7 @@ func withSeedFile(t *testing.T) (string, ed25519.PublicKey) {
 }
 
 // setRootKeyPath swaps *rootKeySeedHexFile for the duration of the test and
-// restores it on cleanup. Required because the flag is process-global.
+// restores it on cleanup.
 func setRootKeyPath(t *testing.T, path string) {
 	t.Helper()
 	prev := *rootKeySeedHexFile
@@ -48,14 +47,14 @@ func setRootKeyPath(t *testing.T, path string) {
 // TestValidateFlagsAccepts asserts validateFlags returns nil when every flag
 // sits inside its permitted range.
 func TestValidateFlagsAccepts(t *testing.T) {
-	setRootKeyPath(t, "/nonexistent") // only checked for non-empty
+	setRootKeyPath(t, "/nonexistent")
 	if err := validateFlags(); err != nil {
 		t.Fatalf("validateFlags() err=%v, want nil", err)
 	}
 }
 
-// TestValidateFlagsRejects table-tests each out-of-range flag combination and
-// checks the resulting error message names the offending flag.
+// TestValidateFlagsRejects asserts each out-of-range flag produces an error
+// that names the offending flag.
 func TestValidateFlagsRejects(t *testing.T) {
 	cases := []struct {
 		name string
@@ -121,7 +120,7 @@ func TestValidateFlagsRejects(t *testing.T) {
 }
 
 // TestGenerateKeypairSuccess verifies generateKeypair writes a 32-byte seed at
-// mode 0600 and that the contents decode as valid hex.
+// mode 0600 decodable as valid hex.
 func TestGenerateKeypairSuccess(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "new.hex")
 	if err := generateKeypair(path); err != nil {
@@ -144,8 +143,8 @@ func TestGenerateKeypairSuccess(t *testing.T) {
 	}
 }
 
-// TestGenerateKeypairRefusesOverwrite asserts an existing seed file is never
-// clobbered; operators must delete it explicitly to rotate the root key.
+// TestGenerateKeypairRefusesOverwrite asserts an existing seed file is not
+// clobbered.
 func TestGenerateKeypairRefusesOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "exists.hex")
 	if err := os.WriteFile(path, []byte("placeholder"), 0600); err != nil {
@@ -157,8 +156,8 @@ func TestGenerateKeypairRefusesOverwrite(t *testing.T) {
 	}
 }
 
-// TestDerivePublicKeySuccess asserts a valid seed file decodes and prints a
-// public key without error.
+// TestDerivePublicKeySuccess asserts a valid seed file produces a public key
+// without error.
 func TestDerivePublicKeySuccess(t *testing.T) {
 	path, _ := withSeedFile(t)
 	if err := derivePublicKey(path); err != nil {
@@ -166,8 +165,8 @@ func TestDerivePublicKeySuccess(t *testing.T) {
 	}
 }
 
-// TestDerivePublicKeyMissingFile asserts derivePublicKey surfaces the os read
-// error rather than silently proceeding.
+// TestDerivePublicKeyMissingFile asserts derivePublicKey surfaces the read
+// error for a missing seed file.
 func TestDerivePublicKeyMissingFile(t *testing.T) {
 	err := derivePublicKey(filepath.Join(t.TempDir(), "nope.hex"))
 	if err == nil || !strings.Contains(err.Error(), "reading") {
@@ -175,8 +174,7 @@ func TestDerivePublicKeyMissingFile(t *testing.T) {
 	}
 }
 
-// TestDerivePublicKeyBadSeed asserts non-hex content is rejected before any key
-// derivation is attempted.
+// TestDerivePublicKeyBadSeed asserts non-hex seed content is rejected.
 func TestDerivePublicKeyBadSeed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.hex")
 	if err := os.WriteFile(path, []byte("not-hex-!@#"), 0600); err != nil {
@@ -188,8 +186,8 @@ func TestDerivePublicKeyBadSeed(t *testing.T) {
 	}
 }
 
-// TestDerivePublicKeyWrongSize asserts a short hex payload is rejected with the
-// expected size-error message.
+// TestDerivePublicKeyWrongSize asserts a short hex payload is rejected with a
+// size error.
 func TestDerivePublicKeyWrongSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "short.hex")
 	if err := os.WriteFile(path, []byte(hex.EncodeToString([]byte{1, 2, 3})), 0600); err != nil {
@@ -202,7 +200,7 @@ func TestDerivePublicKeyWrongSize(t *testing.T) {
 }
 
 // TestProvisionCertificateKeySuccess asserts a valid seed file produces a
-// delegation cert and returned keys match the seed on disk.
+// delegation cert and the returned keys match the seed on disk.
 func TestProvisionCertificateKeySuccess(t *testing.T) {
 	path, wantPK := withSeedFile(t)
 	setRootKeyPath(t, path)
@@ -226,7 +224,7 @@ func TestProvisionCertificateKeySuccess(t *testing.T) {
 }
 
 // TestProvisionCertificateKeyRejectsInsecureMode asserts seed files with any
-// group/other permission bits are refused before being read.
+// group/other permission bits are refused.
 func TestProvisionCertificateKeyRejectsInsecureMode(t *testing.T) {
 	path, _ := withSeedFile(t)
 	if err := os.Chmod(path, 0644); err != nil {
@@ -250,7 +248,7 @@ func TestProvisionCertificateKeyRejectsMissing(t *testing.T) {
 }
 
 // TestProvisionCertificateKeyRejectsBadSeed asserts non-hex seed content fails
-// decoding rather than producing a bogus certificate.
+// decoding.
 func TestProvisionCertificateKeyRejectsBadSeed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.hex")
 	if err := os.WriteFile(path, []byte("not-hex-!@#"), 0600); err != nil {
@@ -264,7 +262,7 @@ func TestProvisionCertificateKeyRejectsBadSeed(t *testing.T) {
 }
 
 // TestProvisionCertificateKeyRejectsWrongSize asserts a seed shorter than
-// ed25519.SeedSize is rejected before Ed25519 key derivation.
+// ed25519.SeedSize is rejected.
 func TestProvisionCertificateKeyRejectsWrongSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "short.hex")
 	if err := os.WriteFile(path, []byte(hex.EncodeToString([]byte{1, 2, 3})), 0600); err != nil {
@@ -299,12 +297,12 @@ func TestTryRefreshCertSuccess(t *testing.T) {
 }
 
 // TestTryRefreshCertRejectsChangedRoot asserts a rotated seed file aborts the
-// refresh with an identity-change error instead of silently swapping keys.
+// refresh with an identity-change error.
 func TestTryRefreshCertRejectsChangedRoot(t *testing.T) {
 	path, _ := withSeedFile(t)
 	setRootKeyPath(t, path)
 
-	// initialPK is a key that does NOT match what's on disk.
+	// Key that does not match what is on disk
 	otherPK, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen other: %v", err)
@@ -316,7 +314,7 @@ func TestTryRefreshCertRejectsChangedRoot(t *testing.T) {
 }
 
 // TestTryRefreshCertPropagatesProvisionErr asserts provisioning errors are
-// returned verbatim rather than masked as identity-check failures.
+// returned verbatim.
 func TestTryRefreshCertPropagatesProvisionErr(t *testing.T) {
 	setRootKeyPath(t, filepath.Join(t.TempDir(), "nope.hex"))
 	pk, _, err := ed25519.GenerateKey(rand.Reader)
@@ -329,10 +327,9 @@ func TestTryRefreshCertPropagatesProvisionErr(t *testing.T) {
 	}
 }
 
-// TestStatsLoopExitsOnCtxCancel asserts the loop returns immediately if ctx is
-// already cancelled, without waiting for the periodic tick.
+// TestStatsLoopExitsOnCtxCancel asserts the loop returns immediately when ctx
+// is already cancelled.
 func TestStatsLoopExitsOnCtxCancel(t *testing.T) {
-	// Pre-cancelled ctx forces a return before the first tick.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -352,7 +349,8 @@ func TestStatsLoopExitsOnCtxCancel(t *testing.T) {
 	}
 }
 
-// withInterval swaps a timer variable for the test and restores it.
+// withInterval swaps a duration variable for the test and restores it on
+// cleanup.
 func withInterval(t *testing.T, v *time.Duration, d time.Duration) {
 	t.Helper()
 	prev := *v
@@ -360,15 +358,15 @@ func withInterval(t *testing.T, v *time.Duration, d time.Duration) {
 	t.Cleanup(func() { *v = prev })
 }
 
-// TestStatsLoopTicks shortens the stats interval so the tick-body executes at
-// least once with a non-zero batch count (exercising the avg_batch_size path).
+// TestStatsLoopTicks shortens the stats interval so the tick body executes at
+// least once with a non-zero batch count.
 func TestStatsLoopTicks(t *testing.T) {
 	withInterval(t, &statsInterval, 5*time.Millisecond)
 	_, st := newUnitCertState(t)
 	statePtr := &atomic.Pointer[certState]{}
 	statePtr.Store(st)
 
-	// Prime a non-zero counter so the tick body takes the avg_batch_size path.
+	// Prime a non-zero counter so the tick body takes the avg_batch_size path
 	statsBatches.Add(1)
 	statsBatchedReqs.Add(4)
 	t.Cleanup(func() { statsBatches.Store(0); statsBatchedReqs.Store(0) })
@@ -388,10 +386,9 @@ func TestRefreshLoopRefreshesNearExpiry(t *testing.T) {
 	path, pk := withSeedFile(t)
 	setRootKeyPath(t, path)
 
-	// Seed a certState that expires very soon so the refresh threshold triggers
-	// on the first tick.
+	// Expiry below threshold triggers refresh on the first tick
 	_, stSeed := newUnitCertState(t)
-	stSeed.expiry = time.Now().Add(time.Minute) // below threshold
+	stSeed.expiry = time.Now().Add(time.Minute)
 	statePtr := &atomic.Pointer[certState]{}
 	statePtr.Store(stSeed)
 
@@ -408,8 +405,8 @@ func TestRefreshLoopRefreshesNearExpiry(t *testing.T) {
 	}
 }
 
-// TestRefreshLoopLogsErrorOnIdentityChange drives the loop with an initialPK
-// that differs from disk and asserts state is never replaced.
+// TestRefreshLoopLogsErrorOnIdentityChange drives the loop with a key that
+// differs from disk and asserts state is never replaced.
 func TestRefreshLoopLogsErrorOnIdentityChange(t *testing.T) {
 	withInterval(t, &certCheckInterval, 5*time.Millisecond)
 	withInterval(t, &certRefreshThreshold, time.Hour)
@@ -418,8 +415,6 @@ func TestRefreshLoopLogsErrorOnIdentityChange(t *testing.T) {
 	path, _ := withSeedFile(t)
 	setRootKeyPath(t, path)
 
-	// initialRootPK is a key that differs from what's on disk; every refresh
-	// attempt must fail the identity check and leave certState untouched.
 	otherPK, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen other: %v", err)
@@ -439,8 +434,8 @@ func TestRefreshLoopLogsErrorOnIdentityChange(t *testing.T) {
 	}
 }
 
-// TestRefreshLoopSkipsWhenNotNearExpiry asserts the loop is a no-op while the
-// current cert's remaining validity is above certRefreshThreshold.
+// TestRefreshLoopSkipsWhenNotNearExpiry asserts the loop is a no-op while
+// remaining validity is above certRefreshThreshold.
 func TestRefreshLoopSkipsWhenNotNearExpiry(t *testing.T) {
 	withInterval(t, &certCheckInterval, 5*time.Millisecond)
 	withInterval(t, &certRefreshThreshold, time.Minute)
@@ -449,7 +444,7 @@ func TestRefreshLoopSkipsWhenNotNearExpiry(t *testing.T) {
 	path, pk := withSeedFile(t)
 	setRootKeyPath(t, path)
 
-	// Expiry far beyond threshold: every tick must be a no-op.
+	// Expiry far beyond threshold
 	_, stSeed := newUnitCertState(t)
 	stSeed.expiry = time.Now().Add(time.Hour)
 	statePtr := &atomic.Pointer[certState]{}
