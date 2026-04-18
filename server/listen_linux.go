@@ -42,11 +42,14 @@ var reqBufPool = sync.Pool{
 var statsWorkerExits atomic.Uint64
 
 // listen starts one SO_REUSEPORT worker per CPU. Each worker owns its own
-// kernel socket and drives recvmmsg/sendmmsg batches.
-func listen(ctx context.Context, state *atomic.Pointer[certState], maxSize int, maxLatency time.Duration) error {
+// kernel socket and drives recvmmsg/sendmmsg batches. Batch vars are
+// snapshotted at entry so test mutations don't race in-flight reads.
+func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
 	numWorkers := runtime.NumCPU()
 	addr := net.JoinHostPort("::", strconv.Itoa(*port))
+	maxSize := batchMaxSize
+	maxLatency := batchMaxLatency
 
 	conns := make([]net.PacketConn, 0, numWorkers)
 	for i := range numWorkers {
@@ -58,12 +61,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState], maxSize int, 
 			return fmt.Errorf("binding worker %d: %w", i, err)
 		}
 		if udp, ok := c.(*net.UDPConn); ok {
-			if err := udp.SetReadBuffer(socketRecvBuffer); err != nil {
-				listenLog.Warn("setting UDP receive buffer failed",
-					zap.Int("requested", socketRecvBuffer),
-					zap.Error(err),
-				)
-			}
+			applyReadBuffer(listenLog.With(zap.Int("worker", i)), udp)
 		}
 		conns = append(conns, c)
 	}

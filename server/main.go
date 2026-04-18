@@ -40,8 +40,6 @@ var (
 	showVersion        = flag.Bool("version", false, "print version and exit")
 	keygen             = flag.String("keygen", "", "generate a root key pair and write the seed to the given path")
 	pubkey             = flag.String("pubkey", "", "derive and print the public key from an existing root key file")
-	batchMaxSize       = flag.Int("batch-max-size", 64, "max requests per signing batch (1 to disable)")
-	batchMaxLatency    = flag.Duration("batch-max-latency", 5*time.Millisecond, "max wait before signing an incomplete batch")
 	greaseRate         = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
 )
 
@@ -63,11 +61,17 @@ const (
 	maxPacketSize = 1472
 
 	// socketRecvBuffer is the kernel UDP receive buffer size per worker socket.
+	// Kernels silently cap this at their sysctl maximum (net.core.rmem_max on
+	// Linux, kern.ipc.maxsockbuf on BSD/Darwin); applyReadBuffer reads the
+	// value back and warns if the request was truncated.
 	socketRecvBuffer = 8 * 1024 * 1024
+)
 
-	// batchQueueSize is the capacity of the batcher channel; excess requests
-	// are dropped for backpressure.
-	batchQueueSize = 4096
+// Intentionally not exposed as flags: misconfigured values silently crater
+// throughput or tail latency. Declared as var so tests can adjust them.
+var (
+	batchMaxSize    = 256
+	batchMaxLatency = 1 * time.Millisecond
 )
 
 // Timer intervals declared as var so tests can shrink them.
@@ -207,15 +211,6 @@ func validateFlags() error {
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("-port %d out of range (must be 1-65535)", *port)
 	}
-	if *batchMaxSize < 1 {
-		return fmt.Errorf("-batch-max-size %d must be >= 1", *batchMaxSize)
-	}
-	if *batchMaxSize > batchQueueSize {
-		return fmt.Errorf("-batch-max-size %d must be <= %d", *batchMaxSize, batchQueueSize)
-	}
-	if *batchMaxLatency <= 0 {
-		return fmt.Errorf("-batch-max-latency %s must be > 0", *batchMaxLatency)
-	}
 	if *greaseRate < 0 || *greaseRate > 1 {
 		return fmt.Errorf("-grease-rate %v out of range (must be in [0, 1])", *greaseRate)
 	}
@@ -268,14 +263,13 @@ func main() {
 		zap.Int("port", *port),
 		zap.String("root_key", *rootKeySeedHexFile),
 		zap.Stringer("log_level", lvl),
-		zap.Int("batch_max_size", *batchMaxSize),
-		zap.Duration("batch_max_latency", *batchMaxLatency),
 		zap.Float64("grease_rate", *greaseRate),
 		zap.Object("tunables", zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
 			enc.AddInt("recv_buffer", socketRecvBuffer)
 			enc.AddInt("max_packet_size", maxPacketSize)
 			enc.AddInt("min_request_size", minRequestSize)
-			enc.AddInt("batch_queue_size", batchQueueSize)
+			enc.AddInt("batch_max_size", batchMaxSize)
+			enc.AddDuration("batch_max_latency", batchMaxLatency)
 			enc.AddDuration("radius", radius)
 			enc.AddDuration("cert_start_offset", certStartOffset)
 			enc.AddDuration("cert_end_offset", certEndOffset)
@@ -310,7 +304,7 @@ func main() {
 	go superviseLoop(ctx, certLog, "refreshLoop", func() { refreshLoop(ctx, certLog, state, initialRootPK) })
 	go superviseLoop(ctx, logger.Named("stats"), "statsLoop", func() { statsLoop(ctx, logger.Named("stats"), state) })
 
-	if err := listen(ctx, state, *batchMaxSize, *batchMaxLatency); err != nil {
+	if err := listen(ctx, state); err != nil {
 		logger.Fatal("running UDP server", zap.Error(err))
 	}
 }

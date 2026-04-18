@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-//go:build !linux
+//go:build unix && !linux
 
 package main
 
@@ -17,6 +17,11 @@ import (
 	"go.uber.org/zap"
 )
 
+// batchQueueSize is the capacity of the batcher channel; excess requests are
+// dropped for backpressure. Only used on this path — the Linux fast path
+// batches inline via recvmmsg without an intermediary channel.
+const batchQueueSize = 4096
+
 // bufPool recycles read buffers to reduce GC pressure under high packet rates.
 var bufPool = sync.Pool{
 	New: func() any {
@@ -26,20 +31,18 @@ var bufPool = sync.Pool{
 }
 
 // listen runs a single-socket UDP server with inline validation and a
-// channel-fed batcher. Linux builds use listen_linux.go instead.
-func listen(ctx context.Context, state *atomic.Pointer[certState], maxSize int, maxLatency time.Duration) error {
+// channel-fed batcher. Linux builds use listen_linux.go instead. Batch vars are
+// snapshotted at entry so test mutations don't race in-flight reads.
+func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
+	maxSize := batchMaxSize
+	maxLatency := batchMaxLatency
 
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
 	if err != nil {
 		return fmt.Errorf("starting UDP server: %w", err)
 	}
-	if err := conn.SetReadBuffer(socketRecvBuffer); err != nil {
-		listenLog.Warn("setting UDP receive buffer failed",
-			zap.Int("requested", socketRecvBuffer),
-			zap.Error(err),
-		)
-	}
+	applyReadBuffer(listenLog, conn)
 
 	batchCh := make(chan validatedRequest, batchQueueSize)
 

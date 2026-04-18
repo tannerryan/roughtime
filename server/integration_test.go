@@ -138,13 +138,11 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 	for range maxAttempts {
 		p := pickFreeUDPPort(t)
 		*port = p
-		// Snapshot tunables on the test goroutine to avoid racing a Cleanup
-		// reset against listen's read
-		maxSize := *batchMaxSize
-		maxLatency := *batchMaxLatency
+		// listen snapshots batchMaxSize/batchMaxLatency at entry, so tests can
+		// mutate them freely without racing in-flight reads
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
-		go func() { done <- listen(ctx, st, maxSize, maxLatency) }()
+		go func() { done <- listen(ctx, st) }()
 
 		// Retry on fast failure (e.g. EADDRINUSE from a pick/bind race)
 		select {
@@ -579,9 +577,9 @@ func TestListenMalformedPackets(t *testing.T) {
 // TestListenBatchLatencyFlush asserts that a single request against an
 // otherwise-idle server is served promptly via the batch latency timer path.
 func TestListenBatchLatencyFlush(t *testing.T) {
-	prevLatency := *batchMaxLatency
-	*batchMaxLatency = 20 * time.Millisecond
-	t.Cleanup(func() { *batchMaxLatency = prevLatency })
+	prevLatency := batchMaxLatency
+	batchMaxLatency = 20 * time.Millisecond
+	t.Cleanup(func() { batchMaxLatency = prevLatency })
 
 	p, rootPK := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -624,15 +622,15 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	if runtime.GOOS == "linux" {
 		t.Skip("incompatible with SO_REUSEPORT per-worker batching")
 	}
-	prevSize := *batchMaxSize
-	*batchMaxSize = 8
-	prevLatency := *batchMaxLatency
-	*batchMaxLatency = time.Hour // disable the timer
+	prevSize := batchMaxSize
+	batchMaxSize = 8
+	prevLatency := batchMaxLatency
+	batchMaxLatency = time.Hour // disable the timer
 	prevGrease := *greaseRate
 	*greaseRate = 0
 	t.Cleanup(func() {
-		*batchMaxSize = prevSize
-		*batchMaxLatency = prevLatency
+		batchMaxSize = prevSize
+		batchMaxLatency = prevLatency
 		*greaseRate = prevGrease
 	})
 

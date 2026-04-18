@@ -2860,6 +2860,42 @@ func TestMerkleNodeFirstConvention(t *testing.T) {
 	}
 }
 
+// TestMerkleCrossConventionRejected asserts a proof built under one Merkle
+// convention fails verification under the other.
+func TestMerkleCrossConventionRejected(t *testing.T) {
+	leaf0 := bytes.Repeat([]byte{0xaa}, 32)
+	leaf1 := bytes.Repeat([]byte{0xbb}, 32)
+	leaves := [][]byte{leaf0, leaf1}
+
+	nodeFirst := newMerkleTree(groupD08, leaves)
+	hashFirst := newMerkleTree(groupD14, leaves)
+
+	var indx0 [4]byte
+	binary.LittleEndian.PutUint32(indx0[:], 0)
+
+	nfResp := map[uint32][]byte{
+		TagINDX: indx0[:],
+		TagPATH: bytes.Join(nodeFirst.paths[0], nil),
+	}
+	if err := verifyMerkle(nfResp, leaf0, nodeFirst.rootHash, groupD08); err != nil {
+		t.Fatalf("node-first self-verify: %v", err)
+	}
+	if err := verifyMerkle(nfResp, leaf0, nodeFirst.rootHash, groupD14); !errors.Is(err, ErrMerkleMismatch) {
+		t.Fatalf("node-first proof under hash-first verifier: err=%v want ErrMerkleMismatch", err)
+	}
+
+	hfResp := map[uint32][]byte{
+		TagINDX: indx0[:],
+		TagPATH: bytes.Join(hashFirst.paths[0], nil),
+	}
+	if err := verifyMerkle(hfResp, leaf0, hashFirst.rootHash, groupD14); err != nil {
+		t.Fatalf("hash-first self-verify: %v", err)
+	}
+	if err := verifyMerkle(hfResp, leaf0, hashFirst.rootHash, groupD08); !errors.Is(err, ErrMerkleMismatch) {
+		t.Fatalf("hash-first proof under node-first verifier: err=%v want ErrMerkleMismatch", err)
+	}
+}
+
 // TestCreateRequestPaddingTag verifies that CreateRequest emits the correct
 // padding tag per wire group: PAD\xff for Google, PAD\0 for IETF drafts 01–07,
 // and ZZZZ for IETF drafts 08+.
@@ -4788,6 +4824,69 @@ func FuzzCreateRequestWithNonce(f *testing.F) {
 		}
 		if !bytes.Equal(parsed.Nonce, nonce) {
 			t.Fatal("nonce mismatch")
+		}
+	})
+}
+
+// TestNonceOffsetInRequest verifies that the returned offset points at the
+// request's NONC value for both framed and unframed inputs, and that malformed
+// or NONC-less inputs produce an error without panicking.
+func TestNonceOffsetInRequest(t *testing.T) {
+	nonce := bytes.Repeat([]byte{0x42}, 32)
+
+	framed, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, nil)
+	if err != nil {
+		t.Fatalf("CreateRequestWithNonce: %v", err)
+	}
+	off, err := NonceOffsetInRequest(framed)
+	if err != nil {
+		t.Fatalf("framed: %v", err)
+	}
+	if !bytes.Equal(framed[off:off+32], nonce) {
+		t.Fatalf("framed: slice at offset %d does not match nonce", off)
+	}
+
+	raw := framed[12:]
+	off, err = NonceOffsetInRequest(raw)
+	if err != nil {
+		t.Fatalf("unframed: %v", err)
+	}
+	if !bytes.Equal(raw[off:off+32], nonce) {
+		t.Fatalf("unframed: slice at offset %d does not match nonce", off)
+	}
+
+	noNONC, err := encode(map[uint32][]byte{TagPAD: make([]byte, 32)})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if _, err := NonceOffsetInRequest(noNONC); err == nil {
+		t.Fatal("expected error for message without NONC")
+	}
+
+	for _, bad := range [][]byte{nil, {}, {0x01}, {0x00, 0x00, 0x00}} {
+		if _, err := NonceOffsetInRequest(bad); err == nil {
+			t.Fatalf("expected error for malformed input %x", bad)
+		}
+	}
+}
+
+// FuzzNonceOffsetInRequest asserts NonceOffsetInRequest never panics on
+// arbitrary input, and that any reported offset lies strictly within the buffer
+// (the NONC value has at least one byte).
+func FuzzNonceOffsetInRequest(f *testing.F) {
+	if req, err := CreateRequestWithNonce([]Version{VersionDraft12}, bytes.Repeat([]byte{0xaa}, 32), nil); err == nil {
+		f.Add(req)
+		f.Add(req[12:])
+	}
+	f.Add([]byte{})
+	f.Add([]byte{0x01, 0x00, 0x00, 0x00})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		off, err := NonceOffsetInRequest(data)
+		if err != nil {
+			return
+		}
+		if off < 0 || off >= len(data) {
+			t.Fatalf("offset %d out of bounds (len=%d)", off, len(data))
 		}
 	})
 }

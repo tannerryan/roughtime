@@ -74,24 +74,6 @@ func TestValidateFlagsRejects(t *testing.T) {
 			*port = 70000
 			t.Cleanup(func() { *port = prev })
 		}, "-port"},
-		{"batch size zero", func(t *testing.T) {
-			setRootKeyPath(t, "/x")
-			prev := *batchMaxSize
-			*batchMaxSize = 0
-			t.Cleanup(func() { *batchMaxSize = prev })
-		}, "-batch-max-size"},
-		{"batch size over queue", func(t *testing.T) {
-			setRootKeyPath(t, "/x")
-			prev := *batchMaxSize
-			*batchMaxSize = batchQueueSize + 1
-			t.Cleanup(func() { *batchMaxSize = prev })
-		}, "-batch-max-size"},
-		{"batch latency zero", func(t *testing.T) {
-			setRootKeyPath(t, "/x")
-			prev := *batchMaxLatency
-			*batchMaxLatency = 0
-			t.Cleanup(func() { *batchMaxLatency = prev })
-		}, "-batch-max-latency"},
 		{"grease rate negative", func(t *testing.T) {
 			setRootKeyPath(t, "/x")
 			prev := *greaseRate
@@ -272,6 +254,22 @@ func TestProvisionCertificateKeyRejectsWrongSize(t *testing.T) {
 	_, _, _, _, err := provisionCertificateKey()
 	if err == nil || !strings.Contains(err.Error(), "seed has") {
 		t.Fatalf("provisionCertificateKey want size error, got %v", err)
+	}
+}
+
+// TestProvisionCertificateKeyRejectsSymlink asserts a symlink is refused even
+// when its target is a valid 0600 seed file.
+func TestProvisionCertificateKeyRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	target, _ := withSeedFile(t)
+	link := filepath.Join(dir, "link.hex")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	setRootKeyPath(t, link)
+	_, _, _, _, err := provisionCertificateKey()
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("provisionCertificateKey want symlink error, got %v", err)
 	}
 }
 

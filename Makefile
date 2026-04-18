@@ -11,6 +11,7 @@ FUZZ_TARGETS = \
     FuzzCreateReplies:./protocol/ \
     FuzzCreateRepliesBatch:./protocol/ \
     FuzzCreateRequestWithNonce:./protocol/ \
+    FuzzNonceOffsetInRequest:./protocol/ \
     FuzzDecodeTimestamp:./protocol/ \
     FuzzEncode:./protocol/ \
     FuzzExtractVersion:./protocol/ \
@@ -78,13 +79,18 @@ coverage-report: test-race-cover
 # Run all test variants (verbose + race + cover)
 test-all: test-verbose test-race test-cover
 
-# Run all fuzz targets sequentially (FUZZ_TIME=30s by default). Each entry
-# encodes name:pkg so the dispatch covers both ./protocol/ and ./server/.
+# Run all fuzz targets sequentially (FUZZ_TIME=30s by default). -run=^$ skips
+# regular tests so only the fuzz phase runs. Up to 3 attempts absorb the
+# upstream go-fuzz coordinator deadline-race flake; a real crash is written to
+# testdata/fuzz and replayed as a seed on retry, so genuine failures still
+# surface.
 fuzz:
 	@for entry in $(FUZZ_TARGETS); do \
 		name=$${entry%%:*}; pkg=$${entry#*:}; \
 		echo "=== fuzzing $$name ($$pkg, $(FUZZ_TIME)) ==="; \
-		go test -fuzz="^$${name}$$" -fuzztime=$(FUZZ_TIME) $$pkg || exit 1; \
+		for _ in 1 2 3; do \
+			go test -run='^$$' -fuzz="^$${name}$$" -fuzztime=$(FUZZ_TIME) $$pkg && break; \
+		done || exit 1; \
 	done
 
 # Run gofmt and goimports

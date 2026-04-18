@@ -13,7 +13,8 @@ server authenticity. This implementation covers Google-Roughtime and IETF drafts
 Note: Drafts 05–13 use node-first Merkle order; drafts 14–19 use hash-first
 (draft-16 reversed the convention, and the implementation follows the latest
 spec across the 14–19 range). Multi-request batches are therefore not strictly
-conformant to drafts 14–15. Single-request replies are unaffected.
+conformant to drafts 14–15 only (drafts 16–19 match). Single-request replies are
+unaffected.
 
 Interoperability testing is available at
 [ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
@@ -36,11 +37,15 @@ derive the public key from an existing seed file.
 
 The root key file must be mode `0600` or stricter.
 
-| Flag                 | Default | Description                                     |
-| -------------------- | ------- | ----------------------------------------------- |
-| `-batch-max-size`    | 64      | Maximum requests per signing batch              |
-| `-batch-max-latency` | 5ms     | Maximum wait before signing an incomplete batch |
-| `-grease-rate`       | 0.01    | Fraction of responses to grease (0 to disable)  |
+| Flag           | Default | Description                                    |
+| -------------- | ------- | ---------------------------------------------- |
+| `-grease-rate` | 0.01    | Fraction of responses to grease (0 to disable) |
+
+On Linux, the server binds one `SO_REUSEPORT` socket per CPU and each worker
+drains its own queue with `recvmmsg`/`sendmmsg`, batching up to 256 requests (or
+1ms, whichever comes first) per signing round. On other Unix systems it falls
+back to a single UDP socket feeding one batcher goroutine over a buffered
+channel, with the same 256/1ms batch window. Windows is not supported.
 
 ## Client
 

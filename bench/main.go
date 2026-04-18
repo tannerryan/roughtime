@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Command roughtime-bench is an end-to-end closed-loop UDP load generator for
-// the Roughtime server. Each worker owns one UDP socket, fires a well-formed
+// Command bench is an end-to-end closed-loop UDP load generator for the
+// Roughtime server. Each worker owns one UDP socket, fires a well-formed
 // request, waits for the reply, records the RTT, and repeats for the configured
 // duration. It reports throughput, latency percentiles, and an error breakdown.
 //
