@@ -27,8 +27,8 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
-// TestListenEndToEnd runs the listener against a real UDP socket and asserts
-// request/response counters advance and no panics are recorded.
+// TestListenEndToEnd verifies request/response counters advance and no panics
+// occur.
 func TestListenEndToEnd(t *testing.T) {
 	statsReceived.Store(0)
 	statsResponded.Store(0)
@@ -62,10 +62,10 @@ func TestListenEndToEnd(t *testing.T) {
 	}
 }
 
-// TestListenShutdownLeaksNoGoroutines verifies that no goroutines leak after a
-// clean context cancellation.
+// TestListenShutdownLeaksNoGoroutines verifies no goroutines leak after context
+// cancel.
 func TestListenShutdownLeaksNoGoroutines(t *testing.T) {
-	// Snapshot pre-existing goroutines so runtime workers are ignored
+	// ignore runtime workers
 	baseline := goleak.IgnoreCurrent()
 
 	statsReceived.Store(0)
@@ -93,9 +93,8 @@ func TestListenShutdownLeaksNoGoroutines(t *testing.T) {
 	}
 }
 
-// newTestCertState builds an in-memory certState wrapped in the atomic pointer
-// the listener expects. Returns the root public key for SRV hashing and reply
-// verification.
+// newTestCertState builds an in-memory certState and returns the root public
+// key.
 func newTestCertState(t *testing.T) (ed25519.PublicKey, *atomic.Pointer[certState]) {
 	t.Helper()
 	rootPK, rootSK, err := ed25519.GenerateKey(rand.Reader)
@@ -116,8 +115,7 @@ func newTestCertState(t *testing.T) (ed25519.PublicKey, *atomic.Pointer[certStat
 	return rootPK, st
 }
 
-// pickFreeUDPPort asks the kernel for an ephemeral UDP port, closes the socket,
-// and returns the number for the server under test to bind.
+// pickFreeUDPPort returns an ephemeral UDP port for the server to bind.
 func pickFreeUDPPort(t *testing.T) int {
 	t.Helper()
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6unspecified, Port: 0})
@@ -129,8 +127,7 @@ func pickFreeUDPPort(t *testing.T) int {
 	return p
 }
 
-// startListen picks a free UDP port and launches listen() on it, retrying on
-// bind failure in case the picked port is grabbed before listen() rebinds.
+// startListen launches listen() on a free port, retrying on bind races.
 func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, context.CancelFunc) {
 	t.Helper()
 	const maxAttempts = 5
@@ -138,13 +135,12 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 	for range maxAttempts {
 		p := pickFreeUDPPort(t)
 		*port = p
-		// listen snapshots batchMaxSize/batchMaxLatency at entry, so tests can
-		// mutate them freely without racing in-flight reads
+		// listen snapshots batchMaxSize/batchMaxLatency at entry
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() { done <- listen(ctx, st) }()
 
-		// Retry on fast failure (e.g. EADDRINUSE from a pick/bind race)
+		// retry on fast failure (e.g. EADDRINUSE)
 		select {
 		case err := <-done:
 			cancel()
@@ -158,8 +154,7 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 	return 0, nil, nil
 }
 
-// waitForServerReady polls the server with well-formed requests until one is
-// answered, so subsequent assertions do not race listen() startup.
+// waitForServerReady polls until the server answers, avoiding startup races.
 func waitForServerReady(t *testing.T, p int, rootPK ed25519.PublicKey) {
 	t.Helper()
 	versions := protocol.Supported()
@@ -188,8 +183,8 @@ func waitForServerReady(t *testing.T, p int, rootPK ed25519.PublicKey) {
 	t.Fatalf("server on port %d never answered", p)
 }
 
-// startServer launches listen() in a goroutine, resets server stats, and
-// registers a cleanup that cancels the context and waits for shutdown.
+// startServer resets stats, launches listen(), and registers a shutdown
+// cleanup.
 func startServer(t *testing.T) (int, ed25519.PublicKey) {
 	t.Helper()
 	statsReceived.Store(0)
@@ -217,9 +212,7 @@ func startServer(t *testing.T) (int, ed25519.PublicKey) {
 	return p, pk
 }
 
-// TestListenMixedVersionBatch interleaves Google-Roughtime and IETF draft-12
-// requests and verifies that each reply is signed for the requested version
-// (i.e. the server shards by wire group, not arrival order).
+// TestListenMixedVersionBatch verifies the server shards replies by wire group.
 func TestListenMixedVersionBatch(t *testing.T) {
 	p, rootPK := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -244,14 +237,13 @@ func TestListenMixedVersionBatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		// Greased replies legitimately fail verification; tolerate the default
-		// 1% rate rather than forcing grease-rate=0
+		// tolerate default 1% grease rate
 		if _, _, err := protocol.VerifyReply(vers, buf[:n], rootPK, nonce, req); err != nil && wantMatch {
 			t.Logf("verify (tolerable): %v", err)
 		}
 	}
 
-	// Alternate versions to force separate wire-group batches
+	// alternate versions to force separate wire-group batches
 	for i := 0; i < 8; i++ {
 		if i%2 == 0 {
 			sendAndExpect([]protocol.Version{protocol.VersionGoogle}, true)
@@ -261,14 +253,13 @@ func TestListenMixedVersionBatch(t *testing.T) {
 	}
 }
 
-// TestListenSRVMismatch verifies that the server ignores a request whose SRV
-// hash does not address this server's key (drafts 10+ §5.1). The client should
-// see a read timeout.
+// TestListenSRVMismatch verifies the server ignores requests with a wrong SRV
+// hash.
 func TestListenSRVMismatch(t *testing.T) {
 	p, rootPK := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
 
-	// Forge an SRV for a different root key
+	// forge SRV for a different root key
 	_, otherSK, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen other key: %v", err)
@@ -300,9 +291,7 @@ func TestListenSRVMismatch(t *testing.T) {
 	}
 }
 
-// TestListenAmplificationDrop sends a minimum-size (1024-byte) IETF request and
-// asserts the server either drops or replies with at most the request size
-// (draft-12 §9 amplification cap).
+// TestListenAmplificationDrop verifies replies are bounded by request size.
 func TestListenAmplificationDrop(t *testing.T) {
 	p, rootPK := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -333,8 +322,7 @@ func TestListenAmplificationDrop(t *testing.T) {
 	}
 }
 
-// TestListenConcurrentBatches stresses batching with concurrent senders and
-// verifies the server stays healthy (no panic, all requests counted).
+// TestListenConcurrentBatches stresses batching under concurrent senders.
 func TestListenConcurrentBatches(t *testing.T) {
 	p, rootPK := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -352,7 +340,7 @@ func TestListenConcurrentBatches(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Drain the last inflight batch before cleanup cancels the context
+	// drain last inflight batch before cleanup cancels the context
 	time.Sleep(50 * time.Millisecond)
 
 	if got := statsReceived.Load(); got < senders*perSender {
@@ -363,8 +351,8 @@ func TestListenConcurrentBatches(t *testing.T) {
 	}
 }
 
-// TestListenNoncInSREPSingletons exercises draft-01/02 requests (NONC inside
-// SREP) which must be signed individually rather than batched.
+// TestListenNoncInSREPSingletons verifies draft-01/02 NONC-in-SREP requests
+// sign individually.
 func TestListenNoncInSREPSingletons(t *testing.T) {
 	prevGrease := *greaseRate
 	*greaseRate = 0
@@ -419,8 +407,8 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 	}
 }
 
-// TestListenUndersizeRequestDropped verifies that requests shorter than 1024
-// bytes are dropped without reply (draft-12 §5 padding requirement).
+// TestListenUndersizeRequestDropped verifies sub-1024 byte requests are
+// dropped.
 func TestListenUndersizeRequestDropped(t *testing.T) {
 	p, _ := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -431,7 +419,7 @@ func TestListenUndersizeRequestDropped(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Well-formed but tiny: NONC with 32 zero bytes
+	// well-formed but tiny: NONC with 32 zero bytes
 	nonce := make([]byte, 32)
 	var tagCount [4]byte
 	binary.LittleEndian.PutUint32(tagCount[:], 1)
@@ -451,8 +439,7 @@ func TestListenUndersizeRequestDropped(t *testing.T) {
 	}
 }
 
-// TestListenAllVersions sends a single-version request for each supported
-// version and confirms the reply verifies, exercising every wire-group branch.
+// TestListenAllVersions verifies every wire-group branch round-trips correctly.
 func TestListenAllVersions(t *testing.T) {
 	prevGrease := *greaseRate
 	*greaseRate = 0
@@ -463,6 +450,10 @@ func TestListenAllVersions(t *testing.T) {
 	srv := protocol.ComputeSRV(rootPK)
 
 	for _, v := range protocol.Supported() {
+		// PQ wire versions are TCP-only
+		if protocol.SchemeSignatureSize(v) != ed25519.SignatureSize {
+			continue
+		}
 		t.Run(v.String(), func(t *testing.T) {
 			conn, err := net.DialUDP("udp", nil, addr)
 			if err != nil {
@@ -493,9 +484,8 @@ func TestListenAllVersions(t *testing.T) {
 	}
 }
 
-// TestListenGreaseAlwaysFails sets -grease-rate to 1.0 so every reply is
-// greased. Modes 0-2 must fail verification; mode 3 is spec-valid and may still
-// verify, so a majority-failure threshold is used.
+// TestListenGreaseAlwaysFails verifies grease at rate 1.0 fails majority of
+// replies.
 func TestListenGreaseAlwaysFails(t *testing.T) {
 	prevGrease := *greaseRate
 	*greaseRate = 1.0
@@ -532,14 +522,14 @@ func TestListenGreaseAlwaysFails(t *testing.T) {
 			passed++
 		}
 	}
-	// Require at least half to fail to confirm the grease path fires
+	// require majority failure to confirm grease path fires
 	if failed < 16 {
 		t.Fatalf("grease path not exercised: failed=%d passed=%d (want failed>=16 at grease-rate=1.0)", failed, passed)
 	}
 }
 
-// TestListenMalformedPackets sends malformed 1024-byte packets and asserts the
-// server drops each without panic or reply.
+// TestListenMalformedPackets verifies malformed packets are dropped without
+// panic.
 func TestListenMalformedPackets(t *testing.T) {
 	p, _ := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -574,8 +564,8 @@ func TestListenMalformedPackets(t *testing.T) {
 	}
 }
 
-// TestListenBatchLatencyFlush asserts that a single request against an
-// otherwise-idle server is served promptly via the batch latency timer path.
+// TestListenBatchLatencyFlush verifies the batch latency timer flushes a single
+// request.
 func TestListenBatchLatencyFlush(t *testing.T) {
 	prevLatency := batchMaxLatency
 	batchMaxLatency = 20 * time.Millisecond
@@ -615,9 +605,8 @@ func TestListenBatchLatencyFlush(t *testing.T) {
 	}
 }
 
-// TestListenBatchMaxSizeFlush exercises the size-triggered flush path using a
-// single client socket. Skipped on Linux because SO_REUSEPORT fan-out spreads
-// requests across workers and no single worker reaches batchMaxSize.
+// TestListenBatchMaxSizeFlush verifies the size-triggered flush path; skipped
+// on Linux SO_REUSEPORT.
 func TestListenBatchMaxSizeFlush(t *testing.T) {
 	if runtime.GOOS == "linux" {
 		t.Skip("incompatible with SO_REUSEPORT per-worker batching")
@@ -625,7 +614,7 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	prevSize := batchMaxSize
 	batchMaxSize = 8
 	prevLatency := batchMaxLatency
-	batchMaxLatency = time.Hour // disable the timer
+	batchMaxLatency = time.Hour // disable timer
 	prevGrease := *greaseRate
 	*greaseRate = 0
 	t.Cleanup(func() {
@@ -639,14 +628,14 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	srv := protocol.ComputeSRV(rootPK)
 	versions := []protocol.Version{protocol.VersionDraft12}
 
-	// Single socket ensures SO_REUSEPORT hashes all requests to one worker.
+	// single socket pins SO_REUSEPORT to one worker
 	const n = 16 // two full-size batches
 	c, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close()
-	// Enlarge receive buffer so queued replies are not dropped by a small rmem
+	// enlarge rcvbuf so queued replies are not dropped
 	_ = c.SetReadBuffer(1 << 20)
 
 	nonces := make([][]byte, n)
@@ -665,7 +654,7 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 			t.Fatalf("write %d: %v", i, err)
 		}
 	}
-	// Responses may arrive in any order; match each reply by nonce
+	// match replies by nonce (any order)
 	buf := make([]byte, 1500)
 	seen := make(map[int]bool)
 	for range n {
@@ -691,8 +680,8 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	}
 }
 
-// sendAndVerify fires n closed-loop requests against the server. Verification
-// errors are tolerated because grease is on by default.
+// sendAndVerify fires n closed-loop requests; verify failures tolerated under
+// default grease.
 func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 	t.Helper()
 	versions := protocol.Supported()
@@ -719,7 +708,7 @@ func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}
-		// Verification failures are tolerated under default -grease-rate=0.01
+		// tolerate default -grease-rate=0.01
 		_, _, _ = protocol.VerifyReply(versions, buf[:m], rootPK, nonce, req)
 	}
 }

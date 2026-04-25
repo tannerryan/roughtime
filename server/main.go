@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Command roughtime is a UDP Roughtime server that responds with signed
-// timestamps and refreshes its online signing certificate before expiry.
+// Command roughtime is a Roughtime server. It serves Ed25519 over UDP/TCP and
+// the experimental ML-DSA-44 extension over TCP. Run with -h for flags.
 package main
 
 import (
@@ -21,10 +21,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"filippo.io/mldsa"
 	"github.com/tannerryan/roughtime/internal/version"
 	"github.com/tannerryan/roughtime/protocol"
 	"go.uber.org/zap"
@@ -34,70 +36,64 @@ import (
 var logger *zap.Logger
 
 var (
-	port               = flag.Int("port", 2002, "port to listen on")
-	rootKeySeedHexFile = flag.String("root-key-file", "", "path to file containing hex-encoded root private key seed")
-	logLevel           = flag.String("log-level", "info", "log level (debug, info, warn, error)")
-	showVersion        = flag.Bool("version", false, "print version and exit")
-	keygen             = flag.String("keygen", "", "generate a root key pair and write the seed to the given path")
-	pubkey             = flag.String("pubkey", "", "derive and print the public key from an existing root key file")
-	greaseRate         = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
+	port                 = flag.Int("port", 2002, "port to listen on")
+	rootKeySeedHexFile   = flag.String("root-key-file", "", "path to file containing hex-encoded Ed25519 root private key seed")
+	pqRootKeySeedHexFile = flag.String("pq-root-key-file", "", "path to file containing hex-encoded ML-DSA-44 root private key seed")
+	logLevel             = flag.String("log-level", "info", "log level (debug, info, warn, error)")
+	showVersion          = flag.Bool("version", false, "print version and exit")
+	keygen               = flag.String("keygen", "", "generate an Ed25519 root key pair and write the seed to the given path")
+	pubkey               = flag.String("pubkey", "", "derive and print the Ed25519 public key from an existing root key file")
+	pqKeygen             = flag.String("pq-keygen", "", "generate an ML-DSA-44 root key pair and write the seed to the given path")
+	pqPubkey             = flag.String("pq-pubkey", "", "derive and print the ML-DSA-44 public key from an existing PQ root key file")
+	greaseRate           = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
+)
+
+// Seed-file headers bind a seed to its scheme. Ed25519 files still accept
+// legacy bare hex; PQ files must carry the header.
+const (
+	ed25519SeedHeader = "roughtime-ed25519-seed-v1"
+	mldsa44SeedHeader = "roughtime-mldsa44-seed-v1"
 )
 
 const (
-	// radius is the Roughtime uncertainty radius (drafts 10+ §5).
+	// Roughtime uncertainty radius (drafts 10+)
 	radius = 3 * time.Second
 
-	// minRequestSize is the minimum accepted on-the-wire request size.
+	// minimum accepted on-the-wire request size
 	minRequestSize = 1024
 
-	// certStartOffset is how far before now the certificate validity begins.
+	// certificate validity window relative to now
 	certStartOffset = -6 * time.Hour
+	certEndOffset   = 18 * time.Hour
 
-	// certEndOffset is how far after now the certificate validity ends.
-	certEndOffset = 18 * time.Hour
-
-	// maxPacketSize sizes the UDP read buffer to the IPv4 Ethernet MTU payload
-	// (1500 - 20 IP - 8 UDP).
+	// IPv4 Ethernet MTU payload (1500 - 20 IP - 8 UDP)
 	maxPacketSize = 1472
 
-	// socketRecvBuffer is the kernel UDP receive buffer size per worker socket.
-	// Kernels silently cap this at their sysctl maximum (net.core.rmem_max on
-	// Linux, kern.ipc.maxsockbuf on BSD/Darwin); applyReadBuffer reads the
-	// value back and warns if the request was truncated.
+	// kernel UDP receive buffer per worker socket; capped silently by the
+	// kernel sysctl maximum, applyReadBuffer warns on truncation
 	socketRecvBuffer = 8 * 1024 * 1024
 )
 
-// Intentionally not exposed as flags: misconfigured values silently crater
-// throughput or tail latency. Declared as var so tests can adjust them.
+// Not exposed as flags; misconfiguration craters throughput or latency. var so
+// tests can adjust.
 var (
 	batchMaxSize    = 256
 	batchMaxLatency = 1 * time.Millisecond
 )
 
-// Timer intervals declared as var so tests can shrink them.
+// Timer intervals; var so tests can shrink them.
 var (
-	// certRefreshThreshold is the remaining validity at which a new certificate
-	// is provisioned.
 	certRefreshThreshold = 3 * time.Hour
-
-	// certCheckInterval is how often the refresh loop checks certificate
-	// expiry.
-	certCheckInterval = 15 * time.Minute
-
-	// refreshRetryCooldown is the minimum delay between failed refresh
-	// attempts.
+	certCheckInterval    = 15 * time.Minute
 	refreshRetryCooldown = 5 * time.Minute
+	statsInterval        = 60 * time.Second
 
-	// statsInterval is how often the periodic stats log line is emitted.
-	statsInterval = 60 * time.Second
-
-	// certWipeGrace is the delay before zeroing a rotated-out certificate's
-	// online signing key, covering any in-flight signing operations that loaded
-	// the previous certState before the swap.
+	// delay before zeroing a rotated-out certificate's online signing key, to
+	// cover signing operations that loaded the previous certState before swap
 	certWipeGrace = 5 * time.Second
 )
 
-// Server-wide counters read by the stats loop and the shutdown log.
+// Server-wide counters read by stats loop and shutdown log
 var (
 	statsReceived    atomic.Uint64
 	statsResponded   atomic.Uint64
@@ -109,14 +105,14 @@ var (
 )
 
 // certState holds the current online certificate, its expiry, and the
-// precomputed SRV hash of the long-term root key. Swapped atomically.
+// precomputed SRV hash of the long-term root key; swapped atomically.
 type certState struct {
 	cert    *protocol.Certificate
 	expiry  time.Time
 	srvHash []byte
 }
 
-// validatedRequest is a parsed request ready for batch signing. bufPtr, when
+// validatedRequest is a parsed request ready for batch signing; bufPtr, when
 // non-nil, must be returned to the pool after signing.
 type validatedRequest struct {
 	req         protocol.Request
@@ -138,22 +134,10 @@ type readyReply struct {
 	bytes []byte
 }
 
-// generateKeypair generates a root Ed25519 key pair, writes the hex-encoded
-// seed to path with mode 0600, and prints the public key to stdout. The seed
-// file is created with O_EXCL|O_NOFOLLOW to avoid overwriting an existing file
-// or following a symlink planted between an existence check and the write.
-func generateKeypair(path string) error {
-	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
-		return fmt.Errorf("reading entropy: %w", err)
-	}
-	defer clear(seed)
-
-	sk := ed25519.NewKeyFromSeed(seed)
-	defer clear(sk)
-	pk := sk.Public().(ed25519.PublicKey)
-
-	encoded := []byte(hex.EncodeToString(seed) + "\n")
+// writeSeedFile writes header + hex(seed) to path mode 0600 with
+// O_EXCL|O_NOFOLLOW to refuse existing files and symlink races.
+func writeSeedFile(path, header string, seed []byte) error {
+	encoded := []byte(header + "\n" + hex.EncodeToString(seed) + "\n")
 	defer clear(encoded)
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
@@ -170,6 +154,25 @@ func generateKeypair(path string) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("closing seed file %s: %w", path, err)
 	}
+	return nil
+}
+
+// generateKeypair generates an Ed25519 root key pair, writes the headered seed
+// to path, and prints the public key.
+func generateKeypair(path string) error {
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return fmt.Errorf("reading entropy: %w", err)
+	}
+	defer clear(seed)
+
+	sk := ed25519.NewKeyFromSeed(seed)
+	defer clear(sk)
+	pk := sk.Public().(ed25519.PublicKey)
+
+	if err := writeSeedFile(path, ed25519SeedHeader, seed); err != nil {
+		return err
+	}
 
 	fmt.Printf("Seed written to: %s\n", path)
 	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
@@ -177,22 +180,41 @@ func generateKeypair(path string) error {
 	return nil
 }
 
-// derivePublicKey reads an existing root key seed and prints the public key.
+// generatePQKeypair generates an ML-DSA-44 root key pair, writes the headered
+// seed to path, and prints the public key.
+func generatePQKeypair(path string) error {
+	sk, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		return fmt.Errorf("generating ML-DSA-44 key: %w", err)
+	}
+	seed := sk.Bytes()
+	defer clear(seed)
+	pk := sk.PublicKey().Bytes()
+
+	if err := writeSeedFile(path, mldsa44SeedHeader, seed); err != nil {
+		return err
+	}
+
+	fmt.Printf("Seed written to: %s\n", path)
+	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
+	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	return nil
+}
+
+// derivePublicKey reads an Ed25519 root seed and prints the public key; accepts
+// headered or legacy bare-hex format.
 func derivePublicKey(path string) error {
-	seedHex, err := os.ReadFile(filepath.Clean(path))
+	raw, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", path, err)
 	}
-	defer clear(seedHex)
+	defer clear(raw)
 
-	seed, err := hex.DecodeString(string(bytes.TrimSpace(seedHex)))
+	seed, err := parseSeed(raw, path, ed25519SeedHeader, "", ed25519.SeedSize, true)
 	if err != nil {
-		return fmt.Errorf("decoding seed: %w", err)
+		return err
 	}
 	defer clear(seed)
-	if len(seed) != ed25519.SeedSize {
-		return fmt.Errorf("seed has %d bytes, want %d", len(seed), ed25519.SeedSize)
-	}
 
 	sk := ed25519.NewKeyFromSeed(seed)
 	defer clear(sk)
@@ -203,10 +225,105 @@ func derivePublicKey(path string) error {
 	return nil
 }
 
-// validateFlags checks CLI flags are within permitted ranges.
+// derivePQPublicKey reads an ML-DSA-44 root seed and prints the public key; the
+// header is required (no legacy bare-hex format).
+func derivePQPublicKey(path string) error {
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
+	}
+	defer clear(raw)
+
+	seed, err := parseSeed(raw, path, mldsa44SeedHeader, "PQ", mldsa.PrivateKeySize, false)
+	if err != nil {
+		return err
+	}
+	defer clear(seed)
+
+	sk, err := mldsa.NewPrivateKey(mldsa.MLDSA44(), seed)
+	if err != nil {
+		return fmt.Errorf("loading ML-DSA-44 key: %w", err)
+	}
+	pk := sk.PublicKey().Bytes()
+
+	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
+	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	return nil
+}
+
+// readPrivateKeyFile Lstats, opens with O_NOFOLLOW, and reads a
+// 0600-or-stricter seed file; role labels error messages (e.g. "root", "PQ
+// root").
+func readPrivateKeyFile(path, role string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s key file: %w", role, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%s key file %s is a symlink (refusing to follow)", role, path)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s key file %s is not a regular file", role, path)
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return nil, fmt.Errorf("%s key file %s has insecure mode %#o (must be 0600 or stricter)", role, path, mode)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening %s signing key file: %w", role, err)
+	}
+	raw, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return nil, fmt.Errorf("reading %s signing key file: %w", role, err)
+	}
+	return raw, nil
+}
+
+// parseSeed extracts a hex-encoded seed from raw; with acceptBareHex, missing
+// header is treated as legacy bare hex. label (may be empty) prefixes errors;
+// path is echoed in every error.
+func parseSeed(raw []byte, path, header, label string, wantLen int, acceptBareHex bool) ([]byte, error) {
+	noun := "seed"
+	if label != "" {
+		noun = label + " seed"
+	}
+	trimmed := bytes.TrimSpace(raw)
+	// require whitespace/EOF after header so v10 doesn't accept v1
+	hasHeader := false
+	var afterHeader []byte
+	if bytes.HasPrefix(trimmed, []byte(header)) {
+		rest := trimmed[len(header):]
+		if len(rest) == 0 || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n' || rest[0] == '\r' {
+			hasHeader = true
+			afterHeader = rest
+		}
+	}
+	var hexPart []byte
+	switch {
+	case hasHeader:
+		hexPart = bytes.TrimSpace(afterHeader)
+	case acceptBareHex:
+		hexPart = trimmed
+	default:
+		return nil, fmt.Errorf("%s file %s missing %q header", noun, path, header)
+	}
+	seed, err := hex.DecodeString(string(hexPart))
+	if err != nil {
+		return nil, fmt.Errorf("decoding %s in %s: %w", noun, path, err)
+	}
+	if len(seed) != wantLen {
+		clear(seed)
+		return nil, fmt.Errorf("%s in %s has %d bytes, want %d", noun, path, len(seed), wantLen)
+	}
+	return seed, nil
+}
+
+// validateFlags checks CLI flags; at least one of -root-key-file or
+// -pq-root-key-file must be set, and both enables dual-stack.
 func validateFlags() error {
-	if *rootKeySeedHexFile == "" {
-		return fmt.Errorf("usage: roughtime -root-key-file <path> [-port <port>] [-log-level <level>]")
+	if *rootKeySeedHexFile == "" && *pqRootKeySeedHexFile == "" {
+		return fmt.Errorf("usage: roughtime -root-key-file <path> [-pq-root-key-file <path>] [-port <port>] [-log-level <level>]")
 	}
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("-port %d out of range (must be 1-65535)", *port)
@@ -230,9 +347,23 @@ func main() {
 		}
 		return
 	}
+	if *pqKeygen != "" {
+		if err := generatePQKeypair(*pqKeygen); err != nil {
+			fmt.Fprintf(os.Stderr, "pq-keygen: %s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *pubkey != "" {
 		if err := derivePublicKey(*pubkey); err != nil {
 			fmt.Fprintf(os.Stderr, "pubkey: %s\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *pqPubkey != "" {
+		if err := derivePQPublicKey(*pqPubkey); err != nil {
+			fmt.Fprintf(os.Stderr, "pq-pubkey: %s\n", err)
 			os.Exit(1)
 		}
 		return
@@ -253,7 +384,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "creating logger: %s\n", err)
 		os.Exit(1)
 	}
-	// zap.Sync returns ENOTTY on a terminal stderr (uber-go/zap#328)
+	// zap.Sync returns ENOTTY on terminal stderr; ignore
 	defer func() { _ = base.Sync() }()
 	logger = base.Named("roughtime")
 
@@ -262,6 +393,7 @@ func main() {
 		zap.Int("pid", os.Getpid()),
 		zap.Int("port", *port),
 		zap.String("root_key", *rootKeySeedHexFile),
+		zap.String("pq_root_key", *pqRootKeySeedHexFile),
 		zap.Stringer("log_level", lvl),
 		zap.Float64("grease_rate", *greaseRate),
 		zap.Object("tunables", zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
@@ -280,76 +412,105 @@ func main() {
 		})),
 	)
 
-	certLog := logger.Named("cert")
-	cert, onlinePK, rootPK, expiry, err := provisionCertificateKey()
-	if err != nil {
-		certLog.Fatal("provisioning initial certificate", zap.Error(err))
-	}
-	certLog.Info("provisioned initial certificate",
-		zap.String("online_pubkey", hex.EncodeToString(onlinePK)),
-		zap.String("root_pubkey", hex.EncodeToString(rootPK)),
-		zap.Time("expiry", expiry),
-		zap.Duration("validity", time.Until(expiry)),
-	)
-
-	state := &atomic.Pointer[certState]{}
-	state.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
-
-	// Captured so refreshLoop can detect a silent root-key change on disk
-	initialRootPK := append(ed25519.PublicKey(nil), rootPK...)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	go superviseLoop(ctx, certLog, "refreshLoop", func() { refreshLoop(ctx, certLog, state, initialRootPK) })
-	go superviseLoop(ctx, logger.Named("stats"), "statsLoop", func() { statsLoop(ctx, logger.Named("stats"), state) })
+	certLog := logger.Named("cert")
 
-	if err := listen(ctx, state); err != nil {
-		logger.Fatal("running UDP server", zap.Error(err))
+	var edState *atomic.Pointer[certState]
+	if *rootKeySeedHexFile != "" {
+		cert, onlinePK, rootPK, expiry, err := provisionCertificateKey()
+		if err != nil {
+			certLog.Fatal("provisioning initial Ed25519 certificate", zap.Error(err))
+		}
+		certLog.Info("provisioned initial Ed25519 certificate",
+			zap.String("online_pubkey", hex.EncodeToString(onlinePK)),
+			zap.String("root_pubkey", hex.EncodeToString(rootPK)),
+			zap.Time("expiry", expiry),
+			zap.Duration("validity", time.Until(expiry)),
+		)
+		edState = &atomic.Pointer[certState]{}
+		edState.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
+
+		// captured so refreshLoop detects silent on-disk root-key changes
+		initialRootPK := append(ed25519.PublicKey(nil), rootPK...)
+		go superviseLoop(ctx, certLog, "refreshLoop", func() { refreshLoop(ctx, certLog, edState, initialRootPK) })
+	}
+
+	var pqState *atomic.Pointer[certState]
+	if *pqRootKeySeedHexFile != "" {
+		cert, onlinePK, rootPK, expiry, err := provisionPQCertificateKey()
+		if err != nil {
+			certLog.Fatal("provisioning initial ML-DSA-44 certificate", zap.Error(err))
+		}
+		certLog.Info("provisioned initial ML-DSA-44 certificate",
+			zap.String("online_pubkey", hex.EncodeToString(onlinePK)),
+			zap.String("root_pubkey", hex.EncodeToString(rootPK)),
+			zap.Time("expiry", expiry),
+			zap.Duration("validity", time.Until(expiry)),
+		)
+		pqState = &atomic.Pointer[certState]{}
+		pqState.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
+
+		initialRootPK := append([]byte(nil), rootPK...)
+		go superviseLoop(ctx, certLog, "refreshLoopPQ", func() { refreshLoopPQ(ctx, certLog, pqState, initialRootPK) })
+	}
+
+	statsLog := logger.Named("stats")
+	go superviseLoop(ctx, statsLog, "statsLoop", func() { statsLoop(ctx, statsLog, edState, pqState) })
+
+	// UDP carries only Ed25519 (ML-DSA breaks the amplification budget); TCP
+	// carries both. A bind failure cancels the shared listener context so peers
+	// drain, then Fatal so the supervisor restarts.
+	listenerCtx, cancelListeners := context.WithCancel(ctx)
+	defer cancelListeners()
+	var listenerErr atomic.Pointer[error]
+	recordListenerErr := func(role string, err error) {
+		logger.Error(role+" listener exited with error", zap.Error(err))
+		wrapped := fmt.Errorf("%s listener: %w", role, err)
+		listenerErr.CompareAndSwap(nil, &wrapped)
+		cancelListeners()
+	}
+	var wg sync.WaitGroup
+	if edState != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := listen(listenerCtx, edState); err != nil {
+				recordListenerErr("UDP", err)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := listenTCP(listenerCtx, edState, pqState); err != nil {
+			recordListenerErr("TCP", err)
+		}
+	}()
+	wg.Wait()
+	if err := listenerErr.Load(); err != nil {
+		logger.Fatal("listener failed", zap.Error(*err))
 	}
 }
 
-// provisionCertificateKey reads the root key seed from disk and signs a fresh
-// online delegation valid from certStartOffset to certEndOffset. The seed and
-// derived private key are cleared before return.
+// provisionCertificateKey reads the Ed25519 root seed and signs a fresh online
+// delegation; seed and derived private key are cleared before return.
 func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed25519.PublicKey, time.Time, error) {
 	path := filepath.Clean(*rootKeySeedHexFile)
 
-	// Lstat rejects a symlinked key file
-	info, err := os.Lstat(path)
+	raw, err := readPrivateKeyFile(path, "root")
 	if err != nil {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("stat root key file: %w", err)
+		return nil, nil, nil, time.Time{}, err
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("root key file %s is a symlink (refusing to follow)", path)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("root key file %s is not a regular file", path)
-	}
-	if mode := info.Mode().Perm(); mode&0o077 != 0 {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("root key file %s has insecure mode %#o (must be 0600 or stricter)", path, mode)
-	}
+	defer clear(raw)
 
-	// O_NOFOLLOW closes the Lstat/open TOCTOU window
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	rootKeySeed, err := parseSeed(raw, path, ed25519SeedHeader, "root signing key", ed25519.SeedSize, true)
 	if err != nil {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("opening root signing key file: %w", err)
-	}
-	rootKeySeedHex, err := io.ReadAll(f)
-	_ = f.Close()
-	if err != nil {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("reading root signing key file: %w", err)
-	}
-	defer clear(rootKeySeedHex)
-
-	rootKeySeed, err := hex.DecodeString(string(bytes.TrimSpace(rootKeySeedHex)))
-	if err != nil {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("decoding root signing key seed: %w", err)
+		return nil, nil, nil, time.Time{}, err
 	}
 	defer clear(rootKeySeed)
-	if len(rootKeySeed) != ed25519.SeedSize {
-		return nil, nil, nil, time.Time{}, fmt.Errorf("root key seed has %d bytes, want %d", len(rootKeySeed), ed25519.SeedSize)
-	}
+
 	rootSK := ed25519.NewKeyFromSeed(rootKeySeed)
 	defer clear(rootSK)
 	rootPK := rootSK.Public().(ed25519.PublicKey)
@@ -367,8 +528,45 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
 }
 
+// provisionPQCertificateKey reads the ML-DSA-44 root seed and signs a fresh
+// online delegation; returns the encoded online and root public keys.
+func provisionPQCertificateKey() (*protocol.Certificate, []byte, []byte, time.Time, error) {
+	path := filepath.Clean(*pqRootKeySeedHexFile)
+
+	raw, err := readPrivateKeyFile(path, "PQ root")
+	if err != nil {
+		return nil, nil, nil, time.Time{}, err
+	}
+	defer clear(raw)
+
+	rootKeySeed, err := parseSeed(raw, path, mldsa44SeedHeader, "PQ root signing key", mldsa.PrivateKeySize, false)
+	if err != nil {
+		return nil, nil, nil, time.Time{}, err
+	}
+	defer clear(rootKeySeed)
+
+	rootSK, err := mldsa.NewPrivateKey(mldsa.MLDSA44(), rootKeySeed)
+	if err != nil {
+		return nil, nil, nil, time.Time{}, fmt.Errorf("loading PQ root signing key: %w", err)
+	}
+	rootPK := rootSK.PublicKey().Bytes()
+
+	onlineSK, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		return nil, nil, nil, time.Time{}, fmt.Errorf("generating PQ online signing key: %w", err)
+	}
+	onlinePK := onlineSK.PublicKey().Bytes()
+
+	now := time.Now()
+	cert, err := protocol.NewCertificatePQ(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
+	if err != nil {
+		return nil, nil, nil, time.Time{}, fmt.Errorf("generating PQ online certificate: %w", err)
+	}
+	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
+}
+
 // statsLoop emits a periodic summary of server activity until ctx is cancelled.
-func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState]) {
+func statsLoop(ctx context.Context, log *zap.Logger, edState, pqState *atomic.Pointer[certState]) {
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
 	log.Info("stats loop started", zap.Duration("interval", statsInterval))
@@ -392,7 +590,7 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 		if intervalBatches > 0 {
 			avgBatch = float64(bt-lastBatchTotal) / float64(intervalBatches)
 		}
-		log.Info("stats",
+		fields := []zap.Field{
 			zap.Uint64("received", r-lastReceived),
 			zap.Uint64("responded", s-lastResponded),
 			zap.Uint64("dropped", d-lastDropped),
@@ -400,8 +598,14 @@ func statsLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certS
 			zap.Uint64("batches", intervalBatches),
 			zap.Uint64("batch_errs", be-lastBatchErrs),
 			zap.Float64("avg_batch_size", avgBatch),
-			zap.Duration("cert_remaining", time.Until(state.Load().expiry)),
-		)
+		}
+		if edState != nil {
+			fields = append(fields, zap.Duration("cert_remaining", time.Until(edState.Load().expiry)))
+		}
+		if pqState != nil {
+			fields = append(fields, zap.Duration("pq_cert_remaining", time.Until(pqState.Load().expiry)))
+		}
+		log.Info("stats", fields...)
 		lastReceived, lastResponded, lastDropped, lastPanics = r, s, d, p
 		lastBatchCount, lastBatchTotal, lastBatchErrs = bc, bt, be
 	}
@@ -443,15 +647,31 @@ func superviseLoop(ctx context.Context, log *zap.Logger, where string, fn func()
 	}
 }
 
-// refreshLoop replaces the certificate as it approaches expiry, with a cooldown
-// between failed attempts. Refresh is rejected if the root public key on disk
-// no longer matches initialRootPK. Exits when ctx is cancelled.
+// refreshLoop replaces the Ed25519 certificate near expiry; refresh is rejected
+// if the root key on disk no longer matches initialRootPK.
 func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK ed25519.PublicKey) {
+	runRefreshLoop(ctx, log, "Ed25519", state, func() (*certState, []byte, error) {
+		return tryRefreshCert(initialRootPK)
+	})
+}
+
+// refreshLoopPQ is the ML-DSA-44 counterpart of refreshLoop; initialRootPK is
+// the encoded root public key captured at startup.
+func refreshLoopPQ(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK []byte) {
+	runRefreshLoop(ctx, log, "ML-DSA-44", state, func() (*certState, []byte, error) {
+		return tryRefreshCertPQ(initialRootPK)
+	})
+}
+
+// runRefreshLoop is the scheme-agnostic refresh driver; refresh returns a new
+// certState and the new online public key (logged only).
+func runRefreshLoop(ctx context.Context, log *zap.Logger, scheme string, state *atomic.Pointer[certState], refresh func() (*certState, []byte, error)) {
 	ticker := time.NewTicker(certCheckInterval)
 	defer ticker.Stop()
 	var lastAttempt time.Time
 
 	log.Info("certificate refresh loop started",
+		zap.String("scheme", scheme),
 		zap.Duration("check_interval", certCheckInterval),
 		zap.Duration("refresh_threshold", certRefreshThreshold),
 		zap.Duration("retry_cooldown", refreshRetryCooldown),
@@ -475,17 +695,18 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 		lastAttempt = now
 
 		log.Info("attempting certificate refresh",
+			zap.String("scheme", scheme),
 			zap.Time("current_expiry", cur.expiry),
 			zap.Duration("remaining", time.Until(cur.expiry)),
 		)
-		newState, newOnlinePK, err := tryRefreshCert(initialRootPK)
+		newState, newOnlinePK, err := refresh()
 		if err != nil {
 			remaining := time.Until(cur.expiry)
-			// Once remaining drops below 2 × cooldown, the next attempt may not
-			// land before expiry; fail the process so the supervisor can
-			// restart rather than serving an about-to-expire certificate
+			// below 2x cooldown the next attempt may miss expiry; fail so the
+			// supervisor restarts rather than serving an expiring cert
 			if remaining < 2*refreshRetryCooldown {
 				log.Fatal("certificate refresh failed near expiry; restart required",
+					zap.String("scheme", scheme),
 					zap.Error(err),
 					zap.Time("current_expiry", cur.expiry),
 					zap.Duration("remaining", remaining),
@@ -494,6 +715,7 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 			}
 			if ce := log.Check(zap.ErrorLevel, "certificate refresh failed"); ce != nil {
 				ce.Write(
+					zap.String("scheme", scheme),
 					zap.Error(err),
 					zap.Time("current_expiry", cur.expiry),
 					zap.Duration("remaining", remaining),
@@ -506,6 +728,7 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 		oldCert := cur.cert
 		time.AfterFunc(certWipeGrace, oldCert.Wipe)
 		log.Info("certificate refreshed",
+			zap.String("scheme", scheme),
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),
 			zap.Time("previous_expiry", cur.expiry),
 			zap.Time("expiry", newState.expiry),
@@ -514,8 +737,8 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 	}
 }
 
-// tryRefreshCert reads the root key from disk, rejects any root public key
-// change, and returns a fresh certState plus the new online public key.
+// tryRefreshCert reads the Ed25519 root key, rejects any root-key change, and
+// returns a fresh certState plus the new online public key.
 func tryRefreshCert(initialRootPK ed25519.PublicKey) (*certState, ed25519.PublicKey, error) {
 	newCert, newOnlinePK, newRootPK, newExpiry, err := provisionCertificateKey()
 	if err != nil {
@@ -528,8 +751,22 @@ func tryRefreshCert(initialRootPK ed25519.PublicKey) (*certState, ed25519.Public
 	return &certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
 }
 
-// validateRequest parses a request, validates SRV, and negotiates a version.
-// bufPtr, when non-nil, is stored on the returned struct for pool return.
+// tryRefreshCertPQ reads the ML-DSA-44 root key, rejects any root-key change,
+// and returns a fresh certState plus the encoded new online public key.
+func tryRefreshCertPQ(initialRootPK []byte) (*certState, []byte, error) {
+	newCert, newOnlinePK, newRootPK, newExpiry, err := provisionPQCertificateKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !bytes.Equal(newRootPK, initialRootPK) {
+		return nil, nil, fmt.Errorf("PQ root public key on disk has changed since startup (want %s, got %s); restart required",
+			hex.EncodeToString(initialRootPK), hex.EncodeToString(newRootPK))
+	}
+	return &certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
+}
+
+// validateRequest parses a request, validates SRV, and negotiates a version;
+// bufPtr (when non-nil) is stored on the returned struct for pool return.
 func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, bool) {
 	req, err := protocol.ParseRequest(requestBytes)
 	if err != nil {
@@ -542,14 +779,14 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 		}
 		return validatedRequest{}, false
 	}
-	// Drafts 10+ §5.1: reject when SRV does not address a long-term key
+	// drafts 10+: reject when SRV does not address a long-term key
 	if req.SRV != nil && !bytes.Equal(req.SRV, st.srvHash) {
 		if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer))
 		}
 		return validatedRequest{}, false
 	}
-	responseVer, err := protocol.SelectVersion(req.Versions, len(req.Nonce))
+	responseVer, err := protocol.SelectVersion(req.Versions, len(req.Nonce), protocol.ServerPreferenceEd25519)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "version negotiation failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
@@ -566,15 +803,14 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 }
 
 // signAndBuildReplies signs a homogeneous batch and returns grease-applied,
-// amplification-filtered replies. Callers record statsResponded after writing;
-// this helper updates only batch-level counters.
+// amplification-filtered replies; updates only batch-level counters.
 func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, items []validatedRequest) []readyReply {
 	reqs := make([]protocol.Request, len(items))
 	for i := range items {
 		reqs[i] = items[i].req
 	}
 
-	// Zero midpoint defers timestamping to CreateReplies
+	// zero midpoint defers timestamping to CreateReplies
 	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
 	if err != nil {
 		statsBatchErrs.Add(1)
@@ -591,8 +827,8 @@ func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, i
 
 	out := make([]readyReply, 0, len(replies))
 	for i, reply := range replies {
-		// Grease (§7); fall back to the ungreased reply if grease would push
-		// the packet past the amplification budget
+		// fall back to ungreased if grease would exceed the amplification
+		// budget
 		if *greaseRate > 0 && mrand.Float64() < *greaseRate {
 			if greased := protocol.Grease(reply, ver); len(greased) <= items[i].requestSize {
 				reply = greased
@@ -602,7 +838,7 @@ func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, i
 			}
 		}
 
-		// Amplification protection (drafts 08+ §9/§13)
+		// amplification protection: reply MUST NOT exceed request size on UDP
 		if len(reply) > items[i].requestSize {
 			if ce := log.Check(zap.WarnLevel, "amplification-blocked response"); ce != nil {
 				ce.Write(

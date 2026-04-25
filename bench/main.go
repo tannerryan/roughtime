@@ -1,17 +1,16 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Command bench is an end-to-end closed-loop UDP load generator for the
-// Roughtime server. Each worker owns one UDP socket, fires a well-formed
-// request, waits for the reply, records the RTT, and repeats for the configured
-// duration. It reports throughput, latency percentiles, and an error breakdown.
+// Command bench is a closed-loop load generator for the Roughtime server. Each
+// worker owns one socket, fires a request, waits for the reply, records the
+// RTT, and repeats. It reports throughput, latency percentiles, and an error
+// breakdown.
 //
-// With -verify, every reply is signature-checked against the root public key.
-// Verification failures are reported as "verify fail" — this bucket includes
-// both grease (RFC §7 deliberately malformed replies from an honest server) and
-// genuine faults, since the wire carries no signal to tell them apart.
-// Verification adds ~100µs/reply of client CPU, which caps throughput before
-// the server does — leave it off for pure throughput numbers.
+// With -verify, replies are signature-checked. The "verify fail" bucket lumps
+// grease and genuine faults together since the wire cannot distinguish them.
+//
+// Key length selects the suite: 32 bytes Ed25519, 1312 bytes ML-DSA-44
+// (experimental, always TCP). -tcp forces TCP for Ed25519.
 //
 // Example:
 //
@@ -20,14 +19,12 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"os"
@@ -39,39 +36,33 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/internal/version"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
 var (
 	addr        = flag.String("addr", "127.0.0.1:2002", "server host:port")
-	pubkey      = flag.String("pubkey", "", "Ed25519 root public key (base64 or hex)")
+	pubkey      = flag.String("pubkey", "", "root public key (base64 or hex); 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
+	useTCP      = flag.Bool("tcp", false, "use TCP transport; ML-DSA-44 keys always use TCP")
 	workers     = flag.Int("workers", 64, "concurrent client sockets")
 	duration    = flag.Duration("duration", 10*time.Second, "measurement duration")
 	warmup      = flag.Duration("warmup", 2*time.Second, "warmup period before measurement (not counted)")
-	timeout     = flag.Duration("timeout", 500*time.Millisecond, "per-request UDP read/write timeout")
+	timeout     = flag.Duration("timeout", 500*time.Millisecond, "per-request read/write timeout")
 	verify      = flag.Bool("verify", false, "verify every reply's signature and Merkle proof (slower, client-bound)")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
-// ietfVersions is advertised in each request. Google-Roughtime is excluded so
-// the server exercises its batch-signing path.
-var ietfVersions = func() []protocol.Version {
-	s := protocol.Supported()
-	out := make([]protocol.Version, 0, len(s))
-	for _, v := range s {
-		if v != protocol.VersionGoogle {
-			out = append(out, v)
-		}
-	}
-	return out
-}()
+// maxTCPReply caps the TCP reply payload.
+const maxTCPReply = 16 * 1024
+
+// maxUDPReply bounds the UDP read buffer at one MTU.
+const maxUDPReply = 1500
 
 // reservoirSize caps per-worker latency samples (Algorithm R).
 const reservoirSize = 100_000
 
-// workerResult accumulates per-goroutine stats and is merged after the run.
-// errVerify aggregates grease and genuine verification failures.
+// workerResult accumulates per-goroutine stats.
 type workerResult struct {
 	latencies []time.Duration
 	received  uint64
@@ -92,52 +83,71 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Under -verify the bench is CPU-bound; cap default worker count to avoid
-	// oversubscription. Explicit -workers is always respected
+	// under -verify the bench is CPU-bound; cap default workers
 	if *verify && !flagSet("workers") {
 		if maxW := runtime.NumCPU() * 2; *workers > maxW {
 			*workers = maxW
 		}
 	}
 
-	rootPK, err := loadPubKey()
+	rootPK, err := roughtime.DecodePublicKey(*pubkey)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bench: %s\n", err)
+		os.Exit(1)
+	}
+	sch, err := roughtime.SchemeOfKey(rootPK)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench: %s\n", err)
 		os.Exit(1)
 	}
 	srv := protocol.ComputeSRV(rootPK)
 
-	raddr, err := net.ResolveUDPAddr("udp", *addr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bench: resolving %s: %s\n", *addr, err)
-		os.Exit(1)
+	versions := roughtime.VersionsForScheme(sch)
+	transport := "udp"
+	if sch == roughtime.SchemeMLDSA44 || *useTCP {
+		transport = "tcp"
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("roughtime-bench -> %s\n", raddr)
+	fmt.Printf("roughtime-bench -> %s (%s)\n", *addr, transport)
 	fmt.Printf("  workers=%d duration=%s warmup=%s timeout=%s verify=%t\n",
 		*workers, *duration, *warmup, *timeout, *verify)
 
-	// Warmup drives load without collecting samples so runtime effects settle
-	if *warmup > 0 {
-		warmCtx, warmCancel := context.WithTimeout(ctx, *warmup)
-		runWorkers(warmCtx, raddr, rootPK, srv, *workers, false)
-		warmCancel()
+	cfg := benchConfig{
+		addr:      *addr,
+		transport: transport,
+		rootPK:    rootPK,
+		srv:       srv,
+		versions:  versions,
+		timeout:   *timeout,
+		verify:    *verify,
 	}
 
-	measureCtx, measureCancel := context.WithTimeout(ctx, *duration)
-	defer measureCancel()
+	// run warmup and measurement in one pass so sockets stay open across the
+	// boundary
+	totalCtx, totalCancel := context.WithTimeout(ctx, *warmup+*duration)
+	defer totalCancel()
 	start := time.Now()
-	results := runWorkers(measureCtx, raddr, rootPK, srv, *workers, true)
-	elapsed := time.Since(start)
+	collectAfter := start.Add(*warmup)
+	results := runWorkers(totalCtx, cfg, *workers, collectAfter)
+	elapsed := max(time.Since(collectAfter), 0)
 
 	report(results, elapsed)
 }
 
-// flagSet reports whether the named flag was explicitly provided on the command
-// line.
+type benchConfig struct {
+	addr      string
+	transport string
+	rootPK    []byte
+	srv       []byte
+	versions  []protocol.Version
+	timeout   time.Duration
+	verify    bool
+}
+
+// flagSet reports whether name was set on the command line.
 func flagSet(name string) bool {
 	set := false
 	flag.Visit(func(f *flag.Flag) {
@@ -148,13 +158,15 @@ func flagSet(name string) bool {
 	return set
 }
 
-// validateFlags checks CLI flags are within permitted ranges.
 func validateFlags() error {
 	if *workers < 1 {
 		return fmt.Errorf("-workers %d must be >= 1", *workers)
 	}
 	if *duration <= 0 {
 		return fmt.Errorf("-duration %s must be > 0", *duration)
+	}
+	if *warmup < 0 {
+		return fmt.Errorf("-warmup %s must be >= 0", *warmup)
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout %s must be > 0", *timeout)
@@ -165,34 +177,9 @@ func validateFlags() error {
 	return nil
 }
 
-// loadPubKey decodes the root public key from the -pubkey flag.
-func loadPubKey() (ed25519.PublicKey, error) {
-	b, err := decodePubKey(*pubkey)
-	if err != nil {
-		return nil, err
-	}
-	return ed25519.PublicKey(b), nil
-}
-
-// decodePubKey accepts a base64 or hex ed25519 public key.
-func decodePubKey(s string) ([]byte, error) {
-	for _, dec := range []func(string) ([]byte, error){
-		base64.StdEncoding.DecodeString,
-		base64.RawStdEncoding.DecodeString,
-		base64.URLEncoding.DecodeString,
-		base64.RawURLEncoding.DecodeString,
-		hex.DecodeString,
-	} {
-		if b, err := dec(s); err == nil && len(b) == ed25519.PublicKeySize {
-			return b, nil
-		}
-	}
-	return nil, fmt.Errorf("public key %q is not 32 bytes of base64 or hex", s)
-}
-
-// runWorkers spins up n goroutines and returns per-worker results once ctx is
-// cancelled. When collect is false, samples are discarded.
-func runWorkers(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, srv []byte, n int, collect bool) []workerResult {
+// runWorkers spins up n workers and returns their results when ctx ends.
+// Samples before collectAfter are dropped to fold warmup into the same sockets.
+func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) []workerResult {
 	results := make([]workerResult, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
@@ -200,7 +187,7 @@ func runWorkers(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKe
 	for i := range n {
 		go func(idx int) {
 			defer wg.Done()
-			if worker(ctx, raddr, rootPK, srv, &results[idx], collect) {
+			if worker(ctx, cfg, &results[idx], collectAfter) {
 				dialed.Add(1)
 			}
 		}(i)
@@ -219,50 +206,78 @@ func recordLatency(out *workerResult, rtt time.Duration) {
 		out.latencies = append(out.latencies, rtt)
 		return
 	}
-	// Replace index j with probability reservoirSize/received
+	// replace index j with probability reservoirSize/received
 	j := mrand.Uint64N(out.received)
 	if j < reservoirSize {
 		out.latencies[j] = rtt
 	}
 }
 
-// worker runs the closed-loop send/recv cycle on a single UDP socket until ctx
-// is cancelled. The request is built once and each iteration rewrites only the
-// NONC bytes. Returns false if it could not dial.
-func worker(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, srv []byte, out *workerResult, collect bool) bool {
+// randomizeNonce fills n with non-cryptographic random bytes; nonces are opaque
+// to the server and only need distinctness to avoid dedupe collapse.
+func randomizeNonce(n []byte) {
+	full := len(n) - len(n)%8
+	for i := 0; i < full; i += 8 {
+		binary.LittleEndian.PutUint64(n[i:], mrand.Uint64())
+	}
+	if tail := n[full:]; len(tail) > 0 {
+		var t [8]byte
+		binary.LittleEndian.PutUint64(t[:], mrand.Uint64())
+		copy(tail, t[:])
+	}
+}
+
+// worker dispatches to the UDP or TCP driver.
+func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
+	if cfg.transport == "tcp" {
+		return workerTCP(ctx, cfg, out, collectAfter)
+	}
+	return workerUDP(ctx, cfg, out, collectAfter)
+}
+
+// workerUDP runs the send/recv loop on one UDP socket. Returns false if dial
+// fails.
+func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
+	raddr, err := net.ResolveUDPAddr("udp", cfg.addr)
+	if err != nil {
+		return false
+	}
 	conn, err := net.DialUDP("udp", nil, raddr)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
-	nonce, req, err := protocol.CreateRequest(ietfVersions, rand.Reader, srv)
+	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
 	if err != nil {
 		return false
 	}
-	// bytes.Index would be unsafe: a random nonce can collide with an earlier
-	// byte window in the header or SRV tag
+	// bytes.Index would be unsafe: a random nonce can collide with header or
+	// SRV bytes
 	nonceOff, err := protocol.NonceOffsetInRequest(req)
 	if err != nil {
 		return false
 	}
 
-	buf := make([]byte, 1500)
+	timeout := cfg.timeout
+	verify := cfg.verify
+	buf := make([]byte, maxUDPReply)
 	for ctx.Err() == nil {
-		// math/rand suffices; the server does not check nonce entropy
-		for i := 0; i < len(nonce); i += 8 {
-			binary.LittleEndian.PutUint64(nonce[i:], mrand.Uint64())
-		}
+		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
-		_ = conn.SetWriteDeadline(time.Now().Add(*timeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
-			out.errWrite++
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				out.timeouts++
+			} else {
+				out.errWrite++
+			}
 			continue
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(*timeout))
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buf)
 		rtt := time.Since(start)
 		if err != nil {
@@ -274,24 +289,107 @@ func worker(ctx context.Context, raddr *net.UDPAddr, rootPK ed25519.PublicKey, s
 			continue
 		}
 
-		if *verify {
-			if _, _, err := protocol.VerifyReply(ietfVersions, buf[:n], rootPK, nonce, req); err != nil {
-				// Grease (RFC §7) and genuine faults share this bucket
+		if verify {
+			if _, _, err := protocol.VerifyReply(cfg.versions, buf[:n], cfg.rootPK, nonce, req); err != nil {
+				// grease and genuine faults share this bucket
 				out.errVerify++
 				continue
 			}
 		}
 
-		if collect {
+		if !start.Before(collectAfter) {
 			recordLatency(out, rtt)
 		}
 	}
 	return true
 }
 
-// report aggregates per-worker results and prints a single summary block.
+// workerTCP runs the send/recv loop on one persistent TCP connection. A framing
+// or transport error exits the worker without reconnecting.
+func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
+	timeout := cfg.timeout
+	verify := cfg.verify
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", cfg.addr)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+
+	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
+	if err != nil {
+		return false
+	}
+	nonceOff, err := protocol.NonceOffsetInRequest(req)
+	if err != nil {
+		return false
+	}
+
+	replyBuf := make([]byte, protocol.PacketHeaderSize+maxTCPReply)
+	for ctx.Err() == nil {
+		randomizeNonce(nonce)
+		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
+
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+		start := time.Now()
+		if _, err := conn.Write(req); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				out.timeouts++
+			} else {
+				out.errWrite++
+			}
+			return true
+		}
+
+		hdr := replyBuf[:protocol.PacketHeaderSize]
+		if _, err := io.ReadFull(conn, hdr); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				out.timeouts++
+			} else {
+				out.errRead++
+			}
+			return true
+		}
+		bodyLen, err := protocol.ParsePacketHeader(hdr)
+		if err != nil || bodyLen == 0 || bodyLen > maxTCPReply {
+			out.errRead++
+			return true
+		}
+		pkt := replyBuf[:protocol.PacketHeaderSize+int(bodyLen)]
+		if _, err := io.ReadFull(conn, pkt[protocol.PacketHeaderSize:]); err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				out.timeouts++
+			} else {
+				out.errRead++
+			}
+			return true
+		}
+		rtt := time.Since(start)
+
+		if verify {
+			if _, _, err := protocol.VerifyReply(cfg.versions, pkt, cfg.rootPK, nonce, req); err != nil {
+				out.errVerify++
+				continue
+			}
+		}
+
+		if !start.Before(collectAfter) {
+			recordLatency(out, rtt)
+		}
+	}
+	return true
+}
+
+// report aggregates per-worker results and prints a summary.
 func report(results []workerResult, elapsed time.Duration) {
-	var all []time.Duration
+	total := 0
+	for i := range results {
+		total += len(results[i].latencies)
+	}
+	all := make([]time.Duration, 0, total)
 	var received, errVerify, errWrite, errRead, timeouts uint64
 	for i := range results {
 		all = append(all, results[i].latencies...)
@@ -341,8 +439,8 @@ func report(results []workerResult, elapsed time.Duration) {
 	}
 }
 
-// percentile returns the p-th percentile from a pre-sorted ascending slice
-// using nearest-rank. p is in [0, 1].
+// percentile returns the nearest-rank p-th percentile of a sorted slice; p in
+// [0,1].
 func percentile(sorted []time.Duration, p float64) time.Duration {
 	if len(sorted) == 0 {
 		return 0
@@ -351,7 +449,7 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	return sorted[idx]
 }
 
-// mean returns the arithmetic mean of a non-empty duration slice.
+// mean returns the arithmetic mean of xs.
 func mean(xs []time.Duration) time.Duration {
 	var sum time.Duration
 	for _, x := range xs {

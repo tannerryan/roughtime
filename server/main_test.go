@@ -17,9 +17,8 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
-// newUnitCertState builds an in-memory certState for unit tests without
-// touching disk. Returns the root public key for SRV hashing and reply
-// verification.
+// newUnitCertState builds an in-memory certState and returns the root public
+// key.
 func newUnitCertState(t *testing.T) (ed25519.PublicKey, *certState) {
 	t.Helper()
 	rootPK, rootSK, err := ed25519.GenerateKey(rand.Reader)
@@ -38,8 +37,8 @@ func newUnitCertState(t *testing.T) (ed25519.PublicKey, *certState) {
 	return rootPK, &certState{cert: cert, expiry: now.Add(time.Hour), srvHash: protocol.ComputeSRV(rootPK)}
 }
 
-// TestRecoverGoroutineAbsorbsPanic verifies `defer recoverGoroutine(...)`
-// absorbs a panic and increments statsPanics.
+// TestRecoverGoroutineAbsorbsPanic verifies recoverGoroutine absorbs a panic
+// and increments statsPanics.
 func TestRecoverGoroutineAbsorbsPanic(t *testing.T) {
 	before := statsPanics.Load()
 	func() {
@@ -52,7 +51,7 @@ func TestRecoverGoroutineAbsorbsPanic(t *testing.T) {
 }
 
 // TestRecoverGoroutineNoPanicNoOp verifies recoverGoroutine leaves statsPanics
-// untouched when deferred on a normally-returning function.
+// untouched on normal return.
 func TestRecoverGoroutineNoPanicNoOp(t *testing.T) {
 	before := statsPanics.Load()
 	func() {
@@ -63,8 +62,8 @@ func TestRecoverGoroutineNoPanicNoOp(t *testing.T) {
 	}
 }
 
-// TestSuperviseLoopRestartsOnPanic injects panics from the supervised function
-// and asserts the loop absorbs them and restarts until ctx is cancelled.
+// TestSuperviseLoopRestartsOnPanic verifies the loop absorbs panics and
+// restarts until ctx cancel.
 func TestSuperviseLoopRestartsOnPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -77,7 +76,7 @@ func TestSuperviseLoopRestartsOnPanic(t *testing.T) {
 			if n < 3 {
 				panic("induced")
 			}
-			// Third iteration exits cleanly to exercise the restart path
+			// third iteration exits cleanly to exercise restart path
 		})
 		close(done)
 	}()
@@ -97,8 +96,8 @@ func TestSuperviseLoopRestartsOnPanic(t *testing.T) {
 	}
 }
 
-// TestSuperviseLoopExitsOnCtxCancel asserts a pre-cancelled ctx causes
-// superviseLoop to return immediately without invoking the supervised fn.
+// TestSuperviseLoopExitsOnCtxCancel verifies a pre-cancelled ctx returns
+// without invoking fn.
 func TestSuperviseLoopExitsOnCtxCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -121,8 +120,8 @@ func TestSuperviseLoopExitsOnCtxCancel(t *testing.T) {
 	}
 }
 
-// TestValidateRequestAcceptsValidDraft12 asserts the happy-path: an IETF
-// draft-12 request with matching SRV is accepted.
+// TestValidateRequestAcceptsValidDraft12 verifies a draft-12 request with
+// matching SRV is accepted.
 func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
@@ -143,8 +142,8 @@ func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 	}
 }
 
-// TestValidateRequestAcceptsGoogle asserts Google-Roughtime requests (no VER
-// tag, no SRV) are accepted and negotiate VersionGoogle.
+// TestValidateRequestAcceptsGoogle verifies Google-Roughtime requests negotiate
+// VersionGoogle.
 func TestValidateRequestAcceptsGoogle(t *testing.T) {
 	_, st := newUnitCertState(t)
 	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionGoogle}, rand.Reader, nil)
@@ -161,26 +160,26 @@ func TestValidateRequestAcceptsGoogle(t *testing.T) {
 	}
 }
 
-// TestValidateRequestRejectsParseError feeds junk bytes through validation and
-// asserts rejection without panic.
+// TestValidateRequestRejectsParseError verifies junk bytes are rejected without
+// panic.
 func TestValidateRequestRejectsParseError(t *testing.T) {
 	_, st := newUnitCertState(t)
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
 
-	// All-zero 1024 bytes: valid size, unparseable content. Debug logger
-	// exercises the parse-failure log branch
+	// valid size, unparseable content; debug logger exercises parse-failure
+	// branch
 	junk := make([]byte, 1024)
 	if _, ok := validateRequest(zaptest.NewLogger(t), junk, peer, 1024, nil, st); ok {
 		t.Fatal("validateRequest accepted all-zero bytes")
 	}
 }
 
-// TestValidateRequestRejectsSRVMismatch asserts a request whose SRV hash does
-// not address this server's key is dropped (drafts 10+ §5.1).
+// TestValidateRequestRejectsSRVMismatch verifies a request with foreign SRV is
+// dropped (drafts 10+).
 func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 	_, st := newUnitCertState(t)
 
-	// Forge SRV with a different root key
+	// forge SRV with a different root key
 	otherPK, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("gen other: %v", err)
@@ -197,8 +196,8 @@ func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 	}
 }
 
-// TestValidateRequestAcceptsAbsentSRV asserts pre-draft-10 requests (which do
-// not include SRV) are still served.
+// TestValidateRequestAcceptsAbsentSRV verifies pre-draft-10 requests without
+// SRV are served.
 func TestValidateRequestAcceptsAbsentSRV(t *testing.T) {
 	_, st := newUnitCertState(t)
 	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft09}, rand.Reader, nil)
@@ -211,12 +210,12 @@ func TestValidateRequestAcceptsAbsentSRV(t *testing.T) {
 	}
 }
 
-// TestValidateRequestRejectsUnsupportedVersion asserts a client advertising
-// only an unsupported version is dropped by SelectVersion.
+// TestValidateRequestRejectsUnsupportedVersion verifies SelectVersion drops
+// unsupported-only clients.
 func TestValidateRequestRejectsUnsupportedVersion(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
-	// 0xdeadbeef is unsupported; SelectVersion must reject
+	// 0xdeadbeef is unsupported
 	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.Version(0xdeadbeef)}, rand.Reader, srv)
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
@@ -227,8 +226,8 @@ func TestValidateRequestRejectsUnsupportedVersion(t *testing.T) {
 	}
 }
 
-// TestValidateRequestStoresBufPtr asserts the pooled-read buffer pointer is
-// round-tripped through validation so it can be returned after signing.
+// TestValidateRequestStoresBufPtr verifies the pooled-buf pointer round-trips
+// through validation.
 func TestValidateRequestStoresBufPtr(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
@@ -245,7 +244,7 @@ func TestValidateRequestStoresBufPtr(t *testing.T) {
 	}
 }
 
-// TestSignAndBuildRepliesSingle signs a one-item batch and verifies the reply
+// TestSignAndBuildRepliesSingle verifies a one-item batch signs and verifies
 // against the root key.
 func TestSignAndBuildRepliesSingle(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
@@ -272,8 +271,8 @@ func TestSignAndBuildRepliesSingle(t *testing.T) {
 	}
 }
 
-// TestSignAndBuildRepliesBatch exercises the bulk-signing path with eight
-// peers, asserting reply/peer ordering is preserved and each reply verifies.
+// TestSignAndBuildRepliesBatch verifies bulk-signing preserves peer order and
+// each reply verifies.
 func TestSignAndBuildRepliesBatch(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
@@ -312,8 +311,8 @@ func TestSignAndBuildRepliesBatch(t *testing.T) {
 	}
 }
 
-// TestSignAndBuildRepliesAmplificationDrop forces reply > requestSize and
-// asserts the amplification guard suppresses the outgoing reply.
+// TestSignAndBuildRepliesAmplificationDrop verifies the amplification guard
+// suppresses oversize replies.
 func TestSignAndBuildRepliesAmplificationDrop(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
@@ -327,7 +326,7 @@ func TestSignAndBuildRepliesAmplificationDrop(t *testing.T) {
 	items := []validatedRequest{{
 		req:         *parsed,
 		peer:        &net.UDPAddr{IP: net.IPv6loopback, Port: 1},
-		requestSize: 64, // forces reply to exceed
+		requestSize: 64, // forces reply to exceed request
 		version:     protocol.VersionDraft12,
 	}}
 	replies := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12, items)
@@ -336,7 +335,7 @@ func TestSignAndBuildRepliesAmplificationDrop(t *testing.T) {
 	}
 }
 
-// TestSignAndBuildRepliesEmpty asserts a nil items slice returns nil.
+// TestSignAndBuildRepliesEmpty verifies a nil items slice returns nil.
 func TestSignAndBuildRepliesEmpty(t *testing.T) {
 	_, st := newUnitCertState(t)
 	replies := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12, nil)
@@ -345,8 +344,8 @@ func TestSignAndBuildRepliesEmpty(t *testing.T) {
 	}
 }
 
-// FuzzValidateRequest pumps arbitrary UDP payloads through validateRequest and
-// asserts it never panics, covering SRV/version checks and cert-state use.
+// FuzzValidateRequest verifies validateRequest never panics on arbitrary
+// payloads.
 func FuzzValidateRequest(f *testing.F) {
 	rootPK, rootSK, _ := ed25519.GenerateKey(rand.Reader)
 	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
@@ -371,8 +370,8 @@ func FuzzValidateRequest(f *testing.F) {
 	})
 }
 
-// FuzzServeOnce drives validateRequest followed by signAndBuildReplies on any
-// accepted input, catching panics reachable only through accepted payloads.
+// FuzzServeOnce verifies validateRequest plus signAndBuildReplies never panics
+// on accepted payloads.
 func FuzzServeOnce(f *testing.F) {
 	rootPK, rootSK, _ := ed25519.GenerateKey(rand.Reader)
 	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)

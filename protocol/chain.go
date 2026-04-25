@@ -5,7 +5,6 @@ package protocol
 
 import (
 	"bytes"
-	"crypto/ed25519"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
@@ -18,43 +17,40 @@ import (
 
 // Sentinel errors returned by [Chain.Verify].
 var (
-	// ErrChainNonce indicates a nonce linkage failure: the chain is corrupted
-	// or forged, not evidence of server misbehavior.
+	// ErrChainNonce indicates a nonce linkage failure (corrupted or forged
+	// chain).
 	ErrChainNonce = errors.New("protocol: chain nonce mismatch")
 
-	// ErrCausalOrder indicates a causal ordering violation (§8.2 drafts 12+,
-	// §9.2 pre-12): evidence of server malfeasance.
+	// ErrCausalOrder indicates a causal ordering violation (server
+	// malfeasance).
 	ErrCausalOrder = errors.New("protocol: causal ordering violation")
 )
 
-// maxChainLinks caps the per-chain link count to prevent CPU-DoS on Verify.
 const maxChainLinks = 1024
 
-// maxMalfeasanceReportBytes caps a JSON malfeasance report size before decode.
-// 1024 links × ~64 KiB max packet × 4/3 base64 expansion ≈ 88 MiB upper bound;
-// 4 MiB is sane for realistic reports while bounding decoder memory.
+// 1024 links * ~64 KiB packets * 4/3 base64 ~ 88 MiB worst case; 4 MiB fits
+// realistic reports
 const maxMalfeasanceReportBytes = 4 * 1024 * 1024
 
-// ChainLink is one server query in a Roughtime measurement chain (§8.4 drafts
-// 12+, §9.3 pre-12). The fields map 1:1 to the malfeasance report JSON format.
+// ChainLink is one server query in a Roughtime measurement chain.
+// Rand/PublicKey/Request/Response map 1:1 to the malfeasance report JSON; Nonce
+// is in-memory only, populated by NextRequest.
 type ChainLink struct {
-	Rand      []byte // blind (size matches the version's nonce length); nil for the first link
-	PublicKey []byte // server's long-term Ed25519 public key
-	Request   []byte // full request packet including ROUGHTIM header
-	Response  []byte // full response packet including ROUGHTIM header
+	Rand      []byte // blind, sized to version's nonce length; nil for first link
+	PublicKey []byte // server long-term key (Ed25519 or ML-DSA-44, experimental)
+	Nonce     []byte // nonce sent in Request, not serialized
+	Request   []byte // full request packet
+	Response  []byte // full response packet
 }
 
-// Chain accumulates sequential Roughtime queries for causal ordering
-// verification and malfeasance reporting (§§8.2/8.4 drafts 12+, §§9.2/9.3
-// pre-12).
+// Chain accumulates sequential Roughtime queries for causal ordering and
+// malfeasance reporting.
 type Chain struct {
 	Links []ChainLink
 }
 
-// ChainNonce derives the nonce for the next link in a chain (§8.2 drafts 12+,
-// §9.2 pre-12). For the first link (prevResponse nil) it returns a random nonce
-// with nil rand; otherwise it returns H(prevResponse || rand) with the rand
-// blind.
+// ChainNonce derives the next link's nonce: random for the first link (nil
+// rand), otherwise H(prevResponse || rand).
 func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (nonce, rand []byte, err error) {
 	_, g, err := clientVersionPreference(versions)
 	if err != nil {
@@ -80,17 +76,16 @@ func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (non
 	return nonce, rand, nil
 }
 
-// chainHasher returns the hash function for chain nonce derivation. Always
-// SHA-512: it must produce up to 64 bytes (Google, drafts 01–04), whereas
-// SHA-512/256 only yields 32.
+// SHA-512: must yield up to 64 bytes (Google, drafts 01-04); SHA-512/256 only
+// gives 32
 func chainHasher(_ wireGroup) hash.Hash {
 	return sha512.New()
 }
 
-// NextRequest creates the next chained request. The returned ChainLink has
-// Rand, PublicKey, and Request populated; the caller must set Response after
-// the round-trip, then pass the link to [Chain.Append].
-func (c *Chain) NextRequest(versions []Version, rootPK ed25519.PublicKey, entropy io.Reader) (ChainLink, error) {
+// NextRequest creates the next chained request with Rand, PublicKey, Nonce, and
+// Request populated; the caller sets Response then calls [Chain.Append]. rootPK
+// length selects Ed25519 or ML-DSA-44 (experimental).
+func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader) (ChainLink, error) {
 	var prevResp []byte
 	if n := len(c.Links); n > 0 {
 		prevResp = c.Links[n-1].Response
@@ -113,6 +108,7 @@ func (c *Chain) NextRequest(versions []Version, rootPK ed25519.PublicKey, entrop
 	return ChainLink{
 		Rand:      blind,
 		PublicKey: append([]byte(nil), rootPK...),
+		Nonce:     nonce,
 		Request:   request,
 	}, nil
 }
@@ -122,10 +118,9 @@ func (c *Chain) Append(link ChainLink) {
 	c.Links = append(c.Links, link)
 }
 
-// Verify checks nonce linkage, signature validity, and causal ordering (§8.2
-// drafts 12+, §9.2 pre-12). Nonce failures wrap [ErrChainNonce], causal
-// ordering failures wrap [ErrCausalOrder], and signature failures return an
-// unwrapped error.
+// Verify checks nonce linkage, signature validity, and causal ordering. Nonce
+// failures wrap [ErrChainNonce]; causal-ordering failures wrap
+// [ErrCausalOrder]; signature failures are returned unwrapped.
 func (c *Chain) Verify() error {
 	if len(c.Links) == 0 {
 		return errors.New("protocol: empty chain")
@@ -147,7 +142,7 @@ func (c *Chain) Verify() error {
 			return fmt.Errorf("protocol: chain link %d: parse request: %w", i, err)
 		}
 
-		// Empty VER list means Google-Roughtime
+		// empty VER list means Google-Roughtime
 		versions := req.Versions
 		if len(versions) == 0 {
 			versions = []Version{VersionGoogle}
@@ -182,9 +177,8 @@ func (c *Chain) Verify() error {
 		}
 	}
 
-	// Causal ordering (§8.2 drafts 12+, §9.2 pre-12): require lower[i] <=
-	// upper[j] for all i < j; tracking the running max of lower[] keeps this
-	// O(n)
+	// require lower[i] <= upper[j] for all i < j; running max of lower[] keeps
+	// this O(n)
 	maxLowerIdx := 0
 	for j := 1; j < len(results); j++ {
 		if results[maxLowerIdx].lower.After(results[j].upper) {
@@ -198,13 +192,11 @@ func (c *Chain) Verify() error {
 	return nil
 }
 
-// malfeasanceReport is the drafts-12+ JSON report structure (§8.4). See
-// malfeasanceReportLegacy for the drafts 10-11 format (§9.3).
+// drafts-12+ JSON report
 type malfeasanceReport struct {
 	Responses []malfeasanceLink `json:"responses"`
 }
 
-// malfeasanceLink is one entry in a drafts-12+ malfeasance report.
 type malfeasanceLink struct {
 	Rand      string `json:"rand,omitempty"`
 	PublicKey string `json:"publicKey"`
@@ -212,17 +204,15 @@ type malfeasanceLink struct {
 	Response  string `json:"response"`
 }
 
-// malfeasanceReportLegacy is the drafts 10-11 format (§9.3): parallel arrays of
-// rand values and response packets, with no request or publicKey fields.
+// drafts 10-11 format: parallel arrays, no request or publicKey
 type malfeasanceReportLegacy struct {
 	Nonces    []string `json:"nonces"`
 	Responses []string `json:"responses"`
 }
 
-// MalfeasanceReport serializes the chain as a JSON report. A chain whose every
-// link negotiated drafts 10–11 uses the legacy §9.3 format; all other chains
-// (drafts 12+, mixed, or Google-Roughtime) use the drafts-12+ §8.4 format
-// (media type application/roughtime-malfeasance+json).
+// MalfeasanceReport serializes the chain as JSON. All-drafts-10-11 chains use
+// the legacy format; everything else uses drafts-12+
+// (application/roughtime-malfeasance+json).
 func (c *Chain) MalfeasanceReport() ([]byte, error) {
 	if len(c.Links) == 0 {
 		return nil, errors.New("protocol: empty chain")
@@ -247,8 +237,7 @@ func (c *Chain) MalfeasanceReport() ([]byte, error) {
 	return json.Marshal(report)
 }
 
-// isLegacyChain reports whether every link negotiated a drafts 10–11 version
-// (groupD10), in which case §9.3 is the conforming malfeasance format.
+// every link must be groupD10 for the legacy parallel-array format to conform
 func (c *Chain) isLegacyChain() bool {
 	if len(c.Links) == 0 {
 		return false
@@ -265,8 +254,6 @@ func (c *Chain) isLegacyChain() bool {
 	return true
 }
 
-// marshalLegacyReport emits the drafts 10–11 §9.3 JSON format: parallel arrays
-// of nonces and responses, with no request or publicKey fields.
 func (c *Chain) marshalLegacyReport() ([]byte, error) {
 	report := malfeasanceReportLegacy{
 		Nonces:    make([]string, len(c.Links)),
@@ -281,16 +268,14 @@ func (c *Chain) marshalLegacyReport() ([]byte, error) {
 	return json.Marshal(report)
 }
 
-// ParseMalfeasanceReport deserializes a JSON malfeasance report into a Chain.
-// Both the drafts 12+ format (§8.4) and the legacy drafts 10-11 format (§9.3)
-// are accepted. Legacy reports yield links with Rand and Response populated but
-// no Request or PublicKey, so [Chain.Verify] cannot be used on them.
+// ParseMalfeasanceReport deserializes a JSON malfeasance report (drafts-12+ or
+// legacy drafts 10-11) into a Chain. Legacy reports lack Request and PublicKey,
+// so [Chain.Verify] cannot be used on them.
 func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	if len(data) > maxMalfeasanceReportBytes {
 		return nil, fmt.Errorf("protocol: malfeasance report is %d bytes (max %d)", len(data), maxMalfeasanceReportBytes)
 	}
-	// Legacy reports have a top-level "nonces" key and string entries in
-	// responses[]; drafts-12+ reports have object entries.
+	// legacy: top-level "nonces" + string entries; drafts-12+: object entries
 	var probe struct {
 		Nonces    json.RawMessage   `json:"nonces"`
 		Responses []json.RawMessage `json:"responses"`

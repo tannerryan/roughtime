@@ -1,8 +1,7 @@
 # roughtime - https://github.com/tannerryan/roughtime
 
-# Binaries
 BINARIES     = roughtime roughtime-client roughtime-debug roughtime-bench
-# Fuzz targets, grouped by package. `name:pkg` — the fuzz rule splits on ':'.
+# name:pkg — split on ':' by the fuzz rule
 FUZZ_TARGETS = \
     FuzzDecode:./protocol/ \
     FuzzParseRequest:./protocol/ \
@@ -21,16 +20,17 @@ FUZZ_TARGETS = \
     FuzzChainNonce:./protocol/ \
     FuzzChainVerify:./protocol/ \
     FuzzValidateRequest:./server/ \
-    FuzzServeOnce:./server/
+    FuzzServeOnce:./server/ \
+    FuzzReadTCPFrame:./server/
 FUZZ_TIME   ?= 30s
 
 .PHONY: all deps build test test-verbose test-race test-cover test-race-cover \
         test-all fuzz lint vet fmt verify coverage-report check clean
 
-# Default: format, vet, build, test with race detector
+# Default: fmt, vet, build, race tests
 all: fmt vet build test-race
 
-# Install development tools
+# Install dev tools
 deps:
 	go install golang.org/x/tools/cmd/goimports@latest
 	go install honnef.co/go/tools/cmd/staticcheck@latest
@@ -38,52 +38,50 @@ deps:
 	go install golang.org/x/tools/gopls@latest
 	go install github.com/gojp/goreportcard/cmd/goreportcard-cli@latest
 
-# Build all binaries
+# Build binaries
 build:
 	go build -o roughtime ./server
 	go build -o roughtime-client ./client
 	go build -o roughtime-debug ./debug
 	go build -o roughtime-bench ./bench
 
-# Run unit tests
+# Unit tests
 test:
 	go test ./...
 
-# Run unit tests with verbose output
+# Unit tests, verbose
 test-verbose:
 	go test -v ./...
 
-# Run unit tests with race detector
+# Unit tests with race detector
 test-race:
 	go test -race ./...
 
-# Run unit tests with coverage (protocol + server packages)
+# Unit tests with coverage
 test-cover:
 	go test -cover ./protocol/ ./server/
 
-# Run unit tests with race detector and coverage profile (used by CI)
+# Race + coverage profile (CI)
 test-race-cover:
 	go test -race -covermode=atomic -coverprofile=coverage.out ./protocol/ ./server/
 
-# Verify module checksums match go.sum
+# Verify module checksums
 verify:
 	go mod download
 	go mod verify
 
-# Generate per-function summary and HTML coverage report from coverage.out
+# Per-function summary + HTML coverage report
 coverage-report: test-race-cover
 	go tool cover -func=coverage.out > coverage.txt
 	cat coverage.txt
 	go tool cover -html=coverage.out -o coverage.html
 
-# Run all test variants (verbose + race + cover)
+# All test variants
 test-all: test-verbose test-race test-cover
 
-# Run all fuzz targets sequentially (FUZZ_TIME=30s by default). -run=^$ skips
-# regular tests so only the fuzz phase runs. Up to 3 attempts absorb the
-# upstream go-fuzz coordinator deadline-race flake; a real crash is written to
-# testdata/fuzz and replayed as a seed on retry, so genuine failures still
-# surface.
+# Run all fuzz targets sequentially. Up to 3 attempts absorb the upstream
+# go-fuzz coordinator deadline-race flake; real crashes replay from
+# testdata/fuzz.
 fuzz:
 	@for entry in $(FUZZ_TARGETS); do \
 		name=$${entry%%:*}; pkg=$${entry#*:}; \
@@ -93,26 +91,25 @@ fuzz:
 		done || exit 1; \
 	done
 
-# Run gofmt and goimports
+# gofmt + goimports
 fmt:
 	gofmt -w .
 	goimports -w .
 
-# Run go vet
+# go vet
 vet:
 	go vet ./...
 
-# Run all linters (staticcheck, golangci-lint, gopls, go vet)
+# All linters (staticcheck, golangci-lint, gopls, vet)
 lint: vet
 	staticcheck ./...
 	golangci-lint run ./...
-	gopls check ./protocol/protocol.go ./protocol/chain.go ./server/main.go ./server/listen_linux.go ./server/listen_other.go ./debug/main.go ./client/main.go ./bench/main.go
+	gopls check ./protocol/protocol.go ./protocol/chain.go ./protocol/sigscheme.go ./protocol/transport.go ./server/main.go ./server/listen_linux.go ./server/listen_other.go ./server/listen_tcp.go ./debug/main.go ./client/main.go ./bench/main.go ./roughtime.go
 
-# Run full check suite: module verify, format, vet, lint, build, test with race
-# + coverage, report card
+# Full check: verify, fmt, vet, lint, build, race+cover, report card
 check: verify fmt vet lint build test-race-cover
 	goreportcard-cli -v
 
-# Remove built binaries and coverage artifacts
+# Remove binaries and coverage artifacts
 clean:
 	rm -f $(BINARIES) coverage.out coverage.txt coverage.html

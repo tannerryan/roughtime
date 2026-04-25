@@ -1,3 +1,11 @@
+# filippo.io/mldsa v0.0.0-20260215214346-43d0283efc3e
+## explicit; go 1.25.0
+filippo.io/mldsa
+filippo.io/mldsa/internal/byteorder
+filippo.io/mldsa/internal/constanttime
+filippo.io/mldsa/internal/fips140
+filippo.io/mldsa/internal/fips140/mldsa
+filippo.io/mldsa/mldsacrypto
 # go.uber.org/goleak v1.3.0
 ## explicit; go 1.20
 go.uber.org/goleak

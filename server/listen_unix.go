@@ -3,6 +3,7 @@
 
 //go:build unix
 
+// Shared UDP receive-buffer sizing for Linux and non-Linux listeners.
 package main
 
 import (
@@ -12,9 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// applyReadBuffer sets SO_RCVBUF to socketRecvBuffer and warns if the kernel
-// silently truncated the request. Linux doubles the stored value when reporting
-// via getsockopt, so effective < requested means truncation to at most half.
+// applyReadBuffer sets SO_RCVBUF and warns if the kernel truncated the request.
 func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 	if err := conn.SetReadBuffer(socketRecvBuffer); err != nil {
 		log.Warn("setting UDP receive buffer failed",

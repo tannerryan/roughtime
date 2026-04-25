@@ -5,7 +5,17 @@
       "version": "IETF-Roughtime",
       "publicKeyType": "ed25519",
       "publicKey": "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=",
-      "addresses": [{ "protocol": "udp", "address": "time.txryan.com:2002" }]
+      "addresses": [
+        { "protocol": "udp", "address": "time.txryan.com:2002" },
+        { "protocol": "tcp", "address": "time.txryan.com:2002" }
+      ]
+    },
+    {
+      "name": "time.txryan.com-pq",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ml-dsa-44",
+      "publicKey": "iuxXi04fJTimiOxZhh0lA9sVI0idvfp4qS0zEskMJfkvnefnkpEjTEjoPA96W8awG66vxK3y8eaXAsW/4tSjRD4tSx+Wvs04AVBxqoUO1eb2DX7hp2+TMGY1uIFHIwM4YWiMSdZnTu6myOgi3FC3Bu096CfPphafY9itnwlXpAXEK6RjglwlWmTC+BY8olKZen/zYkOdQbaHVrh5AiqXME3tEv4gpgzlsWVbNCnVbn/x39HYNw8D4R39KCkZKrTogzkZScVU3FjJHJH5ro2p6CqQ+AC5wH9hnWuFDt6dChIwqa0sdbMMQVo7Yyq3MXAED6KSQmtvXBfBAmbxlJPg/t6iRNNdk1bapnhi1LPe8rqLTuCiCOX0MbMQmAyM+aL6LTCMdDEx/AwVmLCcyumo0/sXVf0CQESh1E1R76oev+75+1iCslZwb6sPOMnLowGCVD84V+ZF1B6HHGLzqlXUorUgaHyCV24pDHEZE8gaAiIVPLgvC0mwQPsdyineAolb5KI34swvdSduGTasbaNOFoOIzoJRXdiuUn3DxP9xOTrxtLNU8BYR5j828ILBqzCvcMLUY0v/2HF0ul59ni7ekm3OXlmfxdqPqyXLk/Qyr7CcbOEpOXeY2cPfFawIIG1LHVeeg17VGOZ48NytjW/IdLxwVJObP6m2SuLusc6rWshNSEUB9xq5fz5qkSIb9DnlQfVbaH7XVu0vCRcW26xU62eUsicVHGyNVbIzIAgd8DKgHaFcQDFMoIzQOrrBh5vg0ilyojoyZgJaxk4RtrF5xG5pyn6OSAbfK4e+dIkfyHjnwPt/Oalavk7EzlfpawBDMYnhUT6nZySc/meWAPDp+hMZ7mUk8tdife4CBti3yLQo6YZ/g870vnHujrJti3pz0QKUpVh/FbsEfpVdRrAq84z/Dl4B61Gc+bZ2wMDcYmzzy/fd09vOG0pTXhcvzvhIzMat1voabEe+LCv6f1ol9SK48350Czq53IsmToAX6pRFhHQXMkIQUUxh4fGlcnbnZwosHVx7iq58a3PE10pm+HivC0VsHXXB2alUKtzK1yZPZf5uych2FJ64vt0mPHSV7N0SvMbSVOLfyrZk4hVsQnwWns6/e1kb5LHUKtxuchXz9ybn39IvYIahFiouTjRXWV0pisbTZaYQFMDkjeyHqxSHYnoZoMVCBKSlZZx0fAC5RFNrz+cqgB0ZsaUgnT2yD47Ui/2yu/+jhk8mUaoIYOKFv+eI2HFMt31fo17q54Z1wr7WFe9PZQ+8BV6n9nQzC988t61C9qIMfPhuyVNUZqfLJ+vw786+JT3jXOo5L2WRGP8x5Yf/9ea3qFK0QdxsS3ul9brkwJ0VTFF9JP4sUqYCQV4nuuF4YTeAgRf6gxOGy9wwkeUjQ2TBm1rrxz44eKOjKUPF+MQj/Nq3DcZ4o+9G3SIVZrn/GqidYdcTXtBCcK33GMOuF9uueJY2WfmEhC6d38kumgZzucABaPSjJuuVRgpAkFycgvFNteIcNnNsstyhvAGDqFnWXIRX2eWvVfgXdxmHDcNei80sqtxWY6USLdZzMFjeH8VcLnAZh/hhT1HfTN3UQ428eT0rzdK0WiCP91uJcWsdehpDIzgUXtcMaptZRjDiqELLUR4QzgjWtBAF5nHDDNm351/oF3/Fj7tmePJXtYiXh1t5V1bbcNzZXiXTz8vKT0gfL7zmHYCHnF1sbLevZaflVTLaJsL6Jkjseahoq/rUyj4CrEE0RA==",
+      "addresses": [{ "protocol": "tcp", "address": "time.txryan.com:2002" }]
     },
     {
       "name": "Cloudflare-Roughtime-2",

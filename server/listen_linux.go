@@ -3,6 +3,8 @@
 
 //go:build linux
 
+// Linux UDP listener: one SO_REUSEPORT socket per CPU with recvmmsg/sendmmsg
+// batching.
 package main
 
 import (
@@ -25,11 +27,11 @@ import (
 )
 
 // idleReadTimeout bounds ReadBatch blocking so ctx cancellation is observed
-// promptly without burning CPU on idle wakeups.
+// promptly.
 const idleReadTimeout = 500 * time.Millisecond
 
 // reqBufPool recycles per-packet copy buffers so payloads survive the next
-// recvmmsg into shared scratch space.
+// recvmmsg.
 var reqBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, maxPacketSize)
@@ -37,13 +39,12 @@ var reqBufPool = sync.Pool{
 	},
 }
 
-// statsWorkerExits counts worker goroutines that returned before ctx was
-// cancelled, surfacing silent SO_REUSEPORT pool shrinkage in the shutdown log.
+// statsWorkerExits counts worker returns before ctx cancellation, surfacing
+// silent pool shrinkage.
 var statsWorkerExits atomic.Uint64
 
-// listen starts one SO_REUSEPORT worker per CPU. Each worker owns its own
-// kernel socket and drives recvmmsg/sendmmsg batches. Batch vars are
-// snapshotted at entry so test mutations don't race in-flight reads.
+// listen starts one SO_REUSEPORT worker per CPU, each driving its own
+// recvmmsg/sendmmsg loop.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
 	numWorkers := runtime.NumCPU()
@@ -77,7 +78,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		go func(id int, c net.PacketConn) {
 			defer wg.Done()
 			wlog := listenLog.With(zap.Int("worker", id))
-			// Restart on panic so the SO_REUSEPORT pool doesn't shrink
+			// restart on panic so the SO_REUSEPORT pool doesn't shrink
 			for ctx.Err() == nil {
 				func() {
 					defer recoverGoroutine(wlog, "worker")
@@ -109,7 +110,6 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 }
 
 // worker reads, validates, signs, and responds in batches until ctx is done.
-// Supervision and socket lifetime are managed by listen.
 func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], conn net.PacketConn, maxSize int, maxLatency time.Duration) {
 	defer func() {
 		if ctx.Err() == nil {
@@ -128,9 +128,8 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 	}
 }
 
-// collectBatch reads up to maxSize datagrams. The first read uses
-// idleReadTimeout for prompt shutdown; subsequent reads share a single
-// maxLatency window.
+// collectBatch reads up to maxSize datagrams; first read uses idleReadTimeout,
+// rest share maxLatency.
 func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs []ipv6.Message, maxSize int, maxLatency time.Duration, state *atomic.Pointer[certState]) []validatedRequest {
 	_ = conn.SetReadDeadline(time.Now().Add(idleReadTimeout))
 	n, err := p.ReadBatch(msgs, 0)
@@ -160,8 +159,8 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 	return batch
 }
 
-// harvest validates each datagram, copying payloads into pooled buffers so they
-// survive the next ReadBatch. respond returns the buffers to the pool.
+// harvest validates each datagram into pooled buffers; respond returns them to
+// the pool.
 func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]validatedRequest) {
 	for i := range msgs {
 		n := msgs[i].N
@@ -190,9 +189,8 @@ func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]valid
 	}
 }
 
-// respond groups items by (version, hasType), signs each group, and writes
-// replies via sendmmsg. NoncInSREP versions (drafts 01-02) are forced into
-// singleton groups since NONC inside SREP prevents aggregation.
+// respond groups items by (version, hasType), signs, and writes via sendmmsg;
+// NoncInSREP versions (drafts 01-02) are kept as singletons.
 func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validatedRequest) {
 	defer recoverGoroutine(log, "respond")
 	defer func() {
@@ -245,7 +243,7 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 			return
 		}
 		if n <= 0 {
-			// Guard against an infinite loop on degenerate returns
+			// guard against infinite loop on degenerate returns
 			log.Warn("WriteBatch wrote 0", zap.Int("dropped", len(out)))
 			statsDropped.Add(uint64(len(out)))
 			return
@@ -255,10 +253,8 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 	}
 }
 
-// listenReusePort binds a dual-stack UDP socket with SO_REUSEPORT so each
-// worker gets an independent kernel queue. IPV6_V6ONLY=0 is set explicitly so
-// the socket accepts IPv4-mapped addresses even when the kernel's
-// net.ipv6.bindv6only sysctl defaults to 1.
+// listenReusePort binds a dual-stack UDP socket with SO_REUSEPORT;
+// IPV6_V6ONLY=0 is set explicitly to override net.ipv6.bindv6only=1.
 func listenReusePort(network, address string) (net.PacketConn, error) {
 	lc := net.ListenConfig{
 		Control: func(ctrlNetwork, _ string, c syscall.RawConn) error {
@@ -281,7 +277,7 @@ func listenReusePort(network, address string) (net.PacketConn, error) {
 }
 
 // makeMessages pre-allocates a batch of ipv6.Messages with per-slot read
-// buffers sized to hold one UDP datagram.
+// buffers.
 func makeMessages(count, size int) []ipv6.Message {
 	msgs := make([]ipv6.Message, count)
 	for i := range msgs {

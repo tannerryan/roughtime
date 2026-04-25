@@ -3,6 +3,8 @@
 
 //go:build unix && !linux
 
+// Non-Linux unix UDP listener: single socket with a channel-fed batcher, since
+// recvmmsg/sendmmsg and SO_REUSEPORT semantics vary across BSD/Darwin.
 package main
 
 import (
@@ -17,12 +19,11 @@ import (
 	"go.uber.org/zap"
 )
 
-// batchQueueSize is the capacity of the batcher channel; excess requests are
-// dropped for backpressure. Only used on this path — the Linux fast path
-// batches inline via recvmmsg without an intermediary channel.
+// batchQueueSize bounds the batcher channel; overflow is dropped for
+// backpressure.
 const batchQueueSize = 4096
 
-// bufPool recycles read buffers to reduce GC pressure under high packet rates.
+// bufPool recycles read buffers to cut GC pressure under load.
 var bufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, maxPacketSize)
@@ -31,10 +32,10 @@ var bufPool = sync.Pool{
 }
 
 // listen runs a single-socket UDP server with inline validation and a
-// channel-fed batcher. Linux builds use listen_linux.go instead. Batch vars are
-// snapshotted at entry so test mutations don't race in-flight reads.
+// channel-fed batcher.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
+	// snapshot at entry so test mutations don't race in-flight reads
 	maxSize := batchMaxSize
 	maxLatency := batchMaxLatency
 
@@ -49,8 +50,8 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	var batcherWg sync.WaitGroup
 	batcherLog := logger.Named("batcher")
 	batcherWg.Add(1)
-	// Panic recovery is per-iteration inside batcher so the batches map
-	// persists and close(batchCh) on shutdown is not raced by a restart
+	// per-iteration recovery lives inside batcher so batches persist and
+	// close(batchCh) on shutdown isn't raced by a restart
 	go func() {
 		defer batcherWg.Done()
 		batcher(batcherLog, conn, state, batchCh, maxSize, maxLatency)
@@ -62,17 +63,16 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		zap.Int("queue_size", batchQueueSize),
 	)
 
-	// Unblock the read loop via a past deadline rather than closing the socket
-	// while in-flight work still holds it
+	// past deadline unblocks the read loop without closing the socket while
+	// in-flight work still holds it
 	go func() {
 		<-ctx.Done()
 		listenLog.Info("shutdown initiated, unblocking reads")
 		_ = conn.SetReadDeadline(time.Unix(1, 0))
 	}()
 
-	// readOne performs one read-dispatch iteration and returns true on
-	// shutdown. Panics are recovered per-iteration; the offending buffer is
-	// leaked rather than returned to the pool
+	// readOne does one read-dispatch iteration; returns true on shutdown.
+	// Recovered panics leak the in-flight buffer rather than returning it
 	readOne := func() bool {
 		defer recoverGoroutine(listenLog, "listen")
 
@@ -87,7 +87,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			return false
 		}
 		statsReceived.Add(1)
-		// Undersize packets may be dropped per all drafts (§5/§6)
+		// undersize packets are always droppable per the drafts
 		if reqLen < minRequestSize {
 			bufPool.Put(bufPtr)
 			statsDropped.Add(1)
@@ -134,9 +134,8 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	return nil
 }
 
-// batcher accumulates validated requests grouped by (version, hasType) and
-// flushes them in bulk signing batches. It fires when a batch reaches maxSize
-// or when maxLatency has elapsed since the first request in a batch arrived.
+// batcher groups validated requests by (version, hasType) and flushes when a
+// batch reaches maxSize or maxLatency elapses since its first request arrived.
 func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], incoming <-chan validatedRequest, maxSize int, maxLatency time.Duration) {
 	type pending struct {
 		items []validatedRequest
@@ -178,9 +177,9 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 		delete(batches, key)
 	}
 
-	// step runs one select iteration, returning true once incoming is closed
-	// and residual batches are flushed. Per-iteration recovery keeps batches
-	// alive across a recovered panic
+	// step runs one select iteration; returns true after incoming closes and
+	// residual batches flush. Per-iteration recovery keeps batches alive across
+	// a recovered panic
 	step := func() (done bool) {
 		defer recoverGoroutine(log, "batcher")
 		select {
@@ -221,8 +220,8 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 	}
 }
 
-// flushBatch signs a batch and writes responses via WriteToUDP, returning
-// pooled read buffers regardless of outcome.
+// flushBatch signs a batch and writes responses, returning pooled read buffers
+// regardless of outcome.
 func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) {
 	defer func() {
 		for i := range items {
