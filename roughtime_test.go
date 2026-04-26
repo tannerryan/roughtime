@@ -5,6 +5,7 @@ package roughtime_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -12,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -35,15 +37,28 @@ type fakeServer struct {
 	tcpLis    net.Listener
 	wg        sync.WaitGroup
 	mu        sync.Mutex
-	dropCount int    // >0 drops the next N requests
-	hook      func() // optional pre-handle hook
+	dropCount int           // >0 drops the next N requests
+	hook      func()        // optional pre-handle hook
+	radius    time.Duration // signed time-uncertainty radius
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
-	return newFakeServerWithHook(t, nil)
+	return newFakeServerOpts(t, nil, time.Second)
+}
+
+// newFakeServerWithRadius returns a fakeServer that signs replies with the
+// given time-uncertainty radius.
+func newFakeServerWithRadius(t *testing.T, radius time.Duration) *fakeServer {
+	return newFakeServerOpts(t, nil, radius)
 }
 
 func newFakeServerWithHook(t *testing.T, hook func()) *fakeServer {
+	return newFakeServerOpts(t, hook, time.Second)
+}
+
+// newFakeServerOpts is the shared constructor: configures the server before
+// starting goroutines so radius and hook are race-free.
+func newFakeServerOpts(t *testing.T, hook func(), radius time.Duration) *fakeServer {
 	t.Helper()
 	rootPK, rootSK, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -77,6 +92,7 @@ func newFakeServerWithHook(t *testing.T, hook func()) *fakeServer {
 		udpConn: uc,
 		tcpLis:  tl,
 		hook:    hook,
+		radius:  radius,
 	}
 	f.wg.Add(2)
 	go f.serveUDP()
@@ -178,7 +194,7 @@ func (f *fakeServer) handle(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	replies, err := protocol.CreateReplies(ver, []protocol.Request{*req}, time.Now(), time.Second, f.cert)
+	replies, err := protocol.CreateReplies(ver, []protocol.Request{*req}, time.Now(), f.radius, f.cert)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +279,8 @@ func TestClientRetryOnDrop(t *testing.T) {
 	}
 }
 
-// TestClientQueryAllConcurrent verifies parallel queries return per-slot results.
+// TestClientQueryAllConcurrent verifies parallel queries return per-slot
+// results.
 func TestClientQueryAllConcurrent(t *testing.T) {
 	f1 := newFakeServer(t)
 	defer f1.Close()
@@ -285,7 +302,7 @@ func TestClientQueryAllConcurrent(t *testing.T) {
 	}
 }
 
-// TestClientQueryChainVerified verifies a three-link chain via [protocol.Chain].
+// TestClientQueryChainVerified verifies a three-link chain via [Proof].
 func TestClientQueryChainVerified(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -304,12 +321,59 @@ func TestClientQueryChainVerified(t *testing.T) {
 			t.Fatalf("link[%d]: %v", i, r.Err)
 		}
 	}
-	if err := cr.Chain.Verify(); err != nil {
-		t.Fatalf("chain Verify: %v", err)
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("cr.Proof: %v", err)
+	}
+	if err := proof.Verify(); err != nil {
+		t.Fatalf("proof Verify: %v", err)
 	}
 }
 
-// TestResponseDriftAndInSync verifies Drift and InSync on a hand-built response.
+// TestClientQueryChainWithNonceBindsSeed verifies the document-timestamping
+// flow: the first link's nonce equals the caller-supplied seed, subsequent
+// links derive causally, and the proof verifies.
+func TestClientQueryChainWithNonceBindsSeed(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+	s := f.server()
+
+	seed := bytes.Repeat([]byte{0xA5}, 32) // simulates SHA-256(document)
+	var c roughtime.Client
+	cr, err := c.QueryChainWithNonce(context.Background(), []roughtime.Server{s, s, s}, seed)
+	if err != nil {
+		t.Fatalf("QueryChainWithNonce: %v", err)
+	}
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("cr.Proof: %v", err)
+	}
+	if proof.Len() != 3 {
+		t.Fatalf("got %d links, want 3", proof.Len())
+	}
+	got, err := proof.SeedNonce()
+	if err != nil {
+		t.Fatalf("SeedNonce: %v", err)
+	}
+	if !bytes.Equal(got, seed) {
+		t.Fatalf("seed nonce = %x, want %x", got, seed)
+	}
+	links, err := proof.Links()
+	if err != nil {
+		t.Fatalf("Links: %v", err)
+	}
+	for i := 1; i < len(links); i++ {
+		if bytes.Equal(links[i].Nonce, seed) {
+			t.Fatalf("link[%d] nonce should not equal seed", i)
+		}
+	}
+	if err := proof.Verify(); err != nil {
+		t.Fatalf("proof Verify: %v", err)
+	}
+}
+
+// TestResponseDriftAndInSync verifies Drift and InSync on a hand-built
+// response.
 func TestResponseDriftAndInSync(t *testing.T) {
 	now := time.Unix(1000, 0)
 	r := roughtime.Response{
@@ -369,7 +433,8 @@ func TestParseEcosystemRoundTrip(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemRejectsJunk confirms malformed input is surfaced as an error.
+// TestParseEcosystemRejectsJunk confirms malformed input is surfaced as an
+// error.
 func TestParseEcosystemRejectsJunk(t *testing.T) {
 	cases := [][]byte{
 		[]byte(""),
@@ -384,7 +449,8 @@ func TestParseEcosystemRejectsJunk(t *testing.T) {
 	}
 }
 
-// TestPickAddressMLDSARequiresTCP confirms a UDP-only ML-DSA-44 server is rejected.
+// TestPickAddressMLDSARequiresTCP confirms a UDP-only ML-DSA-44 server is
+// rejected.
 func TestPickAddressMLDSARequiresTCP(t *testing.T) {
 	// 1312-byte key selects ML-DSA-44
 	pk := make([]byte, 1312)
@@ -488,7 +554,8 @@ func FuzzParseEcosystem(f *testing.F) {
 	})
 }
 
-// FuzzDecodePublicKey asserts the decoder never panics and returns only valid lengths.
+// FuzzDecodePublicKey asserts the decoder never panics and returns only valid
+// lengths.
 func FuzzDecodePublicKey(f *testing.F) {
 	pk := make([]byte, 32)
 	f.Add(base64.StdEncoding.EncodeToString(pk))
@@ -506,7 +573,8 @@ func FuzzDecodePublicKey(f *testing.F) {
 	})
 }
 
-// TestQueryRejectsEmptyAddresses confirms a Server with no addresses errors early.
+// TestQueryRejectsEmptyAddresses confirms a Server with no addresses errors
+// early.
 func TestQueryRejectsEmptyAddresses(t *testing.T) {
 	var c roughtime.Client
 	_, err := c.Query(context.Background(), roughtime.Server{
@@ -517,7 +585,8 @@ func TestQueryRejectsEmptyAddresses(t *testing.T) {
 	}
 }
 
-// TestQueryRejectsBadKeyLength confirms an invalid PublicKey length is rejected.
+// TestQueryRejectsBadKeyLength confirms an invalid PublicKey length is
+// rejected.
 func TestQueryRejectsBadKeyLength(t *testing.T) {
 	var c roughtime.Client
 	_, err := c.Query(context.Background(), roughtime.Server{
@@ -529,7 +598,8 @@ func TestQueryRejectsBadKeyLength(t *testing.T) {
 	}
 }
 
-// TestQueryRejectsUnsupportedTransport confirms unknown transports surface an error.
+// TestQueryRejectsUnsupportedTransport confirms unknown transports surface an
+// error.
 func TestQueryRejectsUnsupportedTransport(t *testing.T) {
 	var c roughtime.Client
 	_, err := c.Query(context.Background(), roughtime.Server{
@@ -541,7 +611,8 @@ func TestQueryRejectsUnsupportedTransport(t *testing.T) {
 	}
 }
 
-// TestPickAddressEd25519PrefersUDP confirms Ed25519 prefers UDP when both are advertised.
+// TestPickAddressEd25519PrefersUDP confirms Ed25519 prefers UDP when both are
+// advertised.
 func TestPickAddressEd25519PrefersUDP(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -556,7 +627,8 @@ func TestPickAddressEd25519PrefersUDP(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemValidatesPublicKeyType rejects publicKeyType vs key-length mismatch.
+// TestParseEcosystemValidatesPublicKeyType rejects publicKeyType vs key-length
+// mismatch.
 func TestParseEcosystemValidatesPublicKeyType(t *testing.T) {
 	pk, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -576,7 +648,8 @@ func TestParseEcosystemValidatesPublicKeyType(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemAllowsMissingPublicKeyType confirms publicKeyType is optional.
+// TestParseEcosystemAllowsMissingPublicKeyType confirms publicKeyType is
+// optional.
 func TestParseEcosystemAllowsMissingPublicKeyType(t *testing.T) {
 	pk, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -595,7 +668,8 @@ func TestParseEcosystemAllowsMissingPublicKeyType(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemEnforcesMaxServers confirms the server-count cap is enforced.
+// TestParseEcosystemEnforcesMaxServers confirms the server-count cap is
+// enforced.
 func TestParseEcosystemEnforcesMaxServers(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	entry := map[string]any{
@@ -613,7 +687,8 @@ func TestParseEcosystemEnforcesMaxServers(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemSanitizesStrings confirms control and bidi chars are stripped.
+// TestParseEcosystemSanitizesStrings confirms control and bidi chars are
+// stripped.
 func TestParseEcosystemSanitizesStrings(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	const rlo = "\u202E"
@@ -650,7 +725,8 @@ func TestDecodePublicKeyMLDSA44(t *testing.T) {
 	}
 }
 
-// TestDecodePublicKeyRejectsWrongLength confirms non-32/1312-byte inputs are rejected.
+// TestDecodePublicKeyRejectsWrongLength confirms non-32/1312-byte inputs are
+// rejected.
 func TestDecodePublicKeyRejectsWrongLength(t *testing.T) {
 	for _, n := range []int{0, 16, 33, 64, 1311, 1313, 2048} {
 		raw := bytes.Repeat([]byte{0x99}, n)
@@ -660,7 +736,8 @@ func TestDecodePublicKeyRejectsWrongLength(t *testing.T) {
 	}
 }
 
-// TestDecodePublicKeyTruncatesError confirms error messages stay bounded for huge inputs.
+// TestDecodePublicKeyTruncatesError confirms error messages stay bounded for
+// huge inputs.
 func TestDecodePublicKeyTruncatesError(t *testing.T) {
 	huge := strings.Repeat("X", 100_000)
 	_, err := roughtime.DecodePublicKey(huge)
@@ -672,7 +749,8 @@ func TestDecodePublicKeyTruncatesError(t *testing.T) {
 	}
 }
 
-// TestQueryAllSemaphoreCap verifies QueryAll bounds in-flight to MaxQueryAllConcurrency.
+// TestQueryAllSemaphoreCap verifies QueryAll bounds in-flight to
+// MaxQueryAllConcurrency.
 func TestQueryAllSemaphoreCap(t *testing.T) {
 	const total = roughtime.MaxQueryAllConcurrency * 2
 	servers := make([]roughtime.Server, total)
@@ -751,13 +829,15 @@ func TestQueryAllPreservesOrder(t *testing.T) {
 	}
 }
 
-// TestClientRetriesExhausted confirms retry exhaustion surfaces the underlying error.
+// TestClientRetriesExhausted confirms retry exhaustion surfaces the underlying
+// error.
 func TestClientRetriesExhausted(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
 	f.dropNext(100)
 	c := roughtime.Client{Timeout: 50 * time.Millisecond, Retries: 2}
-	// large context budget so the surfaced error is the per-attempt timeout, not ctx cancel
+	// large context budget so the surfaced error is the per-attempt timeout,
+	// not ctx cancel
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := c.Query(ctx, f.server())
@@ -766,7 +846,8 @@ func TestClientRetriesExhausted(t *testing.T) {
 	}
 }
 
-// FuzzVersionsForScheme asserts the helper never panics and excludes PQ for non-PQ schemes.
+// FuzzVersionsForScheme asserts the helper never panics and excludes PQ for
+// non-PQ schemes.
 func FuzzVersionsForScheme(f *testing.F) {
 	f.Add(int(roughtime.SchemeEd25519))
 	f.Add(int(roughtime.SchemeMLDSA44))
@@ -786,7 +867,8 @@ func FuzzVersionsForScheme(f *testing.F) {
 	})
 }
 
-// TestClientRespectsContextCancel confirms cancellation unblocks an in-flight query.
+// TestClientRespectsContextCancel confirms cancellation unblocks an in-flight
+// query.
 func TestClientRespectsContextCancel(t *testing.T) {
 	// closed port so Dial/Read hangs on an unreachable peer
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -818,7 +900,8 @@ func TestClientRespectsContextCancel(t *testing.T) {
 	}
 }
 
-// TestQueryWithNonceUsesCallerNonce confirms the supplied nonce is bound into the request.
+// TestQueryWithNonceUsesCallerNonce confirms the supplied nonce is bound into
+// the request.
 func TestQueryWithNonceUsesCallerNonce(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -855,7 +938,8 @@ func TestQueryWithNonceRejectsBadLength(t *testing.T) {
 	}
 }
 
-// TestResponseRawBytesPopulated confirms Query fills Request, Reply, and AmplificationOK.
+// TestResponseRawBytesPopulated confirms Query fills Request, Reply, and
+// AmplificationOK.
 func TestResponseRawBytesPopulated(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -873,7 +957,8 @@ func TestResponseRawBytesPopulated(t *testing.T) {
 	}
 }
 
-// TestPackageLevelQuery confirms the convenience wrapper matches a zero-Client call.
+// TestPackageLevelQuery confirms the convenience wrapper matches a zero-Client
+// call.
 func TestPackageLevelQuery(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -887,7 +972,8 @@ func TestPackageLevelQuery(t *testing.T) {
 	}
 }
 
-// TestPackageLevelQueryWithNonce confirms the package-level nonce-binding wrapper.
+// TestPackageLevelQueryWithNonce confirms the package-level nonce-binding
+// wrapper.
 func TestPackageLevelQueryWithNonce(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -902,7 +988,86 @@ func TestPackageLevelQueryWithNonce(t *testing.T) {
 	}
 }
 
-// TestClientConcurrencyOverride confirms Client.Concurrency caps QueryAll fan-out.
+// TestVerifyOfflineProof confirms Verify reproduces the live-query midpoint
+// from stored Request/Reply bytes.
+func TestVerifyOfflineProof(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+
+	s := f.server()
+	resp, err := roughtime.Query(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	midpoint, _, err := roughtime.Verify(s.PublicKey, resp.Request, resp.Reply)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !midpoint.Equal(resp.Midpoint) {
+		t.Fatalf("midpoint mismatch: got %v want %v", midpoint, resp.Midpoint)
+	}
+}
+
+// TestConsensus exercises the median/min/max aggregation across mixed Result
+// slices including failures.
+func TestConsensus(t *testing.T) {
+	mk := func(d time.Duration, ok bool) roughtime.Result {
+		if !ok {
+			return roughtime.Result{Err: errors.New("x")}
+		}
+		now := time.Now()
+		return roughtime.Result{Response: &roughtime.Response{Midpoint: now.Add(d), LocalNow: now}}
+	}
+	results := []roughtime.Result{
+		mk(50*time.Millisecond, true),
+		mk(0, false), // failure: ignored
+		mk(100*time.Millisecond, true),
+		mk(150*time.Millisecond, true),
+	}
+	c := roughtime.Consensus(results)
+	if c.Samples != 3 {
+		t.Fatalf("Samples = %d, want 3", c.Samples)
+	}
+	if c.Median != 100*time.Millisecond {
+		t.Fatalf("Median = %s, want 100ms", c.Median)
+	}
+	if c.Min != 50*time.Millisecond || c.Max != 150*time.Millisecond {
+		t.Fatalf("Min/Max = %s/%s, want 50ms/150ms", c.Min, c.Max)
+	}
+
+	if got := roughtime.Consensus(nil); got.Samples != 0 {
+		t.Fatalf("empty: Samples = %d, want 0", got.Samples)
+	}
+}
+
+// TestAddressString verifies the Stringer renders the canonical form.
+func TestAddressString(t *testing.T) {
+	a := roughtime.Address{Transport: "udp", Address: "time.example.com:2002"}
+	if got, want := a.String(), "udp://time.example.com:2002"; got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
+// TestVerifyOfflineProofRejectsTamperedReply confirms Verify fails on a
+// modified reply.
+func TestVerifyOfflineProofRejectsTamperedReply(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+
+	s := f.server()
+	resp, err := roughtime.Query(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := append([]byte(nil), resp.Reply...)
+	tampered[len(tampered)-1] ^= 0x01
+	if _, _, err := roughtime.Verify(s.PublicKey, resp.Request, tampered); err == nil {
+		t.Fatal("expected Verify to reject tampered reply")
+	}
+}
+
+// TestClientConcurrencyOverride confirms Client.Concurrency caps QueryAll
+// fan-out.
 func TestClientConcurrencyOverride(t *testing.T) {
 	const cap = 4
 	const total = cap * 3
@@ -953,8 +1118,9 @@ func TestClientConcurrencyOverride(t *testing.T) {
 	<-done
 }
 
-// TestChainResultMalfeasanceReport confirms the convenience method mirrors chain.MalfeasanceReport.
-func TestChainResultMalfeasanceReport(t *testing.T) {
+// TestChainResultProof confirms the chain converts to a Proof and that the
+// Proof verifies and round-trips through MarshalGzip + ParseProof.
+func TestChainResultProof(t *testing.T) {
 	f1 := newFakeServer(t)
 	defer f1.Close()
 	f2 := newFakeServer(t)
@@ -965,28 +1131,63 @@ func TestChainResultMalfeasanceReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryChain: %v", err)
 	}
-	report, err := cr.MalfeasanceReport()
+	proof, err := cr.Proof()
 	if err != nil {
-		t.Fatalf("MalfeasanceReport: %v", err)
+		t.Fatalf("Proof: %v", err)
 	}
-	if !bytes.Contains(report, []byte(`"responses"`)) {
-		t.Fatalf("report missing 'responses' field: %s", report)
+	if proof.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", proof.Len())
+	}
+	if err := proof.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	data, err := proof.MarshalGzip()
+	if err != nil {
+		t.Fatalf("MarshalGzip: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte{0x1f, 0x8b}) {
+		t.Fatalf("MarshalGzip output not gzipped")
+	}
+	parsed, err := roughtime.ParseProof(data)
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if parsed.Len() != proof.Len() {
+		t.Fatalf("round-trip Len: got %d want %d", parsed.Len(), proof.Len())
 	}
 }
 
-// TestChainResultMalfeasanceReportNil confirms nil receiver/chain errors instead of panicking.
-func TestChainResultMalfeasanceReportNil(t *testing.T) {
+// TestChainResultProofNil confirms nil receiver and nil chain field both error
+// rather than panic.
+func TestChainResultProofNil(t *testing.T) {
 	var cr *roughtime.ChainResult
-	if _, err := cr.MalfeasanceReport(); err == nil {
-		t.Fatal("nil receiver should error, not panic")
+	if _, err := cr.Proof(); err == nil {
+		t.Fatal("nil receiver should error")
 	}
 	cr = &roughtime.ChainResult{}
-	if _, err := cr.MalfeasanceReport(); err == nil {
-		t.Fatal("nil Chain should error")
+	if _, err := cr.Proof(); err == nil {
+		t.Fatal("nil chain should error")
 	}
 }
 
-// TestErrorSentinelsReExported confirms package errors match protocol origins via errors.Is.
+// TestChainResultProofEmpty confirms a fully-failed chain yields an "empty
+// chain" error.
+func TestChainResultProofEmpty(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+	f.dropNext(1_000_000)
+	c := roughtime.Client{Timeout: 10 * time.Millisecond, Retries: 1}
+	cr, err := c.QueryChain(context.Background(), []roughtime.Server{f.server(), f.server()})
+	if err != nil {
+		t.Fatalf("QueryChain: %v", err)
+	}
+	if _, err := cr.Proof(); err == nil || !strings.Contains(err.Error(), "empty chain") {
+		t.Fatalf("Proof: %v; want 'empty chain' error", err)
+	}
+}
+
+// TestErrorSentinelsReExported confirms package errors match protocol origins
+// via errors.Is.
 func TestErrorSentinelsReExported(t *testing.T) {
 	pairs := []struct {
 		name      string
@@ -1006,7 +1207,8 @@ func TestErrorSentinelsReExported(t *testing.T) {
 	}
 }
 
-// TestMarshalEcosystemRoundTrip confirms MarshalEcosystem output round-trips through ParseEcosystem.
+// TestMarshalEcosystemRoundTrip confirms MarshalEcosystem output round-trips
+// through ParseEcosystem.
 func TestMarshalEcosystemRoundTrip(t *testing.T) {
 	pk1, _, _ := ed25519.GenerateKey(rand.Reader)
 	pq := bytes.Repeat([]byte{0x42}, 1312)
@@ -1044,7 +1246,8 @@ func TestMarshalEcosystemRoundTrip(t *testing.T) {
 	}
 }
 
-// TestMarshalEcosystemRejectsTooMany confirms exceeding MaxEcosystemServers errors early.
+// TestMarshalEcosystemRejectsTooMany confirms exceeding MaxEcosystemServers
+// errors early.
 func TestMarshalEcosystemRejectsTooMany(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	servers := make([]roughtime.Server, roughtime.MaxEcosystemServers+1)
@@ -1054,4 +1257,690 @@ func TestMarshalEcosystemRejectsTooMany(t *testing.T) {
 	if _, err := roughtime.MarshalEcosystem(servers); err == nil {
 		t.Fatal("expected too-many error")
 	}
+}
+
+// makeProof builds an n-link Proof against a single fakeServer.
+func makeProof(t *testing.T, n int) *roughtime.Proof {
+	t.Helper()
+	f := newFakeServer(t)
+	t.Cleanup(f.Close)
+	s := f.server()
+	servers := make([]roughtime.Server, n)
+	for i := range servers {
+		servers[i] = s
+	}
+	var c roughtime.Client
+	cr, err := c.QueryChain(context.Background(), servers)
+	if err != nil {
+		t.Fatalf("QueryChain: %v", err)
+	}
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("cr.Proof: %v", err)
+	}
+	return proof
+}
+
+// gzipReport gzips raw report bytes for tests that craft proofs.
+func gzipReport(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// tamperResponse decompresses a marshaled proof, flips a byte in link[idx]'s
+// response, and returns the re-gzipped bytes.
+func tamperResponse(t *testing.T, marshaled []byte, idx int) []byte {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(marshaled))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	_ = gr.Close()
+	var report struct {
+		Responses []map[string]string `json:"responses"`
+	}
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	resp, err := base64.StdEncoding.DecodeString(report.Responses[idx]["response"])
+	if err != nil {
+		t.Fatalf("b64: %v", err)
+	}
+	resp[len(resp)-1] ^= 0x01
+	report.Responses[idx]["response"] = base64.StdEncoding.EncodeToString(resp)
+	out, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return gzipReport(t, out)
+}
+
+// craftBadRequestProof builds raw proof JSON whose request bytes won't parse.
+func craftBadRequestProof(t *testing.T) []byte {
+	t.Helper()
+	report := map[string]any{
+		"responses": []map[string]string{
+			{
+				"publicKey": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+				"request":   base64.StdEncoding.EncodeToString([]byte("garbage1")),
+				"response":  base64.StdEncoding.EncodeToString(make([]byte, 32)),
+			},
+		},
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return data
+}
+
+// TestProofMarshalGzipRoundTrip confirms MarshalGzip output round-trips via
+// ParseProof.
+func TestProofMarshalGzipRoundTrip(t *testing.T) {
+	proof := makeProof(t, 3)
+	data, err := proof.MarshalGzip()
+	if err != nil {
+		t.Fatalf("MarshalGzip: %v", err)
+	}
+	if !bytes.HasPrefix(data, []byte{0x1f, 0x8b}) {
+		t.Fatal("MarshalGzip output not gzipped")
+	}
+	out, err := roughtime.ParseProof(data)
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if out.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", out.Len())
+	}
+	if err := out.Verify(); err != nil {
+		t.Fatalf("Verify after round-trip: %v", err)
+	}
+}
+
+// TestProofMarshalGzipNil confirms nil receiver errors instead of panicking.
+func TestProofMarshalGzipNil(t *testing.T) {
+	var p *roughtime.Proof
+	if _, err := p.MarshalGzip(); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofMarshalJSON confirms MarshalJSON returns raw JSON that round-trips
+// via ParseProof and is compatible with [encoding/json].
+func TestProofMarshalJSON(t *testing.T) {
+	proof := makeProof(t, 2)
+	raw, err := proof.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"responses"`)) {
+		t.Fatalf("MarshalJSON output missing 'responses' field")
+	}
+	out, err := roughtime.ParseProof(raw)
+	if err != nil {
+		t.Fatalf("ParseProof(raw): %v", err)
+	}
+	if out.Len() != proof.Len() {
+		t.Fatalf("round-trip Len: got %d want %d", out.Len(), proof.Len())
+	}
+	// json.Marshal should call our MarshalJSON
+	via, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if !bytes.Equal(via, raw) {
+		t.Fatal("json.Marshal output did not match MarshalJSON")
+	}
+}
+
+// TestProofMarshalJSONNil confirms nil receiver errors instead of panicking.
+func TestProofMarshalJSONNil(t *testing.T) {
+	var p *roughtime.Proof
+	if _, err := p.MarshalJSON(); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofVerify confirms a valid proof verifies cleanly.
+func TestProofVerify(t *testing.T) {
+	if err := makeProof(t, 3).Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
+// TestProofVerifyNil confirms nil receiver errors instead of panicking.
+func TestProofVerifyNil(t *testing.T) {
+	var p *roughtime.Proof
+	if err := p.Verify(); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofVerifyTampered confirms a tampered response fails verification.
+func TestProofVerifyTampered(t *testing.T) {
+	proof := makeProof(t, 2)
+	data, _ := proof.MarshalGzip()
+	tampered := tamperResponse(t, data, 0)
+	p2, err := roughtime.ParseProof(tampered)
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if err := p2.Verify(); err == nil {
+		t.Fatal("Verify accepted tampered proof")
+	}
+}
+
+// TestProofLen confirms Len matches the chain length.
+func TestProofLen(t *testing.T) {
+	if got := makeProof(t, 4).Len(); got != 4 {
+		t.Fatalf("Len = %d, want 4", got)
+	}
+}
+
+// TestProofLenNil confirms nil receiver returns 0.
+func TestProofLenNil(t *testing.T) {
+	var p *roughtime.Proof
+	if got := p.Len(); got != 0 {
+		t.Fatalf("nil Len = %d, want 0", got)
+	}
+}
+
+// TestProofLinks confirms Links returns one populated entry per chain link.
+func TestProofLinks(t *testing.T) {
+	proof := makeProof(t, 2)
+	links, err := proof.Links()
+	if err != nil {
+		t.Fatalf("Links: %v", err)
+	}
+	if len(links) != 2 {
+		t.Fatalf("got %d links, want 2", len(links))
+	}
+	for i, l := range links {
+		if len(l.PublicKey) == 0 {
+			t.Errorf("link %d: empty PublicKey", i)
+		}
+		if len(l.Nonce) == 0 {
+			t.Errorf("link %d: empty Nonce", i)
+		}
+		if l.Midpoint.IsZero() {
+			t.Errorf("link %d: zero Midpoint", i)
+		}
+		if l.Radius <= 0 {
+			t.Errorf("link %d: non-positive Radius", i)
+		}
+	}
+}
+
+// TestProofLinksNil confirms nil receiver errors.
+func TestProofLinksNil(t *testing.T) {
+	var p *roughtime.Proof
+	if _, err := p.Links(); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofLinksBadRequest confirms unparsable request bytes surface from
+// Links.
+func TestProofLinksBadRequest(t *testing.T) {
+	p, err := roughtime.ParseProof(craftBadRequestProof(t))
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if _, err := p.Links(); err == nil {
+		t.Fatal("Links should error on corrupt request bytes")
+	}
+}
+
+// TestProofLinksTamperedResponse confirms VerifyReply failure surfaces from
+// Links.
+func TestProofLinksTamperedResponse(t *testing.T) {
+	proof := makeProof(t, 1)
+	data, _ := proof.MarshalGzip()
+	tampered := tamperResponse(t, data, 0)
+	p2, err := roughtime.ParseProof(tampered)
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if _, err := p2.Links(); err == nil {
+		t.Fatal("Links should error on tampered response")
+	}
+}
+
+// TestProofTrust confirms Trust passes when every signing key is in trusted.
+func TestProofTrust(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+	s := f.server()
+	var c roughtime.Client
+	cr, err := c.QueryChain(context.Background(), []roughtime.Server{s, s})
+	if err != nil {
+		t.Fatalf("QueryChain: %v", err)
+	}
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("Proof: %v", err)
+	}
+	if err := proof.Trust([]roughtime.Server{s}); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+}
+
+// TestProofTrustUnknown confirms Trust errors on a key not in the set.
+func TestProofTrustUnknown(t *testing.T) {
+	if err := makeProof(t, 2).Trust(nil); err == nil {
+		t.Fatal("Trust(nil) accepted untrusted keys")
+	}
+}
+
+// TestProofTrustNil confirms nil receiver errors.
+func TestProofTrustNil(t *testing.T) {
+	var p *roughtime.Proof
+	if err := p.Trust(nil); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofSeedNonce confirms SeedNonce returns the bound seed.
+func TestProofSeedNonce(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+	seed := bytes.Repeat([]byte{0xCC}, 32)
+	var c roughtime.Client
+	cr, err := c.QueryChainWithNonce(context.Background(), []roughtime.Server{f.server(), f.server()}, seed)
+	if err != nil {
+		t.Fatalf("QueryChainWithNonce: %v", err)
+	}
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("Proof: %v", err)
+	}
+	got, err := proof.SeedNonce()
+	if err != nil {
+		t.Fatalf("SeedNonce: %v", err)
+	}
+	if !bytes.Equal(got, seed) {
+		t.Fatalf("SeedNonce = %x, want %x", got, seed)
+	}
+}
+
+// TestProofSeedNonceNil confirms nil receiver errors.
+func TestProofSeedNonceNil(t *testing.T) {
+	var p *roughtime.Proof
+	if _, err := p.SeedNonce(); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofSeedNonceBadRequest confirms unparsable request bytes surface.
+func TestProofSeedNonceBadRequest(t *testing.T) {
+	p, err := roughtime.ParseProof(craftBadRequestProof(t))
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if _, err := p.SeedNonce(); err == nil {
+		t.Fatal("SeedNonce should error on corrupt request bytes")
+	}
+}
+
+// TestProofAttestationBound confirms a bound is computed across valid links.
+func TestProofAttestationBound(t *testing.T) {
+	proof := makeProof(t, 3)
+	earliest, latest, err := proof.AttestationBound()
+	if err != nil {
+		t.Fatalf("AttestationBound: %v", err)
+	}
+	if !earliest.Before(latest) {
+		t.Fatalf("earliest %s is not before latest %s", earliest, latest)
+	}
+}
+
+// TestProofAttestationBoundNil confirms nil receiver errors via Links.
+func TestProofAttestationBoundNil(t *testing.T) {
+	var p *roughtime.Proof
+	if _, _, err := p.AttestationBound(); err == nil {
+		t.Fatal("nil receiver should error")
+	}
+}
+
+// TestProofAttestationBoundTightens confirms a later link with a smaller upper
+// bound tightens the verified window.
+func TestProofAttestationBoundTightens(t *testing.T) {
+	wide := newFakeServerWithRadius(t, 5*time.Second)
+	defer wide.Close()
+	tight := newFakeServerWithRadius(t, 50*time.Millisecond)
+	defer tight.Close()
+
+	var c roughtime.Client
+	cr, err := c.QueryChain(context.Background(), []roughtime.Server{wide.server(), tight.server()})
+	if err != nil {
+		t.Fatalf("QueryChain: %v", err)
+	}
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("Proof: %v", err)
+	}
+	earliest, latest, err := proof.AttestationBound()
+	if err != nil {
+		t.Fatalf("AttestationBound: %v", err)
+	}
+	links, _ := proof.Links()
+	_, wideUpper := links[0].Window()
+	if !latest.Before(wideUpper) {
+		t.Fatalf("latest %s should be tighter than link 0 upper %s", latest, wideUpper)
+	}
+	if !earliest.Before(latest) {
+		t.Fatalf("earliest %s !< latest %s", earliest, latest)
+	}
+}
+
+// TestProofLinkWindow confirms Window returns Midpoint ± Radius.
+func TestProofLinkWindow(t *testing.T) {
+	mid := time.Unix(1000, 0).UTC()
+	l := roughtime.ProofLink{Midpoint: mid, Radius: 3 * time.Second}
+	lo, hi := l.Window()
+	if want := mid.Add(-3 * time.Second); !lo.Equal(want) {
+		t.Fatalf("lower = %s, want %s", lo, want)
+	}
+	if want := mid.Add(3 * time.Second); !hi.Equal(want) {
+		t.Fatalf("upper = %s, want %s", hi, want)
+	}
+}
+
+// TestParseProofTooLarge rejects oversized inputs early.
+func TestParseProofTooLarge(t *testing.T) {
+	huge := make([]byte, roughtime.MaxProofBytes+1)
+	if _, err := roughtime.ParseProof(huge); err == nil || !strings.Contains(err.Error(), "max") {
+		t.Fatalf("ParseProof: %v; want max-bytes error", err)
+	}
+}
+
+// TestParseProofBadGzipHeader rejects bytes whose gzip magic prefixes a bad
+// header.
+func TestParseProofBadGzipHeader(t *testing.T) {
+	if _, err := roughtime.ParseProof([]byte{0x1f, 0x8b, 0x00, 0x00}); err == nil {
+		t.Fatal("ParseProof accepted bad gzip header")
+	}
+}
+
+// TestParseProofTruncatedGzip rejects gzip cut mid-stream.
+func TestParseProofTruncatedGzip(t *testing.T) {
+	proof := makeProof(t, 2)
+	data, _ := proof.MarshalGzip()
+	truncated := data[:len(data)/2]
+	if _, err := roughtime.ParseProof(truncated); err == nil {
+		t.Fatal("ParseProof accepted truncated gzip")
+	}
+}
+
+// TestParseProofGzipBomb rejects payloads that decompress beyond MaxProofBytes.
+func TestParseProofGzipBomb(t *testing.T) {
+	bomb := bytes.Repeat([]byte("A"), roughtime.MaxProofBytes+1)
+	if _, err := roughtime.ParseProof(gzipReport(t, bomb)); err == nil ||
+		!strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("ParseProof: %v; want exceeds-size error", err)
+	}
+}
+
+// TestParseProofBadJSON rejects raw bytes that are not a malfeasance report.
+func TestParseProofBadJSON(t *testing.T) {
+	if _, err := roughtime.ParseProof([]byte("not a malfeasance report")); err == nil {
+		t.Fatal("ParseProof accepted non-JSON input")
+	}
+}
+
+// TestParseProofRawJSON confirms ParseProof accepts a non-gzipped malfeasance
+// report directly.
+func TestParseProofRawJSON(t *testing.T) {
+	proof := makeProof(t, 2)
+	data, _ := proof.MarshalGzip()
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	raw, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	_ = gr.Close()
+	parsed, err := roughtime.ParseProof(raw)
+	if err != nil {
+		t.Fatalf("ParseProof(raw): %v", err)
+	}
+	if parsed.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", parsed.Len())
+	}
+}
+
+// TestQueryWithNonceRejectsEmptyAddresses covers QueryWithNonce's resolveServer
+// error path.
+func TestQueryWithNonceRejectsEmptyAddresses(t *testing.T) {
+	var c roughtime.Client
+	_, err := c.QueryWithNonce(context.Background(), roughtime.Server{
+		PublicKey: make([]byte, ed25519.PublicKeySize),
+	}, bytes.Repeat([]byte{0}, 32))
+	if err == nil || !strings.Contains(err.Error(), "no addresses") {
+		t.Fatalf("QueryWithNonce: %v; want no-addresses error", err)
+	}
+}
+
+// TestQueryUnsupportedTransport covers the roundTrip default branch for an
+// unrecognized transport on the resolved address.
+func TestQueryUnsupportedTransport(t *testing.T) {
+	// build a server that resolves to a "sctp" address by overriding via
+	// pickAddress; instead use raw transport enforcement on a known scheme:
+	// Ed25519 with TCP-only "sctp" address has no usable address.
+	var c roughtime.Client
+	_, err := c.Query(context.Background(), roughtime.Server{
+		PublicKey: make([]byte, ed25519.PublicKeySize),
+		Addresses: []roughtime.Address{{Transport: "sctp", Address: "127.0.0.1:1"}},
+	})
+	if err == nil {
+		t.Fatal("Query accepted unsupported transport")
+	}
+}
+
+// TestQueryGoogleVersionPath covers versionsForServer's Google-Roughtime branch
+// by launching a query against a server tagged Google-Roughtime; the query
+// itself fails on the closed port.
+func TestQueryGoogleVersionPath(t *testing.T) {
+	c := roughtime.Client{Timeout: 50 * time.Millisecond, Retries: 1}
+	_, _ = c.Query(context.Background(), roughtime.Server{
+		Version:   "Google-Roughtime",
+		PublicKey: make([]byte, ed25519.PublicKeySize),
+		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},
+	})
+}
+
+// TestSendWithRetryContextCancel covers the in-loop context-cancel branches in
+// sendWithRetry.
+func TestSendWithRetryContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel so the first ctx.Err() check trips
+	c := roughtime.Client{Timeout: 50 * time.Millisecond, Retries: 5}
+	_, err := c.Query(ctx, roughtime.Server{
+		PublicKey: make([]byte, ed25519.PublicKeySize),
+		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},
+	})
+	if err == nil {
+		t.Fatal("Query did not honor pre-cancelled context")
+	}
+}
+
+// TestSendWithRetryBackoffCancel cancels mid-backoff to cover the sleepCtx
+// false-return branch and the cancelled-during-backoff exit.
+func TestSendWithRetryBackoffCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	c := roughtime.Client{Timeout: 10 * time.Millisecond, Retries: 5}
+	// closed port; first attempt fails fast, then sleepCtx triggers
+	_, err := c.Query(ctx, roughtime.Server{
+		PublicKey: make([]byte, ed25519.PublicKeySize),
+		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},
+	})
+	if err == nil {
+		t.Fatal("Query succeeded with cancelled context mid-backoff")
+	}
+}
+
+// TestVerifyRejectsJunkReply covers Verify's ExtractVersion failure branch.
+func TestVerifyRejectsJunkReply(t *testing.T) {
+	if _, _, err := roughtime.Verify(make([]byte, 32), []byte{0, 1, 2}, []byte{0, 1, 2}); err == nil {
+		t.Fatal("Verify accepted junk reply")
+	}
+}
+
+// TestVerifyRejectsJunkRequest covers Verify's ParseRequest failure branch.
+func TestVerifyRejectsJunkRequest(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+	resp, err := roughtime.Query(context.Background(), f.server())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reply is real, but pass garbage as request so ParseRequest fails.
+	if _, _, err := roughtime.Verify(f.server().PublicKey, []byte{0, 1, 2, 3}, resp.Reply); err == nil {
+		t.Fatal("Verify accepted junk request")
+	}
+}
+
+// TestParseEcosystemAcceptsIntVersion covers flexString.UnmarshalJSON's int
+// branch.
+func TestParseEcosystemAcceptsIntVersion(t *testing.T) {
+	pk, _, _ := ed25519.GenerateKey(rand.Reader)
+	doc := []byte(`{"servers":[{"name":"x","version":12,"publicKey":"` +
+		base64.StdEncoding.EncodeToString(pk) +
+		`","addresses":[{"protocol":"udp","address":"x:1"}]}]}`)
+	servers, err := roughtime.ParseEcosystem(doc)
+	if err != nil {
+		t.Fatalf("ParseEcosystem: %v", err)
+	}
+	if servers[0].Version != "12" {
+		t.Fatalf("Version = %q, want %q", servers[0].Version, "12")
+	}
+}
+
+// TestParseEcosystemRejectsBadVersionType covers flexString.UnmarshalJSON's
+// failure branch (neither string nor integer).
+func TestParseEcosystemRejectsBadVersionType(t *testing.T) {
+	pk, _, _ := ed25519.GenerateKey(rand.Reader)
+	doc := []byte(`{"servers":[{"name":"x","version":[1,2],"publicKey":"` +
+		base64.StdEncoding.EncodeToString(pk) +
+		`","addresses":[{"protocol":"udp","address":"x:1"}]}]}`)
+	if _, err := roughtime.ParseEcosystem(doc); err == nil {
+		t.Fatal("ParseEcosystem accepted array-typed version")
+	}
+}
+
+// TestQueryAllPreCancelled covers QueryAll's ctx-already-cancelled and
+// resolveServer-error fan-out branches.
+func TestQueryAllPreCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	bad := roughtime.Server{PublicKey: make([]byte, ed25519.PublicKeySize)} // no addresses
+	servers := []roughtime.Server{bad, bad, bad}
+	c := roughtime.Client{Concurrency: 1}
+	results := c.QueryAll(ctx, servers)
+	if len(results) != 3 {
+		t.Fatalf("got %d results", len(results))
+	}
+	for i, r := range results {
+		if r.Err == nil {
+			t.Fatalf("result[%d]: expected error, got success", i)
+		}
+	}
+}
+
+// TestQueryChainPreCancelled covers queryChain's ctx-already-cancelled and
+// resolveServer-error per-link branches.
+func TestQueryChainPreCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	servers := []roughtime.Server{{PublicKey: make([]byte, ed25519.PublicKeySize)}}
+	var c roughtime.Client
+	cr, err := c.QueryChain(ctx, servers)
+	if err != nil {
+		t.Fatalf("QueryChain: %v", err)
+	}
+	if len(cr.Results) != 1 || cr.Results[0].Err == nil {
+		t.Fatalf("expected per-link error from cancelled context, got %+v", cr.Results)
+	}
+}
+
+// TestQueryChainResolveServerError exercises the resolveServer-error branch
+// inside queryChain (no addresses on the server entry).
+func TestQueryChainResolveServerError(t *testing.T) {
+	servers := []roughtime.Server{{PublicKey: make([]byte, ed25519.PublicKeySize)}}
+	var c roughtime.Client
+	cr, _ := c.QueryChain(context.Background(), servers)
+	if cr.Results[0].Err == nil {
+		t.Fatal("expected resolveServer error, got nil")
+	}
+}
+
+// TestMarshalEcosystemRejectsBadKey covers MarshalEcosystem's SchemeOfKey error
+// branch.
+func TestMarshalEcosystemRejectsBadKey(t *testing.T) {
+	servers := []roughtime.Server{{
+		Name:      "bogus",
+		PublicKey: make([]byte, 7),
+	}}
+	if _, err := roughtime.MarshalEcosystem(servers); err == nil {
+		t.Fatal("MarshalEcosystem accepted 7-byte public key")
+	}
+}
+
+// FuzzParseProof asserts the parser never panics on arbitrary input and any
+// successful parse yields a non-empty Proof.
+func FuzzParseProof(f *testing.F) {
+	f.Add([]byte(""))
+	f.Add([]byte("{}"))
+	f.Add([]byte(`{"responses":[]}`))
+	f.Add([]byte("not json"))
+	f.Add([]byte{0x1f, 0x8b})
+	f.Add([]byte{0x1f, 0x8b, 0x08})
+
+	raw, _ := json.Marshal(map[string]any{
+		"responses": []map[string]string{
+			{
+				"publicKey": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+				"request":   base64.StdEncoding.EncodeToString(make([]byte, 64)),
+				"response":  base64.StdEncoding.EncodeToString(make([]byte, 128)),
+			},
+		},
+	})
+	f.Add(raw)
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	_, _ = gw.Write(raw)
+	_ = gw.Close()
+	f.Add(buf.Bytes())
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		p, err := roughtime.ParseProof(data)
+		if err != nil {
+			return
+		}
+		if p == nil {
+			t.Fatal("ParseProof returned nil with no error")
+		}
+		if p.Len() == 0 {
+			t.Fatal("ParseProof returned empty proof with no error")
+		}
+	})
 }

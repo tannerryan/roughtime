@@ -65,8 +65,8 @@ func TestValidateFlagsRejectsBothEmpty(t *testing.T) {
 // TestGeneratePQKeypairSuccess verifies a headered PQ seed is written at 0600.
 func TestGeneratePQKeypairSuccess(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pq.hex")
-	if err := generatePQKeypair(path); err != nil {
-		t.Fatalf("generatePQKeypair: %v", err)
+	if err := generateMLDSA44Keypair(path); err != nil {
+		t.Fatalf("generateMLDSA44Keypair: %v", err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -96,9 +96,9 @@ func TestGeneratePQKeypairRefusesOverwrite(t *testing.T) {
 	if err := os.WriteFile(path, []byte("placeholder"), 0600); err != nil {
 		t.Fatalf("pre-write: %v", err)
 	}
-	err := generatePQKeypair(path)
+	err := generateMLDSA44Keypair(path)
 	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
-		t.Fatalf("generatePQKeypair want refusing-to-overwrite error, got %v", err)
+		t.Fatalf("generateMLDSA44Keypair want refusing-to-overwrite error, got %v", err)
 	}
 }
 
@@ -106,17 +106,17 @@ func TestGeneratePQKeypairRefusesOverwrite(t *testing.T) {
 // public key.
 func TestDerivePQPublicKeySuccess(t *testing.T) {
 	path, _ := withPQSeedFile(t)
-	if err := derivePQPublicKey(path); err != nil {
-		t.Fatalf("derivePQPublicKey: %v", err)
+	if err := deriveMLDSA44PublicKey(path); err != nil {
+		t.Fatalf("deriveMLDSA44PublicKey: %v", err)
 	}
 }
 
 // TestDerivePQPublicKeyMissingFile verifies a missing file surfaces a read
 // error.
 func TestDerivePQPublicKeyMissingFile(t *testing.T) {
-	err := derivePQPublicKey(filepath.Join(t.TempDir(), "nope.hex"))
+	err := deriveMLDSA44PublicKey(filepath.Join(t.TempDir(), "nope.hex"))
 	if err == nil || !strings.Contains(err.Error(), "reading") {
-		t.Fatalf("derivePQPublicKey want read error, got %v", err)
+		t.Fatalf("deriveMLDSA44PublicKey want read error, got %v", err)
 	}
 }
 
@@ -127,9 +127,9 @@ func TestDerivePQPublicKeyRejectsBareHex(t *testing.T) {
 	if err := os.WriteFile(path, []byte(hex.EncodeToString(seed)), 0600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	err := derivePQPublicKey(path)
+	err := deriveMLDSA44PublicKey(path)
 	if err == nil || !strings.Contains(err.Error(), "missing") || !strings.Contains(err.Error(), "header") {
-		t.Fatalf("derivePQPublicKey want header-missing error, got %v", err)
+		t.Fatalf("deriveMLDSA44PublicKey want header-missing error, got %v", err)
 	}
 }
 
@@ -139,9 +139,9 @@ func TestProvisionPQCertificateKeySuccess(t *testing.T) {
 	path, wantPK := withPQSeedFile(t)
 	setPQRootKeyPath(t, path)
 
-	cert, onlinePK, rootPK, expiry, err := provisionPQCertificateKey()
+	cert, onlinePK, rootPK, expiry, err := provisionMLDSA44CertificateKey()
 	if err != nil {
-		t.Fatalf("provisionPQCertificateKey: %v", err)
+		t.Fatalf("provisionMLDSA44CertificateKey: %v", err)
 	}
 	if cert == nil {
 		t.Fatal("cert is nil")
@@ -165,9 +165,9 @@ func TestProvisionPQCertificateKeyRejectsInsecureMode(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 	setPQRootKeyPath(t, path)
-	_, _, _, _, err := provisionPQCertificateKey()
+	_, _, _, _, err := provisionMLDSA44CertificateKey()
 	if err == nil || !strings.Contains(err.Error(), "insecure mode") {
-		t.Fatalf("provisionPQCertificateKey want insecure-mode error, got %v", err)
+		t.Fatalf("provisionMLDSA44CertificateKey want insecure-mode error, got %v", err)
 	}
 }
 
@@ -175,9 +175,9 @@ func TestProvisionPQCertificateKeyRejectsInsecureMode(t *testing.T) {
 // a stat error.
 func TestProvisionPQCertificateKeyRejectsMissing(t *testing.T) {
 	setPQRootKeyPath(t, filepath.Join(t.TempDir(), "nope.hex"))
-	_, _, _, _, err := provisionPQCertificateKey()
+	_, _, _, _, err := provisionMLDSA44CertificateKey()
 	if err == nil || !strings.Contains(err.Error(), "stat PQ root key file") {
-		t.Fatalf("provisionPQCertificateKey want stat error, got %v", err)
+		t.Fatalf("provisionMLDSA44CertificateKey want stat error, got %v", err)
 	}
 }
 
@@ -190,9 +190,9 @@ func TestProvisionPQCertificateKeyRejectsBareHex(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	setPQRootKeyPath(t, path)
-	_, _, _, _, err := provisionPQCertificateKey()
+	_, _, _, _, err := provisionMLDSA44CertificateKey()
 	if err == nil || !strings.Contains(err.Error(), "missing") {
-		t.Fatalf("provisionPQCertificateKey want missing-header error, got %v", err)
+		t.Fatalf("provisionMLDSA44CertificateKey want missing-header error, got %v", err)
 	}
 }
 
@@ -205,9 +205,9 @@ func TestProvisionPQCertificateKeyRejectsWrongSize(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	setPQRootKeyPath(t, path)
-	_, _, _, _, err := provisionPQCertificateKey()
+	_, _, _, _, err := provisionMLDSA44CertificateKey()
 	if err == nil || !strings.Contains(err.Error(), "bytes, want") {
-		t.Fatalf("provisionPQCertificateKey want size error, got %v", err)
+		t.Fatalf("provisionMLDSA44CertificateKey want size error, got %v", err)
 	}
 }
 
@@ -217,9 +217,9 @@ func TestTryRefreshCertPQSuccess(t *testing.T) {
 	path, pk := withPQSeedFile(t)
 	setPQRootKeyPath(t, path)
 
-	newState, newOnlinePK, err := tryRefreshCertPQ(pk)
+	newState, newOnlinePK, err := tryRefreshCertMLDSA44(pk)
 	if err != nil {
-		t.Fatalf("tryRefreshCertPQ: %v", err)
+		t.Fatalf("tryRefreshCertMLDSA44: %v", err)
 	}
 	if newState == nil || newState.cert == nil {
 		t.Fatal("newState or cert nil")
@@ -242,9 +242,9 @@ func TestTryRefreshCertPQRejectsChangedRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen other: %v", err)
 	}
-	_, _, err = tryRefreshCertPQ(other.PublicKey().Bytes())
+	_, _, err = tryRefreshCertMLDSA44(other.PublicKey().Bytes())
 	if err == nil || !strings.Contains(err.Error(), "PQ root public key on disk has changed") {
-		t.Fatalf("tryRefreshCertPQ want identity error, got %v", err)
+		t.Fatalf("tryRefreshCertMLDSA44 want identity error, got %v", err)
 	}
 }
 
@@ -266,11 +266,11 @@ func TestRefreshLoopPQRefreshesNearExpiry(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	refreshLoopPQ(ctx, zap.NewNop(), statePtr, pk)
+	refreshLoopMLDSA44(ctx, zap.NewNop(), statePtr, pk)
 
 	got := statePtr.Load()
 	if got == stSeed {
-		t.Fatal("refreshLoopPQ did not replace certState")
+		t.Fatal("refreshLoopMLDSA44 did not replace certState")
 	}
 	if remaining := time.Until(got.expiry); remaining < time.Hour {
 		t.Fatalf("post-refresh expiry too soon: %s", remaining)
@@ -299,10 +299,10 @@ func TestRefreshLoopPQLogsErrorOnIdentityChange(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	refreshLoopPQ(ctx, zap.NewNop(), statePtr, other.PublicKey().Bytes())
+	refreshLoopMLDSA44(ctx, zap.NewNop(), statePtr, other.PublicKey().Bytes())
 
 	if statePtr.Load() != stSeed {
-		t.Fatal("refreshLoopPQ replaced certState despite identity mismatch")
+		t.Fatal("refreshLoopMLDSA44 replaced certState despite identity mismatch")
 	}
 }
 

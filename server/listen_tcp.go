@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
+//go:build unix
+
 package main
 
 import (
@@ -142,24 +144,20 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 	if edState != nil {
 		edBatchCh = make(chan tcpBatchItem, tcpBatchQueueSize)
 		batcherLog := tcpLog.Named("batcher").With(zap.String("scheme", "Ed25519"))
-		batcherWg.Add(1)
-		go func() {
-			defer batcherWg.Done()
+		batcherWg.Go(func() {
 			superviseLoop(ctx, batcherLog, "tcpBatcher-ed25519", func() {
 				tcpBatcher(batcherLog, edState, edBatchCh, batchMaxSize, batchMaxLatency)
 			})
-		}()
+		})
 	}
 	if pqState != nil {
 		pqBatchCh = make(chan tcpBatchItem, tcpBatchQueueSize)
 		batcherLog := tcpLog.Named("batcher").With(zap.String("scheme", "ML-DSA-44"))
-		batcherWg.Add(1)
-		go func() {
-			defer batcherWg.Done()
+		batcherWg.Go(func() {
 			superviseLoop(ctx, batcherLog, "tcpBatcher-ml-dsa-44", func() {
 				tcpBatcher(batcherLog, pqState, pqBatchCh, batchMaxSize, batchMaxLatency)
 			})
-		}()
+		})
 	}
 
 	tcpLog.Info("listening TCP",
@@ -192,8 +190,12 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 				break
 			}
 			tcpLog.Warn("Accept failed", zap.Error(err))
-			// backoff to avoid hot spin
-			time.Sleep(acceptErrorBackoff)
+			// backoff to avoid hot spin; observe ctx.Done so shutdown isn't
+			// held
+			select {
+			case <-time.After(acceptErrorBackoff):
+			case <-ctx.Done():
+			}
 			continue
 		}
 		statsTCPAccepted.Add(1)
@@ -210,17 +212,15 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 		}
 		active.Add(1)
 		live.add(c)
-		wg.Add(1)
-		go func(conn net.Conn) {
-			defer wg.Done()
+		wg.Go(func() {
 			defer func() {
-				live.remove(conn)
+				live.remove(c)
 				active.Add(-1)
-				_ = conn.Close()
+				_ = c.Close()
 			}()
 			defer recoverGoroutine(tcpLog, "tcp conn")
-			handleTCPConn(ctx, tcpLog, conn, edState, pqState, edBatchCh, pqBatchCh, prefs)
-		}(c)
+			handleTCPConn(ctx, tcpLog, c, edState, pqState, edBatchCh, pqBatchCh, prefs)
+		})
 	}
 
 	// graceful drain: wait up to tcpShutdownGrace, then force-close
@@ -570,7 +570,10 @@ func flushTCPBatch(log *zap.Logger, st *certState, ver protocol.Version, items [
 			zap.Error(err),
 		)
 		for i := range items {
-			items[i].reply <- tcpBatchReply{err: err}
+			select {
+			case items[i].reply <- tcpBatchReply{err: err}:
+			default:
+			}
 			delivered[i] = true
 		}
 		return
@@ -586,7 +589,11 @@ func flushTCPBatch(log *zap.Logger, st *certState, ver protocol.Version, items [
 				}
 			}
 		}
-		items[i].reply <- tcpBatchReply{bytes: reply}
+		// non-blocking: a full buffer means the handler already returned
+		select {
+		case items[i].reply <- tcpBatchReply{bytes: reply}:
+		default:
+		}
 		delivered[i] = true
 	}
 }

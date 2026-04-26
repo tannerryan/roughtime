@@ -11,6 +11,7 @@ roughtime
 roughtime-client
 roughtime-debug
 roughtime-bench
+roughtime-stamp
 
 # Coverage artifacts
 coverage.out

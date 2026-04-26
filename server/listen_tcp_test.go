@@ -56,9 +56,9 @@ func newPQTCPState(t *testing.T) ([]byte, *atomic.Pointer[certState]) {
 		t.Fatalf("mldsa online: %v", err)
 	}
 	now := time.Now()
-	cert, err := protocol.NewCertificatePQ(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateMLDSA44(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
 	if err != nil {
-		t.Fatalf("NewCertificatePQ: %v", err)
+		t.Fatalf("NewCertificateMLDSA44: %v", err)
 	}
 	rootPK := rootSK.PublicKey().Bytes()
 	st := &atomic.Pointer[certState]{}

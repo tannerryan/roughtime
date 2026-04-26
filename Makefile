@@ -1,12 +1,19 @@
 # roughtime - https://github.com/tannerryan/roughtime
 
-BINARIES     = roughtime roughtime-client roughtime-debug roughtime-bench
+BINARIES     = roughtime roughtime-client roughtime-debug roughtime-bench roughtime-stamp
 # name:pkg — split on ':' by the fuzz rule
 FUZZ_TARGETS = \
+    FuzzParseEcosystem:./ \
+    FuzzDecodePublicKey:./ \
+    FuzzVersionsForScheme:./ \
+    FuzzParseProof:./ \
     FuzzDecode:./protocol/ \
+    FuzzParsePacketHeader:./protocol/ \
     FuzzParseRequest:./protocol/ \
+    FuzzParseShortVersion:./protocol/ \
     FuzzVerifyReply:./protocol/ \
     FuzzVerifyReplyAllVersions:./protocol/ \
+    FuzzPQVerifyReply:./protocol/ \
     FuzzCreateReplies:./protocol/ \
     FuzzCreateRepliesBatch:./protocol/ \
     FuzzCreateRequestWithNonce:./protocol/ \
@@ -44,6 +51,7 @@ build:
 	go build -o roughtime-client ./client
 	go build -o roughtime-debug ./debug
 	go build -o roughtime-bench ./bench
+	go build -o roughtime-stamp ./stamp
 
 # Unit tests
 test:
@@ -59,11 +67,11 @@ test-race:
 
 # Unit tests with coverage
 test-cover:
-	go test -cover ./protocol/ ./server/
+	go test -cover ./ ./protocol/ ./server/
 
 # Race + coverage profile (CI)
 test-race-cover:
-	go test -race -covermode=atomic -coverprofile=coverage.out ./protocol/ ./server/
+	go test -race -covermode=atomic -coverprofile=coverage.out ./ ./protocol/ ./server/
 
 # Verify module checksums
 verify:
@@ -104,7 +112,7 @@ vet:
 lint: vet
 	staticcheck ./...
 	golangci-lint run ./...
-	gopls check ./protocol/protocol.go ./protocol/chain.go ./protocol/sigscheme.go ./protocol/transport.go ./server/main.go ./server/listen_linux.go ./server/listen_other.go ./server/listen_tcp.go ./debug/main.go ./client/main.go ./bench/main.go ./roughtime.go
+	gopls check ./protocol/protocol.go ./protocol/chain.go ./protocol/sigscheme.go ./protocol/transport.go ./server/main.go ./server/listen_linux.go ./server/listen_other.go ./server/listen_tcp.go ./server/listen_unix.go ./debug/main.go ./client/main.go ./bench/main.go ./stamp/main.go ./roughtime.go
 
 # Full check: verify, fmt, vet, lint, build, race+cover, report card
 check: verify fmt vet lint build test-race-cover

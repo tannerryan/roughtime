@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,7 +41,6 @@ import (
 
 	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/internal/version"
-	"github.com/tannerryan/roughtime/protocol"
 )
 
 var (
@@ -51,7 +51,7 @@ var (
 	useTCP      = flag.Bool("tcp", false, "force TCP transport (ML-DSA-44 keys always use TCP)")
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "read/write timeout per attempt")
 	retries     = flag.Int("retries", 3, "max retry attempts per server (backoff 1s × 1.5^(n-1), cap 24h)")
-	chainMode   = flag.Bool("chain", true, "chain queries: derive each nonce from the previous reply")
+	chainMode   = flag.Bool("chain", true, "chain queries sequentially: each nonce derives from the previous reply")
 	all         = flag.Bool("all", false, "query every server in the ecosystem (default: random 3)")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -59,8 +59,9 @@ var (
 // defaultSampleSize is the random sample count when -all is unset.
 const defaultSampleSize = 3
 
-// maxEcosystemFileBytes caps ecosystem JSON file size before decode.
-const maxEcosystemFileBytes = 1 * 1024 * 1024
+// maxEcosystemFileBytes caps ecosystem JSON; sized for MaxEcosystemServers
+// ML-DSA-44 entries (~1.7 KiB base64 each).
+const maxEcosystemFileBytes = 4 * 1024 * 1024
 
 func main() {
 	flag.Parse()
@@ -105,6 +106,9 @@ func validateFlags() error {
 	if *all && *serversFile == "" {
 		return errors.New("-all requires -servers")
 	}
+	if *all && *nameFilter != "" {
+		return errors.New("-all and -name are mutually exclusive")
+	}
 	return nil
 }
 
@@ -119,23 +123,30 @@ func run(ctx context.Context) error {
 	if len(servers) == 1 {
 		resp, err := c.Query(ctx, servers[0])
 		if err != nil {
-			return fmt.Errorf("%s: %w", sanitize(servers[0].Name), err)
+			return fmt.Errorf("%s: %w", roughtime.SanitizeForDisplay(servers[0].Name), err)
 		}
 		printSingle(resp)
 		return nil
 	}
 
 	var results []roughtime.Result
-	var chain *protocol.Chain
+	var proof *roughtime.Proof
 	if *chainMode {
 		// two passes cross-check every server in both directions
-		cr, _ := c.QueryChain(ctx, slices.Concat(servers, servers))
+		cr, qcErr := c.QueryChain(ctx, slices.Concat(servers, servers))
+		if qcErr != nil {
+			// chain-construction failure aborts mid-run; per-row errors print
+			// below
+			fmt.Fprintf(os.Stderr, "client: chain aborted: %s\n", roughtime.SanitizeForDisplay(qcErr.Error()))
+		}
 		results = cr.Results
-		chain = cr.Chain
+		// ignore the empty-chain error so a fully-failed run still prints
+		// results
+		proof, _ = cr.Proof()
 	} else {
 		results = c.QueryAll(ctx, servers)
 	}
-	return printTable(results, chain, servers)
+	return printTable(results, proof, servers)
 }
 
 // loadServers resolves the server list from flags.
@@ -168,7 +179,11 @@ func loadServers() ([]roughtime.Server, error) {
 		return servers, nil
 	}
 	if *addr != "" && *pubkey != "" {
-		cleanAddr := sanitize(*addr)
+		host, port, err := net.SplitHostPort(*addr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -addr %q: %w", roughtime.SanitizeForDisplay(*addr), err)
+		}
+		cleanAddr := net.JoinHostPort(host, port)
 		pk, err := roughtime.DecodePublicKey(*pubkey)
 		if err != nil {
 			return nil, err
@@ -231,8 +246,8 @@ func loadServersFile(path string) ([]roughtime.Server, error) {
 
 // printSingle prints a vertical summary of one verified server response.
 func printSingle(r *roughtime.Response) {
-	safeName := sanitize(r.Server.Name)
-	displayAddr := formatAddress(r.Address)
+	safeName := roughtime.SanitizeForDisplay(r.Server.Name)
+	displayAddr := roughtime.SanitizeForDisplay(r.Address.String())
 	windowStart := r.Midpoint.Add(-r.Radius).UTC().Format(time.RFC3339)
 	windowEnd := r.Midpoint.Add(r.Radius).UTC().Format(time.RFC3339)
 	status := "out-of-sync"
@@ -255,12 +270,13 @@ func printSingle(r *roughtime.Response) {
 }
 
 // printTable prints the per-server table, drift consensus, and chain status.
-func printTable(results []roughtime.Result, chain *protocol.Chain, servers []roughtime.Server) error {
+func printTable(results []roughtime.Result, proof *roughtime.Proof, servers []roughtime.Server) error {
 	nameW, addrW := 30, 30
 	for _, s := range servers {
 		nameW = max(nameW, len(s.Name))
 		if len(s.Addresses) > 0 {
-			// +6 for the "tcp://" / "udp://" prefix from [formatAddress]
+			// +6 accounts for the "tcp://" / "udp://" prefix from
+			// Address.String
 			addrW = max(addrW, len(s.Addresses[0].Address)+6)
 		}
 	}
@@ -268,25 +284,24 @@ func printTable(results []roughtime.Result, chain *protocol.Chain, servers []rou
 	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
 	errFmt := fmt.Sprintf("%%-%ds  %%-%ds  error: %%s\n", nameW, addrW)
 
-	var drifts []time.Duration
+	var deduped []roughtime.Result
 	seen := make(map[string]bool) // dedupe chained two-pass
 	var succeeded, failed int
 	for _, r := range results {
 		if r.Err != nil {
-			displayAddr := formatAddress(r.Address)
+			displayAddr := roughtime.SanitizeForDisplay(r.Address.String())
 			if displayAddr == "://" && len(r.Server.Addresses) > 0 {
-				displayAddr = formatAddress(r.Server.Addresses[0])
+				displayAddr = roughtime.SanitizeForDisplay(r.Server.Addresses[0].String())
 			}
-			fmt.Printf(errFmt, sanitize(r.Server.Name), displayAddr, sanitize(r.Err.Error()))
+			fmt.Printf(errFmt, roughtime.SanitizeForDisplay(r.Server.Name), displayAddr, roughtime.SanitizeForDisplay(r.Err.Error()))
 			failed++
 			continue
 		}
 		resp := r.Response
-		displayAddr := formatAddress(resp.Address)
-		d := resp.Drift()
-		key := resp.Server.Name + "|" + displayAddr
+		displayAddr := roughtime.SanitizeForDisplay(resp.Address.String())
+		key := string(resp.Server.PublicKey)
 		if !seen[key] {
-			drifts = append(drifts, d)
+			deduped = append(deduped, r)
 			seen[key] = true
 		}
 		status := "out-of-sync"
@@ -294,21 +309,21 @@ func printTable(results []roughtime.Result, chain *protocol.Chain, servers []rou
 			status = "in-sync"
 		}
 		fmt.Printf(rowFmt,
-			sanitize(resp.Server.Name),
+			roughtime.SanitizeForDisplay(resp.Server.Name),
 			displayAddr,
 			resp.Version.ShortString(),
 			resp.Midpoint.UTC().Format(time.RFC3339),
 			"±"+resp.Radius.String(),
 			resp.RTT.Round(time.Millisecond).String(),
-			d.Round(time.Millisecond).String(),
+			resp.Drift().Round(time.Millisecond).String(),
 			status,
 		)
 		succeeded++
 	}
 	fmt.Printf("\n%d/%d servers responded\n", succeeded, succeeded+failed)
-	printConsensus(drifts)
-	if chain != nil && len(chain.Links) > 0 {
-		printChainStatus(chain)
+	printConsensus(deduped)
+	if proof != nil {
+		printChainStatus(proof)
 	}
 	if succeeded == 0 {
 		return errors.New("no servers responded")
@@ -316,61 +331,28 @@ func printTable(results []roughtime.Result, chain *protocol.Chain, servers []rou
 	return nil
 }
 
-// printConsensus prints median drift, consensus midpoint, and spread.
-func printConsensus(drifts []time.Duration) {
-	if len(drifts) == 0 {
+// printConsensus formats the [roughtime.Consensus] summary across results.
+func printConsensus(results []roughtime.Result) {
+	c := roughtime.Consensus(results)
+	if c.Samples == 0 {
 		return
 	}
-	median := medianDuration(drifts)
-	lo, hi := slices.Min(drifts), slices.Max(drifts)
-	consensus := time.Now().Add(median).UTC().Format(time.RFC3339)
+	consensus := time.Now().Add(c.Median).UTC().Format(time.RFC3339)
 	fmt.Printf("Consensus drift:    %s (median of %d samples)\n",
-		median.Round(time.Millisecond), len(drifts))
+		c.Median.Round(time.Millisecond), c.Samples)
 	fmt.Printf("Consensus midpoint: %s\n", consensus)
 	fmt.Printf("Drift spread:       %s (min=%s, max=%s)\n",
-		(hi - lo).Round(time.Millisecond),
-		lo.Round(time.Millisecond),
-		hi.Round(time.Millisecond),
+		(c.Max - c.Min).Round(time.Millisecond),
+		c.Min.Round(time.Millisecond),
+		c.Max.Round(time.Millisecond),
 	)
 }
 
-func printChainStatus(c *protocol.Chain) {
-	if err := c.Verify(); err != nil {
+// printChainStatus verifies the proof and prints the chain summary line.
+func printChainStatus(p *roughtime.Proof) {
+	if err := p.Verify(); err != nil {
 		fmt.Printf("Chain:              FAILED: %s\n", err)
 		return
 	}
-	fmt.Printf("Chain:              ok (%d links verified)\n", len(c.Links))
-}
-
-func medianDuration(d []time.Duration) time.Duration {
-	s := slices.Clone(d)
-	slices.Sort(s)
-	n := len(s)
-	if n%2 == 1 {
-		return s[n/2]
-	}
-	return (s[n/2-1] + s[n/2]) / 2
-}
-
-// formatAddress renders an [roughtime.Address] as "<transport>://<host:port>".
-// Inputs originate from user-controlled config (ecosystem JSON, -addr flag) and
-// are sanitized to prevent log/output injection.
-func formatAddress(a roughtime.Address) string {
-	return sanitize(a.Transport) + "://" + sanitize(a.Address)
-}
-
-// sanitize strips control characters and bidi overrides to defeat Trojan-Source
-// attacks on CLI output.
-func sanitize(s string) string {
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		if (r >= 0x202A && r <= 0x202E) || (r >= 0x2066 && r <= 0x2069) {
-			return -1
-		}
-		return r
-	}, s)
+	fmt.Printf("Chain:              ok (%d links verified)\n", p.Len())
 }

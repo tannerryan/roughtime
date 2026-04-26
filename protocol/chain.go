@@ -44,7 +44,7 @@ type ChainLink struct {
 }
 
 // Chain accumulates sequential Roughtime queries for causal ordering and
-// malfeasance reporting.
+// malfeasance reporting. A Chain is not safe for concurrent use.
 type Chain struct {
 	Links []ChainLink
 }
@@ -109,6 +109,25 @@ func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader
 		Rand:      blind,
 		PublicKey: append([]byte(nil), rootPK...),
 		Nonce:     nonce,
+		Request:   request,
+	}, nil
+}
+
+// NextRequestWithNonce is [Chain.NextRequest] with a caller-supplied nonce.
+// Only valid as the first link — subsequent links must derive nonces causally
+// so the malfeasance proof binds.
+func (c *Chain) NextRequestWithNonce(versions []Version, rootPK, nonce []byte) (ChainLink, error) {
+	if len(c.Links) > 0 {
+		return ChainLink{}, errors.New("protocol: NextRequestWithNonce only valid for the first chain link")
+	}
+	srv := ComputeSRV(rootPK)
+	request, err := CreateRequestWithNonce(versions, nonce, srv)
+	if err != nil {
+		return ChainLink{}, fmt.Errorf("protocol: create chained request: %w", err)
+	}
+	return ChainLink{
+		PublicKey: append([]byte(nil), rootPK...),
+		Nonce:     append([]byte(nil), nonce...),
 		Request:   request,
 	}, nil
 }

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
+//go:build unix
+
 // Command roughtime is a Roughtime server. It serves Ed25519 over UDP/TCP and
 // the experimental ML-DSA-44 extension over TCP. Run with -h for flags.
 package main
@@ -180,9 +182,9 @@ func generateKeypair(path string) error {
 	return nil
 }
 
-// generatePQKeypair generates an ML-DSA-44 root key pair, writes the headered
-// seed to path, and prints the public key.
-func generatePQKeypair(path string) error {
+// generateMLDSA44Keypair generates an ML-DSA-44 root key pair, writes the
+// headered seed to path, and prints the public key.
+func generateMLDSA44Keypair(path string) error {
 	sk, err := mldsa.GenerateKey(mldsa.MLDSA44())
 	if err != nil {
 		return fmt.Errorf("generating ML-DSA-44 key: %w", err)
@@ -225,9 +227,9 @@ func derivePublicKey(path string) error {
 	return nil
 }
 
-// derivePQPublicKey reads an ML-DSA-44 root seed and prints the public key; the
-// header is required (no legacy bare-hex format).
-func derivePQPublicKey(path string) error {
+// deriveMLDSA44PublicKey reads an ML-DSA-44 root seed and prints the public
+// key; the header is required (no legacy bare-hex format).
+func deriveMLDSA44PublicKey(path string) error {
 	raw, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return fmt.Errorf("reading %s: %w", path, err)
@@ -336,53 +338,63 @@ func validateFlags() error {
 
 func main() {
 	flag.Parse()
-	if *showVersion {
-		fmt.Printf("roughtime %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Version, version.Copyright)
-		return
-	}
-	if *keygen != "" {
-		if err := generateKeypair(*keygen); err != nil {
-			fmt.Fprintf(os.Stderr, "keygen: %s\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *pqKeygen != "" {
-		if err := generatePQKeypair(*pqKeygen); err != nil {
-			fmt.Fprintf(os.Stderr, "pq-keygen: %s\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *pubkey != "" {
-		if err := derivePublicKey(*pubkey); err != nil {
-			fmt.Fprintf(os.Stderr, "pubkey: %s\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *pqPubkey != "" {
-		if err := derivePQPublicKey(*pqPubkey); err != nil {
-			fmt.Fprintf(os.Stderr, "pq-pubkey: %s\n", err)
-			os.Exit(1)
-		}
-		return
-	}
-	if err := validateFlags(); err != nil {
+	if err := dispatch(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}
+}
+
+// dispatch routes flag.Parsed input to a subcommand or to [serve], returning
+// any error to main for unified os.Exit handling. Tests invoke serve directly.
+func dispatch() error {
+	if *showVersion {
+		fmt.Printf("roughtime %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Version, version.Copyright)
+		return nil
+	}
+	if *keygen != "" {
+		if err := generateKeypair(*keygen); err != nil {
+			return fmt.Errorf("keygen: %w", err)
+		}
+		return nil
+	}
+	if *pqKeygen != "" {
+		if err := generateMLDSA44Keypair(*pqKeygen); err != nil {
+			return fmt.Errorf("pq-keygen: %w", err)
+		}
+		return nil
+	}
+	if *pubkey != "" {
+		if err := derivePublicKey(*pubkey); err != nil {
+			return fmt.Errorf("pubkey: %w", err)
+		}
+		return nil
+	}
+	if *pqPubkey != "" {
+		if err := deriveMLDSA44PublicKey(*pqPubkey); err != nil {
+			return fmt.Errorf("pq-pubkey: %w", err)
+		}
+		return nil
+	}
+	if err := validateFlags(); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return serve(ctx)
+}
+
+// serve runs the Roughtime server until ctx is cancelled or a listener fails.
+// Reads the standard flag globals; configure them before calling.
+func serve(ctx context.Context) error {
 	lvl, err := zapcore.ParseLevel(*logLevel)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid -log-level %q: %s\n", *logLevel, err)
-		os.Exit(1)
+		return fmt.Errorf("invalid -log-level %q: %w", *logLevel, err)
 	}
-	cfg := zap.NewProductionConfig()
-	cfg.Level = zap.NewAtomicLevelAt(lvl)
-	base, err := cfg.Build()
+	zcfg := zap.NewProductionConfig()
+	zcfg.Level = zap.NewAtomicLevelAt(lvl)
+	base, err := zcfg.Build()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "creating logger: %s\n", err)
-		os.Exit(1)
+		return fmt.Errorf("creating logger: %w", err)
 	}
 	// zap.Sync returns ENOTTY on terminal stderr; ignore
 	defer func() { _ = base.Sync() }()
@@ -412,16 +424,13 @@ func main() {
 		})),
 	)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	certLog := logger.Named("cert")
 
 	var edState *atomic.Pointer[certState]
 	if *rootKeySeedHexFile != "" {
 		cert, onlinePK, rootPK, expiry, err := provisionCertificateKey()
 		if err != nil {
-			certLog.Fatal("provisioning initial Ed25519 certificate", zap.Error(err))
+			return fmt.Errorf("provisioning initial Ed25519 certificate: %w", err)
 		}
 		certLog.Info("provisioned initial Ed25519 certificate",
 			zap.String("online_pubkey", hex.EncodeToString(onlinePK)),
@@ -439,9 +448,9 @@ func main() {
 
 	var pqState *atomic.Pointer[certState]
 	if *pqRootKeySeedHexFile != "" {
-		cert, onlinePK, rootPK, expiry, err := provisionPQCertificateKey()
+		cert, onlinePK, rootPK, expiry, err := provisionMLDSA44CertificateKey()
 		if err != nil {
-			certLog.Fatal("provisioning initial ML-DSA-44 certificate", zap.Error(err))
+			return fmt.Errorf("provisioning initial ML-DSA-44 certificate: %w", err)
 		}
 		certLog.Info("provisioned initial ML-DSA-44 certificate",
 			zap.String("online_pubkey", hex.EncodeToString(onlinePK)),
@@ -453,15 +462,15 @@ func main() {
 		pqState.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
 
 		initialRootPK := append([]byte(nil), rootPK...)
-		go superviseLoop(ctx, certLog, "refreshLoopPQ", func() { refreshLoopPQ(ctx, certLog, pqState, initialRootPK) })
+		go superviseLoop(ctx, certLog, "refreshLoopMLDSA44", func() { refreshLoopMLDSA44(ctx, certLog, pqState, initialRootPK) })
 	}
 
 	statsLog := logger.Named("stats")
 	go superviseLoop(ctx, statsLog, "statsLoop", func() { statsLoop(ctx, statsLog, edState, pqState) })
 
 	// UDP carries only Ed25519 (ML-DSA breaks the amplification budget); TCP
-	// carries both. A bind failure cancels the shared listener context so peers
-	// drain, then Fatal so the supervisor restarts.
+	// carries both. A listener error cancels the shared context so the peer
+	// drains, and serve returns the first error.
 	listenerCtx, cancelListeners := context.WithCancel(ctx)
 	defer cancelListeners()
 	var listenerErr atomic.Pointer[error]
@@ -473,25 +482,22 @@ func main() {
 	}
 	var wg sync.WaitGroup
 	if edState != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if err := listen(listenerCtx, edState); err != nil {
 				recordListenerErr("UDP", err)
 			}
-		}()
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		if err := listenTCP(listenerCtx, edState, pqState); err != nil {
 			recordListenerErr("TCP", err)
 		}
-	}()
+	})
 	wg.Wait()
 	if err := listenerErr.Load(); err != nil {
-		logger.Fatal("listener failed", zap.Error(*err))
+		return *err
 	}
+	return nil
 }
 
 // provisionCertificateKey reads the Ed25519 root seed and signs a fresh online
@@ -528,9 +534,9 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
 }
 
-// provisionPQCertificateKey reads the ML-DSA-44 root seed and signs a fresh
-// online delegation; returns the encoded online and root public keys.
-func provisionPQCertificateKey() (*protocol.Certificate, []byte, []byte, time.Time, error) {
+// provisionMLDSA44CertificateKey reads the ML-DSA-44 root seed and signs a
+// fresh online delegation; returns the encoded online and root public keys.
+func provisionMLDSA44CertificateKey() (*protocol.Certificate, []byte, []byte, time.Time, error) {
 	path := filepath.Clean(*pqRootKeySeedHexFile)
 
 	raw, err := readPrivateKeyFile(path, "PQ root")
@@ -558,7 +564,7 @@ func provisionPQCertificateKey() (*protocol.Certificate, []byte, []byte, time.Ti
 	onlinePK := onlineSK.PublicKey().Bytes()
 
 	now := time.Now()
-	cert, err := protocol.NewCertificatePQ(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateMLDSA44(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("generating PQ online certificate: %w", err)
 	}
@@ -655,11 +661,11 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 	})
 }
 
-// refreshLoopPQ is the ML-DSA-44 counterpart of refreshLoop; initialRootPK is
-// the encoded root public key captured at startup.
-func refreshLoopPQ(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK []byte) {
+// refreshLoopMLDSA44 is the ML-DSA-44 counterpart of refreshLoop; initialRootPK
+// is the encoded root public key captured at startup.
+func refreshLoopMLDSA44(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK []byte) {
 	runRefreshLoop(ctx, log, "ML-DSA-44", state, func() (*certState, []byte, error) {
-		return tryRefreshCertPQ(initialRootPK)
+		return tryRefreshCertMLDSA44(initialRootPK)
 	})
 }
 
@@ -751,10 +757,10 @@ func tryRefreshCert(initialRootPK ed25519.PublicKey) (*certState, ed25519.Public
 	return &certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
 }
 
-// tryRefreshCertPQ reads the ML-DSA-44 root key, rejects any root-key change,
-// and returns a fresh certState plus the encoded new online public key.
-func tryRefreshCertPQ(initialRootPK []byte) (*certState, []byte, error) {
-	newCert, newOnlinePK, newRootPK, newExpiry, err := provisionPQCertificateKey()
+// tryRefreshCertMLDSA44 reads the ML-DSA-44 root key, rejects any root-key
+// change, and returns a fresh certState plus the encoded new online public key.
+func tryRefreshCertMLDSA44(initialRootPK []byte) (*certState, []byte, error) {
+	newCert, newOnlinePK, newRootPK, newExpiry, err := provisionMLDSA44CertificateKey()
 	if err != nil {
 		return nil, nil, err
 	}

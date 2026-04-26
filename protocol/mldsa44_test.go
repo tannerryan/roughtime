@@ -27,7 +27,7 @@ func testPQCert(t *testing.T) (*Certificate, []byte) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	cert, err := NewCertificatePQ(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := NewCertificateMLDSA44(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,10 +230,10 @@ func TestPQComputeSRV(t *testing.T) {
 }
 
 // TestPQNewCertificateRejectsNilKey covers the nil-key guard in
-// NewCertificatePQ.
+// NewCertificateMLDSA44.
 func TestPQNewCertificateRejectsNilKey(t *testing.T) {
 	now := time.Now()
-	if _, err := NewCertificatePQ(now, now.Add(time.Hour), nil, nil); err == nil {
+	if _, err := NewCertificateMLDSA44(now, now.Add(time.Hour), nil, nil); err == nil {
 		t.Fatal("expected error on nil keys")
 	}
 }
@@ -243,7 +243,7 @@ func TestPQNewCertificateRejectsBadWindow(t *testing.T) {
 	rootSK, _ := mldsa.GenerateKey(mldsa.MLDSA44())
 	onlineSK, _ := mldsa.GenerateKey(mldsa.MLDSA44())
 	now := time.Now()
-	if _, err := NewCertificatePQ(now.Add(time.Hour), now, onlineSK, rootSK); err == nil {
+	if _, err := NewCertificateMLDSA44(now.Add(time.Hour), now, onlineSK, rootSK); err == nil {
 		t.Fatal("expected error when MINT >= MAXT")
 	}
 }
@@ -398,4 +398,42 @@ func TestPQSelectVersion(t *testing.T) {
 	if err != nil || v != VersionDraft12 {
 		t.Fatalf("dual server falling back to Draft12: v=%v err=%v", v, err)
 	}
+}
+
+// FuzzPQVerifyReply fuzzes ML-DSA-44 reply verification with mutated reply,
+// root key, nonce, and request bytes.
+func FuzzPQVerifyReply(f *testing.F) {
+	rootSK, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		f.Fatal(err)
+	}
+	onlineSK, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		f.Fatal(err)
+	}
+	rootPKBytes := rootSK.PublicKey().Bytes()
+	now := time.Now()
+	cert, err := NewCertificateMLDSA44(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	if err != nil {
+		f.Fatal(err)
+	}
+	versions := []Version{VersionMLDSA44}
+	srv := ComputeSRV(rootPKBytes)
+	nonce, req, err := CreateRequest(versions, rand.Reader, srv)
+	if err != nil {
+		f.Fatal(err)
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		f.Fatal(err)
+	}
+	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, now, time.Second, cert)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(replies[0], rootPKBytes, nonce, req)
+
+	f.Fuzz(func(t *testing.T, reply, rootKey, nonce, request []byte) {
+		VerifyReply(versions, reply, rootKey, nonce, request) //nolint:errcheck // fuzz target tests for panics
+	})
 }

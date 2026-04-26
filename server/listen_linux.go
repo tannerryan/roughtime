@@ -74,10 +74,8 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 
 	var wg sync.WaitGroup
 	for i, c := range conns {
-		wg.Add(1)
-		go func(id int, c net.PacketConn) {
-			defer wg.Done()
-			wlog := listenLog.With(zap.Int("worker", id))
+		wg.Go(func() {
+			wlog := listenLog.With(zap.Int("worker", i))
 			// restart on panic so the SO_REUSEPORT pool doesn't shrink
 			for ctx.Err() == nil {
 				func() {
@@ -89,7 +87,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 				}
 				wlog.Warn("worker exited before shutdown, restarting")
 			}
-		}(i, c)
+		})
 	}
 	wg.Wait()
 

@@ -1,9 +1,11 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Package protocol implements the Roughtime wire protocol for Google-Roughtime
-// and IETF drafts 01-19, plus an experimental ML-DSA-44 post-quantum variant
-// ([VersionMLDSA44]); see README.md for the PQ caveats.
+// Package protocol is the low-level Roughtime wire layer (Google-Roughtime,
+// IETF drafts 01-19, and an experimental ML-DSA-44 post-quantum variant — see
+// [VersionMLDSA44] and README.md). End-user applications should use the
+// high-level [github.com/tannerryan/roughtime] package; this package stays
+// exposed for the server, benchmark, and debug tools.
 //
 // Drafts 12-19 share wire version 0x8000000c, disambiguated by [TagTYPE] (draft
 // 14+). Multi-request batches to draft 14-15 peers are not strictly conformant
@@ -344,8 +346,9 @@ func radiSeconds(d time.Duration) uint32 {
 	return uint32(min(max(sec, floor), math.MaxUint32))
 }
 
-// microsPerDay is µs in a UTC day (Roughtime defines MJD in TAI-equivalent
-// µs-of-day, no leap seconds).
+// microsPerDay is µs in a non-leap UTC day. Drafts 01-07 encode UTC µs since
+// midnight; leap-second days legally exceed this, but we reject to flag
+// malformed wire.
 const microsPerDay int64 = 86_400 * 1_000_000
 
 // mjdMicroToTime converts an MJD-µs timestamp to a [time.Time]. The sub-day µs
@@ -716,8 +719,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, fmt.Errorf("protocol: SRV length %d invalid for drafts 10+ (want 32)", len(req.SRV))
 	}
 
-	// drafts 12+ MUST zero ZZZZ; drafts 01-11 only SHOULD, so non-zero padding
-	// is tolerated there for interop
+	// drafts 10+ say ZZZZ MUST be zero; we enforce only on drafts 12+ so
+	// non-conformant 10-11 peers still interop
 	if maxGroup >= groupD12 {
 		if pad, ok := msg[TagZZZZ]; ok {
 			for _, b := range pad {
@@ -867,7 +870,7 @@ func SelectVersion(clientVersions []Version, nonceLen int, serverVersions []Vers
 
 // Certificate holds a pre-signed online delegation. CERT bytes are built once
 // per wire group at construction and reused. Use [NewCertificate] for Ed25519
-// and [NewCertificatePQ] for ML-DSA-44.
+// and [NewCertificateMLDSA44] for ML-DSA-44.
 type Certificate struct {
 	scheme sigScheme
 	mint   time.Time
@@ -927,9 +930,9 @@ func NewCertificate(mint, maxt time.Time, onlineSK, rootSK ed25519.PrivateKey) (
 	return c, nil
 }
 
-// NewCertificatePQ creates and signs an ML-DSA-44 delegation certificate. The
-// PQ suite uses a single wire group, so the cache has one entry.
-func NewCertificatePQ(mint, maxt time.Time, onlineSK, rootSK *mldsa.PrivateKey) (*Certificate, error) {
+// NewCertificateMLDSA44 creates and signs an ML-DSA-44 delegation certificate.
+// The PQ suite uses a single wire group, so the cache has one entry.
+func NewCertificateMLDSA44(mint, maxt time.Time, onlineSK, rootSK *mldsa.PrivateKey) (*Certificate, error) {
 	if onlineSK == nil || rootSK == nil {
 		return nil, errors.New("protocol: nil ML-DSA key")
 	}
@@ -1040,7 +1043,9 @@ type merkleTree struct {
 }
 
 // merkleNodeFirst reports whether node precedes hash when INDX bit is 0. Drafts
-// 05-13 use node-first; 14+ switched to hash-first (groupD14 follows draft-19).
+// 05-13 use node-first; draft-16+ reversed to hash-first. groupD14 here treats
+// drafts 14-19 as hash-first — the deliberate 14-15 batch divergence is in the
+// README.
 func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }
@@ -1049,16 +1054,15 @@ func merkleNodeFirst(g wireGroup) bool {
 const maxMerkleLeaves = 1 << 32
 
 // newMerkleTree builds the tree and per-leaf paths in one bottom-up pass;
-// panics if len(leafInputs) > [maxMerkleLeaves].
+// panics if len(leafInputs) is zero or > [maxMerkleLeaves].
 func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 	n := len(leafInputs)
-	hs := hashSize(g)
 
+	if n == 0 {
+		panic("protocol: newMerkleTree called with zero leaves")
+	}
 	if uint64(n) > maxMerkleLeaves {
 		panic(fmt.Sprintf("protocol: Merkle tree with %d leaves exceeds 2^32 (PATH > 32 hash values)", n))
-	}
-	if n == 0 {
-		return &merkleTree{rootHash: make([]byte, hs)}
 	}
 
 	hashes := make([][]byte, n)
@@ -1668,8 +1672,8 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("protocol: decode RADI: %w", err)
 	}
-	// drafts 12+: RADI must be nonzero
-	if g >= groupD12 && radius == 0 {
+	// drafts 10+: RADI must be nonzero
+	if g >= groupD10 && radius == 0 {
 		return time.Time{}, 0, errors.New("protocol: RADI must not be zero")
 	}
 	return midpoint, radius, nil

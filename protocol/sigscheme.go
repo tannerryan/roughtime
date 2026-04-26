@@ -11,6 +11,10 @@ import (
 	"filippo.io/mldsa"
 )
 
+// MLDSA44PublicKeySize is the on-wire public-key length of the experimental
+// ML-DSA-44 (FIPS 204) wire variant.
+const MLDSA44PublicKeySize = mldsa.MLDSA44PublicKeySize
+
 // sigScheme identifies the signature algorithm: Ed25519 for standard versions,
 // ML-DSA-44 for the experimental post-quantum version.
 type sigScheme int

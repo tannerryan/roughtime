@@ -273,6 +273,44 @@ func TestNextRequestRejectsMissingResponse(t *testing.T) {
 	}
 }
 
+// TestNextRequestWithNonceFirstLink verifies the first link's nonce is the
+// caller-supplied value.
+func TestNextRequestWithNonceFirstLink(t *testing.T) {
+	srv := newChainServer(t, VersionDraft12)
+	seed := bytes.Repeat([]byte{0x42}, 32)
+	var c Chain
+	link, err := c.NextRequestWithNonce([]Version{VersionDraft12}, srv.rootPK, seed)
+	if err != nil {
+		t.Fatalf("NextRequestWithNonce: %v", err)
+	}
+	if !bytes.Equal(link.Nonce, seed) {
+		t.Fatalf("link.Nonce = %x, want seed %x", link.Nonce, seed)
+	}
+	if link.Rand != nil {
+		t.Fatalf("link.Rand = %x, want nil for first link", link.Rand)
+	}
+}
+
+// TestNextRequestWithNonceRejectsNonFirst verifies NextRequestWithNonce errors
+// when the chain is non-empty (only the first link may use a custom nonce).
+func TestNextRequestWithNonceRejectsNonFirst(t *testing.T) {
+	srv := newChainServer(t, VersionDraft12)
+	c := Chain{Links: []ChainLink{{Request: []byte("dummy"), Response: []byte("dummy-reply")}}}
+	if _, err := c.NextRequestWithNonce([]Version{VersionDraft12}, srv.rootPK, bytes.Repeat([]byte{0x42}, 32)); err == nil {
+		t.Fatal("expected error when chain is non-empty")
+	}
+}
+
+// TestNextRequestWithNonceRejectsBadLength verifies the nonce length must match
+// the negotiated wire group.
+func TestNextRequestWithNonceRejectsBadLength(t *testing.T) {
+	srv := newChainServer(t, VersionDraft12)
+	var c Chain
+	if _, err := c.NextRequestWithNonce([]Version{VersionDraft12}, srv.rootPK, []byte{1, 2, 3}); err == nil {
+		t.Fatal("expected length error for 3-byte nonce")
+	}
+}
+
 func TestVerifyValidChain(t *testing.T) {
 	for _, n := range []int{1, 2, 3, 5} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {

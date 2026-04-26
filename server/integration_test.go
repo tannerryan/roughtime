@@ -636,7 +636,7 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	}
 	defer c.Close()
 	// enlarge rcvbuf so queued replies are not dropped
-	_ = c.SetReadBuffer(1 << 20)
+	_ = c.SetReadBuffer(1 * 1024 * 1024)
 
 	nonces := make([][]byte, n)
 	reqs := make([][]byte, n)

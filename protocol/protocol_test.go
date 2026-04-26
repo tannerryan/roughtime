@@ -1390,12 +1390,14 @@ func TestCacheKeyForDistinctGroups(t *testing.T) {
 	}
 }
 
-// TestMerkleTreeEmpty verifies zero-filled root for an empty tree.
+// TestMerkleTreeEmpty verifies the zero-leaf precondition panics.
 func TestMerkleTreeEmpty(t *testing.T) {
-	tree := newMerkleTree(groupD12, nil)
-	if len(tree.rootHash) != 32 {
-		t.Fatal("wrong root length")
-	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on zero leaves")
+		}
+	}()
+	newMerkleTree(groupD12, nil)
 }
 
 // TestMerkleTreeSingleLeaf verifies root equals leaf hash with empty path.
@@ -3576,7 +3578,7 @@ func TestVerifyReplyToleratesMissingTYPE(t *testing.T) {
 	}
 }
 
-// TestVerifyReplyRejectsZeroRADI verifies drafts 12+ reject a signed response
+// TestVerifyReplyRejectsZeroRADI verifies drafts 10+ reject a signed response
 // with RADI=0.
 func TestVerifyReplyRejectsZeroRADI(t *testing.T) {
 	cert, _ := testCert(t)

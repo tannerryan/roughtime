@@ -86,19 +86,14 @@ func validateFlags() error {
 	return nil
 }
 
-// defaultProbeVersions returns the version list to probe for sch.
+// defaultProbeVersions returns the version list to probe for sch. Ed25519
+// includes Google-Roughtime so the debug client can also surface that variant.
 func defaultProbeVersions(sch roughtime.Scheme) []protocol.Version {
-	if sch == roughtime.SchemeMLDSA44 {
-		return []protocol.Version{protocol.VersionMLDSA44}
+	versions := roughtime.VersionsForScheme(sch)
+	if sch == roughtime.SchemeEd25519 {
+		versions = append(versions, protocol.VersionGoogle)
 	}
-	out := make([]protocol.Version, 0)
-	for _, v := range protocol.Supported() {
-		if v == protocol.VersionMLDSA44 {
-			continue
-		}
-		out = append(out, v)
-	}
-	return out
+	return versions
 }
 
 // run probes all versions and prints diagnostics for the best one.
@@ -120,6 +115,12 @@ func run() error {
 		v, err := protocol.ParseShortVersion(*forceVer)
 		if err != nil {
 			return err
+		}
+		// forced wire version must match the pubkey's signature scheme
+		pqKey := sch == roughtime.SchemeMLDSA44
+		pqVer := v == protocol.VersionMLDSA44
+		if pqKey != pqVer {
+			return fmt.Errorf("-ver %s is incompatible with the supplied root key", *forceVer)
 		}
 		probeVersions = []protocol.Version{v}
 	}
@@ -238,15 +239,21 @@ func isIETF(pkt []byte) bool {
 	return len(pkt) >= 8 && string(pkt[:8]) == "ROUGHTIM"
 }
 
-// msgBody strips the 12-byte ROUGHTIM header if present.
+// msgBody strips the 12-byte ROUGHTIM header if present, bounded by the
+// declared length so trailing bytes are not included.
 func msgBody(pkt []byte) []byte {
-	if isIETF(pkt) {
-		if len(pkt) < 12 {
-			return nil
-		}
-		return pkt[12:]
+	if !isIETF(pkt) {
+		return pkt
 	}
-	return pkt
+	bodyLen, err := protocol.ParsePacketHeader(pkt)
+	if err != nil {
+		return nil
+	}
+	end := protocol.PacketHeaderSize + int(bodyLen)
+	if end > len(pkt) {
+		return nil
+	}
+	return pkt[protocol.PacketHeaderSize:end]
 }
 
 // decode wraps [protocol.Decode] and logs errors to stderr.
@@ -339,12 +346,12 @@ func printVerified(r probeResult) {
 	fmt.Printf("Midpoint:        %s\n", r.midpoint.UTC().Format(time.RFC3339))
 	fmt.Printf("Radius:          %s\n", r.radius)
 	fmt.Printf("Local time:      %s\n", r.localNow.UTC().Format(time.RFC3339Nano))
-	fmt.Printf("Clock drift:     %s\n", r.midpoint.Sub(r.localNow).Round(time.Millisecond))
+	fmt.Printf("Clock drift:     %s\n", r.midpoint.Sub(r.localNow.Add(-r.rtt/2)).Round(time.Millisecond))
 	switch {
 	case transport != "udp":
 		fmt.Printf("Amplification:   n/a (%s, reply %d, request %d)\n", transport, len(r.reply), len(r.request))
 	case len(r.reply) <= len(r.request):
-		fmt.Printf("Amplification:   ok (reply %d ≤ request %d)\n", len(r.reply), len(r.request))
+		fmt.Printf("Amplification:   ok (reply %d <= request %d)\n", len(r.reply), len(r.request))
 	default:
 		fmt.Printf("Amplification:   VIOLATED (reply %d > request %d)\n", len(r.reply), len(r.request))
 	}
@@ -403,8 +410,11 @@ func printSREP(r probeResult, tags map[uint32][]byte) {
 	}
 	if midp, ok := srep[protocol.TagMIDP]; ok && len(midp) == 8 {
 		raw := binary.LittleEndian.Uint64(midp)
-		ts, _ := protocol.DecodeTimestamp(r.version, midp)
-		fmt.Printf("Midpoint (raw):  %d (%s)\n", raw, ts.UTC().Format(time.RFC3339))
+		if ts, err := protocol.DecodeTimestamp(r.version, midp); err == nil {
+			fmt.Printf("Midpoint (raw):  %d (%s)\n", raw, ts.UTC().Format(time.RFC3339))
+		} else {
+			fmt.Printf("Midpoint (raw):  %d (decode failed: %s)\n", raw, err)
+		}
 	}
 	if radi, ok := srep[protocol.TagRADI]; ok && len(radi) == 4 {
 		fmt.Printf("Radius (raw):    %d\n", binary.LittleEndian.Uint32(radi))
@@ -449,10 +459,12 @@ func printCert(r probeResult, tags map[uint32][]byte) {
 
 	deleBytes, ok := certMsg[protocol.TagDELE]
 	if !ok {
+		fmt.Println("DELE:            missing")
 		return
 	}
 	dele := decode(deleBytes)
 	if dele == nil {
+		fmt.Println("DELE:            decode failed")
 		return
 	}
 
@@ -464,23 +476,33 @@ func printCert(r probeResult, tags map[uint32][]byte) {
 	var mintTime, maxtTime time.Time
 	var haveMint, haveMaxt bool
 	if mint, ok := dele[protocol.TagMINT]; ok && len(mint) == 8 {
-		mintTime, _ = protocol.DecodeTimestamp(r.version, mint)
-		haveMint = true
-		fmt.Printf("Not before:      %s\n", mintTime.UTC().Format(time.RFC3339))
+		t, err := protocol.DecodeTimestamp(r.version, mint)
+		if err != nil {
+			fmt.Printf("Not before:      decode failed: %s\n", err)
+		} else {
+			mintTime = t
+			haveMint = true
+			fmt.Printf("Not before:      %s\n", mintTime.UTC().Format(time.RFC3339))
+		}
 	}
 	if maxt, ok := dele[protocol.TagMAXT]; ok && len(maxt) == 8 {
-		maxtTime, _ = protocol.DecodeTimestamp(r.version, maxt)
-		haveMaxt = true
-		fmt.Printf("Not after:       %s\n", maxtTime.UTC().Format(time.RFC3339))
-		// prefer verified midpoint so a skewed local clock does not mislead
-		ref := time.Now()
-		if verified {
-			ref = r.midpoint
-		}
-		if remaining := maxtTime.Sub(ref); remaining > 0 {
-			fmt.Printf("Expires in:      %s\n", remaining.Round(time.Second))
+		t, err := protocol.DecodeTimestamp(r.version, maxt)
+		if err != nil {
+			fmt.Printf("Not after:       decode failed: %s\n", err)
 		} else {
-			fmt.Printf("Expired:         %s ago\n", (-remaining).Round(time.Second))
+			maxtTime = t
+			haveMaxt = true
+			fmt.Printf("Not after:       %s\n", maxtTime.UTC().Format(time.RFC3339))
+			// prefer verified midpoint so a skewed local clock does not mislead
+			ref := time.Now()
+			if verified {
+				ref = r.midpoint
+			}
+			if remaining := maxtTime.Sub(ref); remaining > 0 {
+				fmt.Printf("Expires in:      %s\n", remaining.Round(time.Second))
+			} else {
+				fmt.Printf("Expired:         %s ago\n", (-remaining).Round(time.Second))
+			}
 		}
 	}
 

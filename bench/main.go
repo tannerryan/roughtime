@@ -54,10 +54,10 @@ var (
 )
 
 // maxTCPReply caps the TCP reply payload.
-const maxTCPReply = 16 * 1024
+const maxTCPReply = protocol.MaxTCPReplyBody
 
-// maxUDPReply bounds the UDP read buffer at one MTU.
-const maxUDPReply = 1500
+// maxUDPReply bounds the UDP read buffer.
+const maxUDPReply = protocol.MaxUDPReply
 
 // reservoirSize caps per-worker latency samples (Algorithm R).
 const reservoirSize = 100_000
@@ -182,15 +182,13 @@ func validateFlags() error {
 func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) []workerResult {
 	results := make([]workerResult, n)
 	var wg sync.WaitGroup
-	wg.Add(n)
 	var dialed atomic.Int32
 	for i := range n {
-		go func(idx int) {
-			defer wg.Done()
-			if worker(ctx, cfg, &results[idx], collectAfter) {
+		wg.Go(func() {
+			if worker(ctx, cfg, &results[i], collectAfter) {
 				dialed.Add(1)
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 	if dialed.Load() == 0 {
@@ -210,6 +208,14 @@ func recordLatency(out *workerResult, rtt time.Duration) {
 	j := mrand.Uint64N(out.received)
 	if j < reservoirSize {
 		out.latencies[j] = rtt
+	}
+}
+
+// bumpAfter increments *c when start is at or past collectAfter; warmup samples
+// are dropped to keep error and success counts on the same window.
+func bumpAfter(start, collectAfter time.Time, c *uint64) {
+	if !start.Before(collectAfter) {
+		*c++
 	}
 }
 
@@ -270,9 +276,9 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				out.timeouts++
+				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
-				out.errWrite++
+				bumpAfter(start, collectAfter, &out.errWrite)
 			}
 			continue
 		}
@@ -282,9 +288,9 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		rtt := time.Since(start)
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				out.timeouts++
+				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
-				out.errRead++
+				bumpAfter(start, collectAfter, &out.errRead)
 			}
 			continue
 		}
@@ -292,7 +298,7 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		if verify {
 			if _, _, err := protocol.VerifyReply(cfg.versions, buf[:n], cfg.rootPK, nonce, req); err != nil {
 				// grease and genuine faults share this bucket
-				out.errVerify++
+				bumpAfter(start, collectAfter, &out.errVerify)
 				continue
 			}
 		}
@@ -304,8 +310,8 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	return true
 }
 
-// workerTCP runs the send/recv loop on one persistent TCP connection. A framing
-// or transport error exits the worker without reconnecting.
+// workerTCP runs the send/recv loop on a TCP connection. Transport or framing
+// errors close the connection and redial; a redial failure exits the worker.
 func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
 	timeout := cfg.timeout
 	verify := cfg.verify
@@ -314,10 +320,8 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	if err != nil {
 		return false
 	}
-	defer conn.Close()
-	if tcp, ok := conn.(*net.TCPConn); ok {
-		_ = tcp.SetNoDelay(true)
-	}
+	defer func() { conn.Close() }()
+	setTCPNoDelay(conn)
 
 	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
 	if err != nil {
@@ -328,50 +332,76 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		return false
 	}
 
+	// reconnect closes conn and redials; returns false if the redial fails.
+	reconnect := func() bool {
+		conn.Close()
+		c, err := dialer.DialContext(ctx, "tcp", cfg.addr)
+		if err != nil {
+			return false
+		}
+		conn = c
+		setTCPNoDelay(conn)
+		return true
+	}
+
 	replyBuf := make([]byte, protocol.PacketHeaderSize+maxTCPReply)
 	for ctx.Err() == nil {
 		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
-		_ = conn.SetDeadline(time.Now().Add(timeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				out.timeouts++
+				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
-				out.errWrite++
+				bumpAfter(start, collectAfter, &out.errWrite)
 			}
-			return true
+			if !reconnect() {
+				return true
+			}
+			continue
 		}
 
 		hdr := replyBuf[:protocol.PacketHeaderSize]
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				out.timeouts++
+				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
-				out.errRead++
+				bumpAfter(start, collectAfter, &out.errRead)
 			}
-			return true
+			if !reconnect() {
+				return true
+			}
+			continue
 		}
 		bodyLen, err := protocol.ParsePacketHeader(hdr)
 		if err != nil || bodyLen == 0 || bodyLen > maxTCPReply {
-			out.errRead++
-			return true
+			bumpAfter(start, collectAfter, &out.errRead)
+			if !reconnect() {
+				return true
+			}
+			continue
 		}
 		pkt := replyBuf[:protocol.PacketHeaderSize+int(bodyLen)]
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		if _, err := io.ReadFull(conn, pkt[protocol.PacketHeaderSize:]); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				out.timeouts++
+				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
-				out.errRead++
+				bumpAfter(start, collectAfter, &out.errRead)
 			}
-			return true
+			if !reconnect() {
+				return true
+			}
+			continue
 		}
 		rtt := time.Since(start)
 
 		if verify {
 			if _, _, err := protocol.VerifyReply(cfg.versions, pkt, cfg.rootPK, nonce, req); err != nil {
-				out.errVerify++
+				bumpAfter(start, collectAfter, &out.errVerify)
 				continue
 			}
 		}
@@ -381,6 +411,13 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		}
 	}
 	return true
+}
+
+// setTCPNoDelay disables Nagle on c if it is a *net.TCPConn.
+func setTCPNoDelay(c net.Conn) {
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 }
 
 // report aggregates per-worker results and prints a summary.

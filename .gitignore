@@ -2,6 +2,7 @@ roughtime
 roughtime-client
 roughtime-debug
 roughtime-bench
+roughtime-stamp
 coverage.out
 coverage.txt
 coverage.html
