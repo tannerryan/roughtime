@@ -53,7 +53,7 @@ const (
 	// IETF wire versions.
 	SchemeEd25519 Scheme = iota
 	// SchemeMLDSA44 is the experimental ML-DSA-44 post-quantum signature suite
-	// (TCP only).
+	// (TCP only). Not part of any IETF draft.
 	SchemeMLDSA44
 )
 

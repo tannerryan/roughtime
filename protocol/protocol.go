@@ -50,8 +50,9 @@ const (
 	VersionDraft11 Version = 0x8000000b // draft-ietf-ntp-roughtime-11
 	VersionDraft12 Version = 0x8000000c // drafts 12-19
 
-	// VersionMLDSA44 is an experimental post-quantum wire version that signs
-	// with ML-DSA-44 (FIPS 204) over TCP only. See README.md.
+	// VersionMLDSA44 is an experimental post-quantum wire version, not part of
+	// any IETF draft. Signs with ML-DSA-44 (FIPS 204) over TCP only. See
+	// README.md.
 	VersionMLDSA44 Version = 0x90000001
 )
 
@@ -1043,9 +1044,9 @@ type merkleTree struct {
 }
 
 // merkleNodeFirst reports whether node precedes hash when INDX bit is 0. Drafts
-// 05-13 use node-first; draft-16+ reversed to hash-first. groupD14 here treats
-// drafts 14-19 as hash-first — the deliberate 14-15 batch divergence is in the
-// README.
+// 05-15 specify node-first; draft-16+ reverted to hash-first. groupD14 here
+// treats drafts 14-19 as hash-first — the deliberate 14-15 batch divergence is
+// in the README.
 func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }

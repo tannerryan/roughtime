@@ -8,21 +8,13 @@ version](https://img.shields.io/github/go-mod/go-version/tannerryan/roughtime?st
 [![Go Report
 Card](https://goreportcard.com/badge/github.com/tannerryan/roughtime?style=flat-square)](https://goreportcard.com/report/github.com/tannerryan/roughtime)
 
-A [Roughtime](https://datatracker.ietf.org/doc/draft-ietf-ntp-roughtime/)
-implementation in Go covering Google-Roughtime and IETF drafts 01–19. Ships the
-`roughtime` server, four CLIs (`client`, `debug`, `bench`, `stamp`), and two Go
-packages: `github.com/tannerryan/roughtime` (high-level client) and
-`.../protocol` (wire primitives). Interop:
+A Go implementation of
+[Roughtime](https://datatracker.ietf.org/doc/draft-ietf-ntp-roughtime/) covering
+Google-Roughtime and IETF drafts 01–19. Ships a server, four CLIs (client,
+debug, bench, stamp), and two Go packages: a high-level client in the [roughtime
+package](roughtime.go) and wire primitives in the [protocol
+package](protocol/protocol.go). Interop-tested with
 [ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
-
-> ⚠️ **ML-DSA-44 (FIPS 204) is experimental and not part of any IETF draft.**
-> Defined here as an ahead-of-spec extension and framed over TCP because replies
-> exceed the UDP amplification cap. No interop guaranteed.
-
-Merkle node order changed at draft-16 (node-first → hash-first). This
-implementation applies hash-first to all of drafts 14–19, so multi-request
-batches diverge from drafts 14–15 only; single-request replies are unaffected
-(PATH is empty).
 
 Try it against the public server at `time.txryan.com:2002`
 ([details](https://time.txryan.com)):
@@ -31,13 +23,23 @@ Try it against the public server at `time.txryan.com:2002`
 go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 ```
 
+> ⚠️ **ML-DSA-44 (FIPS 204) is experimental and not part of any IETF draft.**
+> Defined here as an ahead-of-spec extension, framed over TCP because replies
+> exceed the UDP amplification cap. No interop guaranteed.
+
+This implementation uses hash-first Merkle path verification across drafts
+14–19, matching draft-16's spec. Drafts 14–15 specify node-first instead, so
+multi-request batches against those two drafts diverge; single-request replies
+have an empty PATH and are unaffected.
+
 ## Server
 
-Speaks UDP (Ed25519 + Google) and TCP (Ed25519 + ML-DSA-44) on one port. Reads
-hex-encoded root key seeds and refreshes online delegation certificates before
-expiry. At least one of `-root-key-file` or `-pq-root-key-file` must be set;
-supply both for dual-stack. `-keygen`/`-pq-keygen` write a seed (`0600`) and
-print the public key; `-pubkey`/`-pq-pubkey` re-derive it.
+Listens on a single port: UDP carries Ed25519 and Google-Roughtime, TCP carries
+Ed25519 and the experimental ML-DSA-44 extension. Root keys are hex-encoded
+seeds, and online delegation certificates auto-refresh before expiry. Set
+`-root-key-file`, `-pq-root-key-file`, or both for dual-stack. `-keygen` and
+`-pq-keygen` write a fresh seed (mode `0600`) and print its public key;
+`-pubkey` and `-pq-pubkey` re-derive a public key from an existing seed.
 
 ```
 roughtime -keygen /path/to/root.key
@@ -55,35 +57,28 @@ roughtime -root-key-file /path/to/root.key -pq-root-key-file /path/to/pq-root.ke
 
 ### Architecture
 
-UDP on Linux binds one `SO_REUSEPORT` socket per CPU; each worker drains its own
-queue with `recvmmsg`/`sendmmsg` and batches up to 256 requests (or 1ms) per
-signing round. Other Unix systems use a single socket feeding one batcher. TCP
-serializes per connection, routes requests to a per-scheme batcher keyed on
-`(version, hasType)`, signs once with Ed25519 or ML-DSA-44, and fans out
-per-client Merkle PATH proofs. Windows is not supported (`//go:build unix`).
+Optimized for high throughput on Linux: per-CPU `SO_REUSEPORT` sockets, batched
+syscalls, and amortized signing across up to 256 requests per round. Other Unix
+systems use a single-socket fallback. TCP requests batch per scheme so each
+connection gets its own Merkle proof from a shared signature. Windows is not
+supported (`//go:build unix`).
 
 ### TCP framing
 
-```
-+------------------------------+---------------------+------------------------+
-| "ROUGHTIM" magic  (8 bytes)  | length (4 bytes)    | message (length bytes) |
-+------------------------------+---------------------+------------------------+
-                                 little-endian uint32
-```
-
-Google-Roughtime (no `ROUGHTIM` header) is UDP-only; Ed25519 runs on either
-transport; ML-DSA-44 is TCP-only. Lengths above 8192 bytes, bad magic,
-zero-length bodies, or a missed read deadline close the connection. Idle timeout
-10s; per-stage deadline 5s.
+Each message is prefixed with an 8-byte `ROUGHTIM` magic and a little-endian
+`uint32` length. Google-Roughtime (no header) is UDP-only; Ed25519 works over
+either transport; ML-DSA-44 is TCP-only. The TCP server is hardened against
+malformed input: bad magic, frames over 8192 bytes, zero-length bodies, and
+stalled reads close the connection.
 
 ### ML-DSA-44 wire variant (experimental)
 
-Version `0x90000001` (`roughtime-ml-dsa-44`) — top bit set, disjoint from the
-IETF `0x80000000 + n` range. Reuses the draft-12+ wire layout with the TYPE tag
-(same tags, request-as-Merkle-leaf, SRV binding); only the signature material
-and the context convention differ. `VERS` in SREP is per-scheme since each
-listener can only attest its own scheme's versions, keeping the downgrade check
-(`chosen == max(client_offered ∩ signed_VERS)`) tractable per suite.
+An experimental post-quantum signature suite **not part of any IETF draft**,
+defined here as an ahead-of-spec extension and advertised as version
+`0x90000001` (`roughtime-ml-dsa-44`). The wire format is the modern IETF one;
+only the signature algorithm and the FIPS 204 context replace Ed25519. Version
+negotiation is per-scheme, so a client picks the highest mutually supported
+version per suite. No interop guaranteed.
 
 | Parameter          | Ed25519                  | ML-DSA-44                  |
 | ------------------ | ------------------------ | -------------------------- |
@@ -107,14 +102,15 @@ docker run -d --name roughtime --restart unless-stopped \
 
 ## CLIs
 
-All four auto-detect the suite from the root public key length: 32 bytes
-Ed25519, 1312 bytes ML-DSA-44.
+All four auto-detect the signature suite from the root public key length: 32
+bytes for Ed25519, 1312 bytes for ML-DSA-44.
 
 ### client
 
-Queries one or more servers and prints authenticated timestamps with clock
-drift. With `-servers`, samples 3 entries (or `-all`) and queries them twice to
-surface pairwise inconsistencies. Multi-server queries chain by default.
+Queries one or more servers and prints authenticated timestamps alongside clock
+drift. With `-servers`, it samples 3 entries (or `-all`) and queries each twice
+to surface pairwise inconsistencies. Multi-server queries are chained by
+default.
 
 ```
 go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
@@ -154,9 +150,9 @@ go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabx
 ### bench
 
 Closed-loop load generator. Reports throughput, latency percentiles, and an
-error breakdown. `-verify` signature-checks every reply client-side; ML-DSA-44
-verify is materially slower than Ed25519, so leave `-verify` off for raw
-throughput numbers.
+error breakdown. `-verify` signature-checks every reply client-side; since
+ML-DSA-44 verification is materially slower than Ed25519, leave it off when
+measuring raw throughput.
 
 ```
 go run bench/main.go -addr <host:port> -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s [-tcp] [-verify]
@@ -175,11 +171,10 @@ go run bench/main.go -addr <host:port> -pubkey <base64-or-hex> -workers 256 -dur
 
 ### stamp
 
-Document timestamping. Stamp hashes a file with SHA-256, binds the digest into a
-causal-chained query across multiple witnesses, and writes a gzipped drafts-12+
-malfeasance report. Verify re-validates that proof offline against the document
-and a trusted ecosystem. Witnesses must use a 32-byte nonce (IETF Ed25519 drafts
-05+ and experimental ML-DSA-44); Google-Roughtime entries are skipped.
+Document timestamping. Produces an offline-verifiable proof binding a document
+to a chain of witness signatures, and later re-validates that proof against the
+document and a trusted ecosystem. Witnesses need 32-byte nonces (IETF Ed25519
+drafts 05+ and experimental ML-DSA-44); Google-Roughtime entries are skipped.
 
 ```
 go run stamp/main.go -doc README.md -servers ecosystem.json -out README.md.proof
@@ -215,17 +210,16 @@ resp, err := c.Query(ctx, server)
 // resp.Midpoint, resp.Radius, resp.RTT, resp.Drift(), resp.InSync()
 ```
 
-`QueryAll` fans out concurrently. `QueryChain` runs causal-chained queries and
-returns a `*ChainResult` whose `Proof()` yields a `*Proof` with `MarshalGzip`,
-`Verify`, `Trust`, `Links`, `SeedNonce`, `AttestationBound` for offline audit;
-`ParseProof` reloads. `QueryChainWithNonce` seeds the first link's nonce so a
-document hash binds to the chain — the high-level path for timestamping.
-`Consensus` aggregates drift across `[]Result`; `Verify` re-validates a stored
-`Request`/`Reply` pair; `ParseEcosystem` decodes the ecosystem JSON.
+Beyond a single `Query`, the package offers concurrent fan-out across servers
+(`QueryAll`), causal-chained multi-server queries with offline-verifiable proofs
+(`QueryChain`/`Proof`), and document timestamping (`QueryChainWithNonce`).
+Helpers cover drift consensus, replay verification, and ecosystem JSON parsing.
+Full API at [pkg.go.dev](https://pkg.go.dev/github.com/tannerryan/roughtime).
 
 ### Wire primitives — `github.com/tannerryan/roughtime/protocol`
 
-Wire format and `RoundTripUDP` / `RoundTripTCP`. Full API on
+Encodes and decodes Roughtime messages and round-trips them over UDP or TCP.
+Full API on
 [pkg.go.dev](https://pkg.go.dev/github.com/tannerryan/roughtime/protocol).
 
 ```go
@@ -233,9 +227,8 @@ nonce, request, err := protocol.CreateRequest(versions, rand.Reader, srv)
 midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPublicKey, nonce, request)
 ```
 
-`srv` binds the request to a server key (SRV tag, drafts 10+);
-`CreateRequestWithNonce` accepts a caller-supplied nonce. For multi-server
-measurement and malfeasance detection:
+`srv` is the server's public key, used for SRV-tag binding from drafts 10+. A
+chain primitive supports multi-server measurement and malfeasance detection:
 
 ```go
 var chain protocol.Chain
