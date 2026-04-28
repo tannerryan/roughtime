@@ -8,15 +8,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha512"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 	"time"
 )
 
-// chainServer holds keys and a certificate for building chain links.
+// chainServer is a test fixture for serving Roughtime replies in chain tests.
 type chainServer struct {
 	rootSK ed25519.PrivateKey
 	rootPK ed25519.PublicKey
@@ -24,7 +22,7 @@ type chainServer struct {
 	ver    Version
 }
 
-// newChainServer creates a server with a certificate valid for ±1 hour.
+// newChainServer constructs a chainServer with a fresh certificate.
 func newChainServer(t *testing.T, ver Version) chainServer {
 	t.Helper()
 	rootSK, onlineSK := testKeys(t)
@@ -41,7 +39,7 @@ func newChainServer(t *testing.T, ver Version) chainServer {
 	}
 }
 
-// respond generates a server reply for a request packet.
+// respond builds a signed reply for a single request.
 func (s chainServer) respond(t *testing.T, request []byte) []byte {
 	t.Helper()
 	parsed, err := ParseRequest(request)
@@ -55,7 +53,7 @@ func (s chainServer) respond(t *testing.T, request []byte) []byte {
 	return replies[0]
 }
 
-// buildChain creates a valid n-link chain with distinct servers.
+// buildChain creates a chain of n verified links against fresh chainServers.
 func buildChain(t *testing.T, ver Version, n int) (*Chain, []chainServer) {
 	t.Helper()
 	servers := make([]chainServer, n)
@@ -75,8 +73,14 @@ func buildChain(t *testing.T, ver Version, n int) (*Chain, []chainServer) {
 	return &c, servers
 }
 
-// TestChainNonceFirst verifies the first link returns a random nonce and nil
-// blind.
+// errReader is an io.Reader that always returns its err.
+type errReader struct{ err error }
+
+// Read returns the configured error.
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestChainNonceFirst verifies ChainNonce returns nil rand and a sized nonce
+// for the first link.
 func TestChainNonceFirst(t *testing.T) {
 	nonce, blind, err := ChainNonce(nil, rand.Reader, []Version{VersionDraft12})
 	if err != nil {
@@ -90,8 +94,8 @@ func TestChainNonceFirst(t *testing.T) {
 	}
 }
 
-// TestChainNonceGoogle verifies Google-Roughtime uses 64-byte nonces and
-// blinds.
+// TestChainNonceGoogle verifies ChainNonce derivation for Google-Roughtime
+// (64-byte nonce).
 func TestChainNonceGoogle(t *testing.T) {
 	prevResp := randBytes(t, 128)
 	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionGoogle})
@@ -114,7 +118,8 @@ func TestChainNonceGoogle(t *testing.T) {
 	}
 }
 
-// TestChainNonceDerived verifies the derived nonce matches H(resp || rand).
+// TestChainNonceDerived verifies ChainNonce produces H(prevResp || rand) for
+// derived links.
 func TestChainNonceDerived(t *testing.T) {
 	prevResp := randBytes(t, 128)
 	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft12})
@@ -137,8 +142,30 @@ func TestChainNonceDerived(t *testing.T) {
 	}
 }
 
-// TestChainNonceDraft02 verifies draft-02 uses SHA-512; SHA-512/256's 32-byte
-// output is too short for the 64-byte nonce of drafts 01–04.
+// TestChainNonceDraft01 verifies ChainNonce derivation for draft-01 (64-byte
+// nonce).
+func TestChainNonceDraft01(t *testing.T) {
+	prevResp := randBytes(t, 128)
+	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft01})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blind) != 64 {
+		t.Fatalf("draft-01 blind length = %d, want 64", len(blind))
+	}
+	if len(nonce) != 64 {
+		t.Fatalf("draft-01 nonce length = %d, want 64", len(nonce))
+	}
+	h := sha512.New()
+	h.Write(prevResp)
+	h.Write(blind)
+	want := h.Sum(nil)[:64]
+	if !bytes.Equal(nonce, want) {
+		t.Fatal("draft-01 chain nonce mismatch")
+	}
+}
+
+// TestChainNonceDraft02 verifies ChainNonce derivation for draft-02.
 func TestChainNonceDraft02(t *testing.T) {
 	prevResp := randBytes(t, 128)
 	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft02})
@@ -160,7 +187,29 @@ func TestChainNonceDraft02(t *testing.T) {
 	}
 }
 
-// TestChainNonceDraft07 verifies draft-07 uses SHA-512 with 32-byte nonces.
+// TestChainNonceDraft05 verifies ChainNonce derivation for draft-05.
+func TestChainNonceDraft05(t *testing.T) {
+	prevResp := randBytes(t, 128)
+	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft05})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blind) != 32 {
+		t.Fatalf("draft-05 blind length = %d, want 32", len(blind))
+	}
+	if len(nonce) != 32 {
+		t.Fatalf("draft-05 nonce length = %d, want 32", len(nonce))
+	}
+	h := sha512.New()
+	h.Write(prevResp)
+	h.Write(blind)
+	want := h.Sum(nil)[:32]
+	if !bytes.Equal(nonce, want) {
+		t.Fatal("draft-05 chain nonce mismatch")
+	}
+}
+
+// TestChainNonceDraft07 verifies ChainNonce derivation for draft-07.
 func TestChainNonceDraft07(t *testing.T) {
 	prevResp := randBytes(t, 128)
 	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft07})
@@ -182,8 +231,52 @@ func TestChainNonceDraft07(t *testing.T) {
 	}
 }
 
-// TestChainNonceDeterministic verifies fixed entropy produces a deterministic
-// nonce.
+// TestChainNonceDraft10 verifies ChainNonce derivation for draft-10.
+func TestChainNonceDraft10(t *testing.T) {
+	prevResp := randBytes(t, 128)
+	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blind) != 32 {
+		t.Fatalf("draft-10 blind length = %d, want 32", len(blind))
+	}
+	if len(nonce) != 32 {
+		t.Fatalf("draft-10 nonce length = %d, want 32", len(nonce))
+	}
+	h := sha512.New()
+	h.Write(prevResp)
+	h.Write(blind)
+	want := h.Sum(nil)[:32]
+	if !bytes.Equal(nonce, want) {
+		t.Fatal("draft-10 chain nonce mismatch")
+	}
+}
+
+// TestChainNonceDraft12 verifies ChainNonce derivation for draft-12.
+func TestChainNonceDraft12(t *testing.T) {
+	prevResp := randBytes(t, 128)
+	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blind) != 32 {
+		t.Fatalf("draft-12 blind length = %d, want 32", len(blind))
+	}
+	if len(nonce) != 32 {
+		t.Fatalf("draft-12 nonce length = %d, want 32", len(nonce))
+	}
+	h := sha512.New()
+	h.Write(prevResp)
+	h.Write(blind)
+	want := h.Sum(nil)[:32]
+	if !bytes.Equal(nonce, want) {
+		t.Fatal("draft-12 chain nonce mismatch")
+	}
+}
+
+// TestChainNonceDeterministic verifies ChainNonce is deterministic for the same
+// entropy and inputs.
 func TestChainNonceDeterministic(t *testing.T) {
 	prevResp := randBytes(t, 128)
 	ver := []Version{VersionDraft12}
@@ -204,8 +297,37 @@ func TestChainNonceDeterministic(t *testing.T) {
 	}
 }
 
-// TestNextRequestFirstLink verifies the first link has nil Rand and a valid
-// request.
+// TestChainNonceRejectsEmptyVersions verifies ChainNonce rejects an empty
+// versions list.
+func TestChainNonceRejectsEmptyVersions(t *testing.T) {
+	if _, _, err := ChainNonce(nil, rand.Reader, nil); err == nil {
+		t.Fatal("expected error for empty versions")
+	}
+}
+
+// TestChainNonceFirstReadError verifies ChainNonce wraps entropy errors on the
+// first link.
+func TestChainNonceFirstReadError(t *testing.T) {
+	want := errors.New("entropy boom")
+	_, _, err := ChainNonce(nil, errReader{want}, []Version{VersionDraft12})
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("expected wrapped %v, got %v", want, err)
+	}
+}
+
+// TestChainNonceDerivedReadError verifies ChainNonce wraps entropy errors on
+// derived links.
+func TestChainNonceDerivedReadError(t *testing.T) {
+	want := errors.New("entropy boom")
+	prev := []byte("previous response")
+	_, _, err := ChainNonce(prev, errReader{want}, []Version{VersionDraft12})
+	if err == nil || !errors.Is(err, want) {
+		t.Fatalf("expected wrapped %v, got %v", want, err)
+	}
+}
+
+// TestNextRequestFirstLink verifies the first link's Rand is nil and Request is
+// parseable.
 func TestNextRequestFirstLink(t *testing.T) {
 	srv := newChainServer(t, VersionDraft12)
 	var c Chain
@@ -227,8 +349,8 @@ func TestNextRequestFirstLink(t *testing.T) {
 	}
 }
 
-// TestNextRequestChained verifies link 2's nonce derives from link 1's
-// response.
+// TestNextRequestChained verifies a chained second link derives its nonce from
+// the previous response.
 func TestNextRequestChained(t *testing.T) {
 	srv1 := newChainServer(t, VersionDraft12)
 	srv2 := newChainServer(t, VersionDraft12)
@@ -263,8 +385,8 @@ func TestNextRequestChained(t *testing.T) {
 	}
 }
 
-// TestNextRequestRejectsMissingResponse verifies NextRequest fails when the
-// prior link has no response.
+// TestNextRequestRejectsMissingResponse verifies NextRequest errors when the
+// previous link lacks a response.
 func TestNextRequestRejectsMissingResponse(t *testing.T) {
 	srv := newChainServer(t, VersionDraft12)
 	c := Chain{Links: []ChainLink{{Request: []byte("dummy")}}}
@@ -273,8 +395,8 @@ func TestNextRequestRejectsMissingResponse(t *testing.T) {
 	}
 }
 
-// TestNextRequestWithNonceFirstLink verifies the first link's nonce is the
-// caller-supplied value.
+// TestNextRequestWithNonceFirstLink verifies NextRequestWithNonce uses the
+// supplied nonce on the first link.
 func TestNextRequestWithNonceFirstLink(t *testing.T) {
 	srv := newChainServer(t, VersionDraft12)
 	seed := bytes.Repeat([]byte{0x42}, 32)
@@ -292,7 +414,7 @@ func TestNextRequestWithNonceFirstLink(t *testing.T) {
 }
 
 // TestNextRequestWithNonceRejectsNonFirst verifies NextRequestWithNonce errors
-// when the chain is non-empty (only the first link may use a custom nonce).
+// on a non-empty chain.
 func TestNextRequestWithNonceRejectsNonFirst(t *testing.T) {
 	srv := newChainServer(t, VersionDraft12)
 	c := Chain{Links: []ChainLink{{Request: []byte("dummy"), Response: []byte("dummy-reply")}}}
@@ -301,8 +423,8 @@ func TestNextRequestWithNonceRejectsNonFirst(t *testing.T) {
 	}
 }
 
-// TestNextRequestWithNonceRejectsBadLength verifies the nonce length must match
-// the negotiated wire group.
+// TestNextRequestWithNonceRejectsBadLength verifies NextRequestWithNonce
+// rejects a wrong-length nonce.
 func TestNextRequestWithNonceRejectsBadLength(t *testing.T) {
 	srv := newChainServer(t, VersionDraft12)
 	var c Chain
@@ -311,6 +433,53 @@ func TestNextRequestWithNonceRejectsBadLength(t *testing.T) {
 	}
 }
 
+// TestNextRequestRejectsEmptyVersions verifies NextRequest errors on an empty
+// versions list.
+func TestNextRequestRejectsEmptyVersions(t *testing.T) {
+	rootSK, _ := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	var c Chain
+	if _, err := c.NextRequest(nil, rootPK, rand.Reader); err == nil {
+		t.Fatal("expected error for empty versions")
+	}
+}
+
+// TestNextRequestEntropyError verifies NextRequest surfaces entropy read
+// failures.
+func TestNextRequestEntropyError(t *testing.T) {
+	rootSK, _ := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	var c Chain
+	_, err := c.NextRequest([]Version{VersionDraft12}, rootPK, errReader{errors.New("no entropy")})
+	if err == nil {
+		t.Fatal("expected entropy error")
+	}
+}
+
+// TestNextRequestPopulatesNonce verifies ChainLink.Nonce matches the framed
+// Request's nonce.
+func TestNextRequestPopulatesNonce(t *testing.T) {
+	rootSK, _ := testKeys(t)
+	rootPK := rootSK.Public().(ed25519.PublicKey)
+	var c Chain
+	link, err := c.NextRequest([]Version{VersionDraft12}, rootPK, rand.Reader)
+	if err != nil {
+		t.Fatalf("NextRequest: %v", err)
+	}
+	if len(link.Nonce) == 0 {
+		t.Fatal("link.Nonce not populated")
+	}
+	parsed, err := ParseRequest(link.Request)
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	if !bytes.Equal(parsed.Nonce, link.Nonce) {
+		t.Fatalf("link.Nonce != ParseRequest(link.Request).Nonce: %x vs %x", link.Nonce, parsed.Nonce)
+	}
+}
+
+// TestVerifyValidChain verifies Chain.Verify accepts valid chains of varying
+// length.
 func TestVerifyValidChain(t *testing.T) {
 	for _, n := range []int{1, 2, 3, 5} {
 		t.Run(fmt.Sprintf("n=%d", n), func(t *testing.T) {
@@ -322,6 +491,7 @@ func TestVerifyValidChain(t *testing.T) {
 	}
 }
 
+// TestVerifyEmpty verifies Chain.Verify rejects an empty chain.
 func TestVerifyEmpty(t *testing.T) {
 	var c Chain
 	if err := c.Verify(); err == nil {
@@ -329,6 +499,8 @@ func TestVerifyEmpty(t *testing.T) {
 	}
 }
 
+// TestVerifyBadNonce verifies Chain.Verify wraps ErrChainNonce on a corrupted
+// blind.
 func TestVerifyBadNonce(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft12, 3)
 
@@ -344,7 +516,7 @@ func TestVerifyBadNonce(t *testing.T) {
 }
 
 // TestVerifyBadSignature verifies a wrong public key surfaces as a signature
-// failure, not a causal ordering error.
+// failure.
 func TestVerifyBadSignature(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft12, 2)
 
@@ -360,8 +532,75 @@ func TestVerifyBadSignature(t *testing.T) {
 	}
 }
 
-// TestVerifyCausalOrder verifies non-monotonic midpoints (with non-overlapping
-// radius windows) trigger a causal ordering violation.
+// TestPQChainVerify verifies Chain.Verify accepts an ML-DSA-44 chain.
+func TestPQChainVerify(t *testing.T) {
+	cert, rootPK := testPQCert(t)
+	versions := []Version{VersionMLDSA44}
+
+	var chain Chain
+	for i := range 2 {
+		link, err := chain.NextRequest(versions, rootPK, rand.Reader)
+		if err != nil {
+			t.Fatalf("NextRequest %d: %v", i, err)
+		}
+		parsed, err := ParseRequest(link.Request)
+		if err != nil {
+			t.Fatalf("ParseRequest %d: %v", i, err)
+		}
+		replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now().Add(time.Duration(i)*time.Second), time.Second, cert)
+		if err != nil {
+			t.Fatalf("CreateReplies %d: %v", i, err)
+		}
+		link.Response = replies[0]
+		chain.Append(link)
+	}
+	if err := chain.Verify(); err != nil {
+		t.Fatalf("Chain.Verify: %v", err)
+	}
+}
+
+// TestPQChainNonce verifies ChainNonce sizes for VersionMLDSA44.
+func TestPQChainNonce(t *testing.T) {
+	prevResp := randBytes(t, 128)
+	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionMLDSA44})
+	if err != nil {
+		t.Fatalf("ChainNonce: %v", err)
+	}
+	if len(blind) != 32 || len(nonce) != 32 {
+		t.Fatalf("PQ chain nonce/blind lengths = %d/%d, want 32/32", len(nonce), len(blind))
+	}
+}
+
+// TestVerifyBadRandLength verifies Chain.Verify wraps ErrChainNonce when Rand
+// is the wrong length.
+func TestVerifyBadRandLength(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft12, 2)
+
+	c.Links[1].Rand = c.Links[1].Rand[:16]
+
+	err := c.Verify()
+	if err == nil {
+		t.Fatal("expected error for bad rand length")
+	}
+	if !errors.Is(err, ErrChainNonce) {
+		t.Fatalf("expected ErrChainNonce, got: %v", err)
+	}
+}
+
+// TestVerifyCorruptedResponse verifies Chain.Verify rejects a chain with a
+// tampered response.
+func TestVerifyCorruptedResponse(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft12, 2)
+
+	c.Links[0].Response[len(c.Links[0].Response)-1] ^= 0xff
+
+	if err := c.Verify(); err == nil {
+		t.Fatal("expected error for corrupted response")
+	}
+}
+
+// TestVerifyCausalOrder verifies non-monotonic midpoints trigger
+// ErrCausalOrder.
 func TestVerifyCausalOrder(t *testing.T) {
 	ver := VersionDraft12
 	versions := []Version{ver}
@@ -374,7 +613,6 @@ func TestVerifyCausalOrder(t *testing.T) {
 	past := now.Add(-10 * time.Minute)
 	future := now.Add(10 * time.Minute)
 
-	// baseline: increasing midpoints
 	var c Chain
 	link1, _ := c.NextRequest(versions, srv1.rootPK, rand.Reader)
 	req1, _ := ParseRequest(link1.Request)
@@ -398,7 +636,7 @@ func TestVerifyCausalOrder(t *testing.T) {
 		t.Fatalf("baseline chain should verify: %v", err)
 	}
 
-	// link 2 claims future, link 3 claims past: preserves nonce linkage but
+	// link 2 claims future, link 3 claims past — preserves nonce linkage,
 	// violates causal ordering
 	var bad Chain
 	blink1, _ := bad.NextRequest(versions, srv1.rootPK, rand.Reader)
@@ -428,149 +666,69 @@ func TestVerifyCausalOrder(t *testing.T) {
 	}
 }
 
-// TestMalfeasanceReportRoundTrip verifies a chain round-trips through
-// serialization and the deserialized chain still verifies.
-func TestMalfeasanceReportRoundTrip(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 3)
+// TestVerifyCausalOrderFiveLinks verifies the running-max algorithm catches
+// non-adjacent ordering violations.
+func TestVerifyCausalOrderFiveLinks(t *testing.T) {
+	ver := VersionDraft12
+	versions := []Version{ver}
 
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
+	servers := make([]chainServer, 5)
+	for i := range servers {
+		servers[i] = newChainServer(t, ver)
 	}
 
-	if len(parsed.Links) != len(c.Links) {
-		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
-	}
-	for i := range c.Links {
-		if !bytes.Equal(parsed.Links[i].Rand, c.Links[i].Rand) {
-			t.Fatalf("link %d: rand mismatch", i)
-		}
-		if !bytes.Equal(parsed.Links[i].PublicKey, c.Links[i].PublicKey) {
-			t.Fatalf("link %d: publicKey mismatch", i)
-		}
-		if !bytes.Equal(parsed.Links[i].Request, c.Links[i].Request) {
-			t.Fatalf("link %d: request mismatch", i)
-		}
-		if !bytes.Equal(parsed.Links[i].Response, c.Links[i].Response) {
-			t.Fatalf("link %d: response mismatch", i)
-		}
+	// link 2 is the peak; link 4 drops below it, violating running max
+	base := time.Now().Truncate(time.Second)
+	midpoints := []time.Time{
+		base.Add(-10 * time.Minute),
+		base.Add(-5 * time.Minute),
+		base.Add(30 * time.Minute),
+		base.Add(10 * time.Minute),
+		base.Add(-15 * time.Minute),
 	}
 
-	if err := parsed.Verify(); err != nil {
-		t.Fatalf("deserialized chain should verify: %v", err)
-	}
-}
-
-// TestMalfeasanceReportFirstLinkNoRand verifies the first link's rand is
-// omitted from JSON.
-func TestMalfeasanceReportFirstLinkNoRand(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 2)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var raw struct {
-		Responses []map[string]any `json:"responses"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, ok := raw.Responses[0]["rand"]; ok {
-		t.Fatal("first link should not have rand in JSON")
-	}
-	if _, ok := raw.Responses[1]["rand"]; !ok {
-		t.Fatal("second link should have rand in JSON")
-	}
-}
-
-// TestMalfeasanceReportFields verifies the drafts-12+ report JSON structure.
-func TestMalfeasanceReportFields(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 2)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var report struct {
-		Responses []struct {
-			Rand      string `json:"rand"`
-			PublicKey string `json:"publicKey"`
-			Request   string `json:"request"`
-			Response  string `json:"response"`
-		} `json:"responses"`
-	}
-	if err := json.Unmarshal(data, &report); err != nil {
-		t.Fatal(err)
-	}
-
-	for i, r := range report.Responses {
-		if r.PublicKey == "" {
-			t.Fatalf("link %d: missing publicKey", i)
-		}
-		if r.Request == "" {
-			t.Fatalf("link %d: missing request", i)
-		}
-		if r.Response == "" {
-			t.Fatalf("link %d: missing response", i)
-		}
-		for _, field := range []string{r.PublicKey, r.Request, r.Response} {
-			if _, err := base64.StdEncoding.DecodeString(field); err != nil {
-				t.Fatalf("link %d: invalid base64: %v", i, err)
-			}
-		}
-	}
-}
-
-func TestParseMalfeasanceReportRejectsEmpty(t *testing.T) {
-	if _, err := ParseMalfeasanceReport([]byte(`{"responses":[]}`)); err == nil {
-		t.Fatal("expected error for empty responses")
-	}
-}
-
-func TestParseMalfeasanceReportRejectsMalformed(t *testing.T) {
-	if _, err := ParseMalfeasanceReport([]byte(`not json`)); err == nil {
-		t.Fatal("expected error for malformed JSON")
-	}
-}
-
-// TestParseMalfeasanceReportRejectsBadBase64 verifies invalid base64 in any
-// field is rejected.
-func TestParseMalfeasanceReportRejectsBadBase64(t *testing.T) {
-	valid := base64.StdEncoding.EncodeToString([]byte("test"))
-	for _, field := range []string{"publicKey", "request", "response"} {
-		t.Run(field, func(t *testing.T) {
-			entry := map[string]string{
-				"publicKey": valid,
-				"request":   valid,
-				"response":  valid,
-			}
-			entry[field] = "!!!not-base64!!!"
-			data, _ := json.Marshal(map[string]any{"responses": []any{entry}})
-			if _, err := ParseMalfeasanceReport(data); err == nil {
-				t.Fatalf("expected error for bad %s", field)
-			}
-		})
-	}
-}
-
-func TestMalfeasanceReportEmpty(t *testing.T) {
 	var c Chain
-	if _, err := c.MalfeasanceReport(); err == nil {
-		t.Fatal("expected error for empty chain")
+	for i, srv := range servers {
+		link, err := c.NextRequest(versions, srv.rootPK, rand.Reader)
+		if err != nil {
+			t.Fatalf("next request %d: %v", i, err)
+		}
+		req, err := ParseRequest(link.Request)
+		if err != nil {
+			t.Fatalf("parse %d: %v", i, err)
+		}
+		replies, err := CreateReplies(ver, []Request{*req}, midpoints[i], time.Second, srv.cert)
+		if err != nil {
+			t.Fatalf("create reply %d: %v", i, err)
+		}
+		link.Response = replies[0]
+		c.Append(link)
+	}
+
+	err := c.Verify()
+	if err == nil {
+		t.Fatal("expected causal ordering error")
+	}
+	if !errors.Is(err, ErrCausalOrder) {
+		t.Fatalf("expected ErrCausalOrder, got: %v", err)
 	}
 }
 
-// TestVerifyMultipleVersions verifies chains work across 32-byte-nonce draft
-// versions.
+// TestVerifyRejectsTooManyLinks verifies Chain.Verify rejects chains exceeding
+// maxChainLinks.
+func TestVerifyRejectsTooManyLinks(t *testing.T) {
+	c := &Chain{Links: make([]ChainLink, maxChainLinks+1)}
+	err := c.Verify()
+	if err == nil {
+		t.Fatal("expected error for chain length > maxChainLinks")
+	}
+	if !bytes.Contains([]byte(err.Error()), []byte("max")) {
+		t.Fatalf("error should mention max link count, got: %v", err)
+	}
+}
+
+// TestVerifyMultipleVersions verifies Chain.Verify accepts chains across drafts
+// 08, 10, 12.
 func TestVerifyMultipleVersions(t *testing.T) {
 	versions := []Version{VersionDraft08, VersionDraft10, VersionDraft12}
 	for _, ver := range versions {
@@ -583,169 +741,8 @@ func TestVerifyMultipleVersions(t *testing.T) {
 	}
 }
 
-// TestVerifyChainDraft10 exercises the groupD10 path.
-func TestVerifyChainDraft10(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft10, 3)
-	if err := c.Verify(); err != nil {
-		t.Fatalf("draft-10 chain should verify: %v", err)
-	}
-}
-
-// TestVerifyChainDraft11 exercises the groupD10 path for draft-11.
-func TestVerifyChainDraft11(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft11, 3)
-	if err := c.Verify(); err != nil {
-		t.Fatalf("draft-11 chain should verify: %v", err)
-	}
-}
-
-// TestMalfeasanceReportRoundTripDraft10 verifies a draft-10 chain emits the
-// legacy format (parallel nonces/responses, no request/publicKey) and
-// round-trips Rand + Response bytewise. Parsed chain is not Verify()-able since
-// legacy omits Request.
-func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft10, 3)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	// drafts 10-11 emit legacy {"nonces":[...],"responses":[...]}
-	var probe struct {
-		Nonces    []string `json:"nonces"`
-		Responses []string `json:"responses"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		t.Fatalf("legacy format unmarshal: %v", err)
-	}
-	if len(probe.Nonces) != len(c.Links) || len(probe.Responses) != len(c.Links) {
-		t.Fatalf("legacy arrays length mismatch: nonces=%d responses=%d want=%d",
-			len(probe.Nonces), len(probe.Responses), len(c.Links))
-	}
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if len(parsed.Links) != len(c.Links) {
-		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
-	}
-	for i, link := range parsed.Links {
-		if !bytes.Equal(link.Rand, c.Links[i].Rand) {
-			t.Fatalf("link %d: rand mismatch", i)
-		}
-		if !bytes.Equal(link.Response, c.Links[i].Response) {
-			t.Fatalf("link %d: response mismatch", i)
-		}
-		if link.Request != nil || link.PublicKey != nil {
-			t.Fatalf("link %d: legacy format should drop Request/PublicKey", i)
-		}
-	}
-}
-
-// TestMalfeasanceReportRoundTripDraft12 verifies a draft-12 chain round-trips
-// and Verify()s after deserialization.
-func TestMalfeasanceReportRoundTripDraft12(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 3)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if err := parsed.Verify(); err != nil {
-		t.Fatalf("deserialized draft-12 chain should verify: %v", err)
-	}
-}
-
-// TestParseMalfeasanceReportLegacyFromChain verifies the legacy
-// {nonces,responses} format parses from a real draft-10 chain.
-func TestParseMalfeasanceReportLegacyFromChain(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft10, 3)
-
-	nonces := make([]string, len(c.Links))
-	responses := make([]string, len(c.Links))
-	for i, link := range c.Links {
-		if link.Rand != nil {
-			nonces[i] = base64.StdEncoding.EncodeToString(link.Rand)
-		}
-		responses[i] = base64.StdEncoding.EncodeToString(link.Response)
-	}
-	data, err := json.Marshal(struct {
-		Nonces    []string `json:"nonces"`
-		Responses []string `json:"responses"`
-	}{Nonces: nonces, Responses: responses})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse legacy report: %v", err)
-	}
-	if len(parsed.Links) != len(c.Links) {
-		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
-	}
-	for i, link := range parsed.Links {
-		if !bytes.Equal(link.Rand, c.Links[i].Rand) {
-			t.Fatalf("link %d: rand mismatch", i)
-		}
-		if !bytes.Equal(link.Response, c.Links[i].Response) {
-			t.Fatalf("link %d: response mismatch", i)
-		}
-	}
-}
-
-// TestChainNonceDraft10 verifies draft-10 uses SHA-512 with 32-byte nonces.
-func TestChainNonceDraft10(t *testing.T) {
-	prevResp := randBytes(t, 128)
-	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(blind) != 32 {
-		t.Fatalf("draft-10 blind length = %d, want 32", len(blind))
-	}
-	if len(nonce) != 32 {
-		t.Fatalf("draft-10 nonce length = %d, want 32", len(nonce))
-	}
-	h := sha512.New()
-	h.Write(prevResp)
-	h.Write(blind)
-	want := h.Sum(nil)[:32]
-	if !bytes.Equal(nonce, want) {
-		t.Fatal("draft-10 chain nonce mismatch")
-	}
-}
-
-func TestVerifyBadRandLength(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 2)
-
-	c.Links[1].Rand = c.Links[1].Rand[:16]
-
-	err := c.Verify()
-	if err == nil {
-		t.Fatal("expected error for bad rand length")
-	}
-	if !errors.Is(err, ErrChainNonce) {
-		t.Fatalf("expected ErrChainNonce, got: %v", err)
-	}
-}
-
-// TestVerifyCorruptedResponse verifies a corrupted response is detected.
-func TestVerifyCorruptedResponse(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 2)
-
-	c.Links[0].Response[len(c.Links[0].Response)-1] ^= 0xff
-
-	if err := c.Verify(); err == nil {
-		t.Fatal("expected error for corrupted response")
-	}
-}
-
-// TestVerifyMultipleVersionsExtended covers all supported versions.
+// TestVerifyMultipleVersionsExtended verifies Chain.Verify across every Ed25519
+// wire group.
 func TestVerifyMultipleVersionsExtended(t *testing.T) {
 	versions := []Version{
 		VersionGoogle,
@@ -769,52 +766,8 @@ func TestVerifyMultipleVersionsExtended(t *testing.T) {
 	}
 }
 
-// TestChainNonceDraft01 verifies draft-01 uses SHA-512 with 64-byte nonces.
-func TestChainNonceDraft01(t *testing.T) {
-	prevResp := randBytes(t, 128)
-	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft01})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(blind) != 64 {
-		t.Fatalf("draft-01 blind length = %d, want 64", len(blind))
-	}
-	if len(nonce) != 64 {
-		t.Fatalf("draft-01 nonce length = %d, want 64", len(nonce))
-	}
-	h := sha512.New()
-	h.Write(prevResp)
-	h.Write(blind)
-	want := h.Sum(nil)[:64]
-	if !bytes.Equal(nonce, want) {
-		t.Fatal("draft-01 chain nonce mismatch")
-	}
-}
-
-// TestChainNonceDraft05 verifies draft-05 uses SHA-512 with 32-byte nonces.
-func TestChainNonceDraft05(t *testing.T) {
-	prevResp := randBytes(t, 128)
-	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft05})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(blind) != 32 {
-		t.Fatalf("draft-05 blind length = %d, want 32", len(blind))
-	}
-	if len(nonce) != 32 {
-		t.Fatalf("draft-05 nonce length = %d, want 32", len(nonce))
-	}
-	h := sha512.New()
-	h.Write(prevResp)
-	h.Write(blind)
-	want := h.Sum(nil)[:32]
-	if !bytes.Equal(nonce, want) {
-		t.Fatal("draft-05 chain nonce mismatch")
-	}
-}
-
-// TestVerifyMultipleVersionsWithDraft12TYPE exercises the groupD14 (TYPE tag)
-// path via draft-12.
+// TestVerifyMultipleVersionsWithDraft12TYPE verifies Chain.Verify on the
+// groupD14 path via draft-12 with TYPE.
 func TestVerifyMultipleVersionsWithDraft12TYPE(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft12, 3)
 	if err := c.Verify(); err != nil {
@@ -822,8 +775,24 @@ func TestVerifyMultipleVersionsWithDraft12TYPE(t *testing.T) {
 	}
 }
 
-// TestChainMixedVersions verifies a chain mixing draft versions across links
-// verifies.
+// TestVerifyChainDraft10 verifies Chain.Verify on a draft-10 chain.
+func TestVerifyChainDraft10(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft10, 3)
+	if err := c.Verify(); err != nil {
+		t.Fatalf("draft-10 chain should verify: %v", err)
+	}
+}
+
+// TestVerifyChainDraft11 verifies Chain.Verify on a draft-11 chain.
+func TestVerifyChainDraft11(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft11, 3)
+	if err := c.Verify(); err != nil {
+		t.Fatalf("draft-11 chain should verify: %v", err)
+	}
+}
+
+// TestChainMixedVersions verifies Chain.Verify on a chain whose links span
+// drafts 08, 10, 12.
 func TestChainMixedVersions(t *testing.T) {
 	versions := []Version{VersionDraft08, VersionDraft10, VersionDraft12}
 	servers := make([]chainServer, len(versions))
@@ -847,132 +816,8 @@ func TestChainMixedVersions(t *testing.T) {
 	}
 }
 
-// TestMalfeasanceReportRoundTripDraft14 verifies a groupD14 chain round-trips.
-func TestMalfeasanceReportRoundTripDraft14(t *testing.T) {
-	c, servers := buildChain(t, VersionDraft12, 3)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(parsed.Links) != len(c.Links) {
-		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
-	}
-	for i, link := range parsed.Links {
-		if !bytes.Equal(link.PublicKey, c.Links[i].PublicKey) {
-			t.Fatalf("link %d: public key mismatch", i)
-		}
-		if !bytes.Equal(link.Request, c.Links[i].Request) {
-			t.Fatalf("link %d: request mismatch", i)
-		}
-		if !bytes.Equal(link.Response, c.Links[i].Response) {
-			t.Fatalf("link %d: response mismatch", i)
-		}
-	}
-	_ = servers
-	if err := parsed.Verify(); err != nil {
-		t.Fatalf("round-tripped draft-14 chain should verify: %v", err)
-	}
-}
-
-// TestChainNonceDraft12 verifies draft-12 uses SHA-512 truncated to 32 bytes.
-func TestChainNonceDraft12(t *testing.T) {
-	prevResp := randBytes(t, 128)
-	nonce, blind, err := ChainNonce(prevResp, rand.Reader, []Version{VersionDraft12})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(blind) != 32 {
-		t.Fatalf("draft-12 blind length = %d, want 32", len(blind))
-	}
-	if len(nonce) != 32 {
-		t.Fatalf("draft-12 nonce length = %d, want 32", len(nonce))
-	}
-	h := sha512.New()
-	h.Write(prevResp)
-	h.Write(blind)
-	want := h.Sum(nil)[:32]
-	if !bytes.Equal(nonce, want) {
-		t.Fatal("draft-12 chain nonce mismatch")
-	}
-}
-
-// FuzzParseMalfeasanceReport ensures the parser never panics on arbitrary JSON.
-func FuzzParseMalfeasanceReport(f *testing.F) {
-	validReport, _ := json.Marshal(struct {
-		Responses []struct {
-			Rand      string `json:"rand,omitempty"`
-			PublicKey string `json:"publicKey"`
-			Request   string `json:"request"`
-			Response  string `json:"response"`
-		} `json:"responses"`
-	}{
-		Responses: []struct {
-			Rand      string `json:"rand,omitempty"`
-			PublicKey string `json:"publicKey"`
-			Request   string `json:"request"`
-			Response  string `json:"response"`
-		}{
-			{
-				PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-				Request:   base64.StdEncoding.EncodeToString(make([]byte, 64)),
-				Response:  base64.StdEncoding.EncodeToString(make([]byte, 128)),
-			},
-			{
-				Rand:      base64.StdEncoding.EncodeToString(make([]byte, 32)),
-				PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
-				Request:   base64.StdEncoding.EncodeToString(make([]byte, 64)),
-				Response:  base64.StdEncoding.EncodeToString(make([]byte, 128)),
-			},
-		},
-	})
-	f.Add(validReport)
-
-	f.Add([]byte("{}"))
-	f.Add([]byte(`{"responses":[]}`))
-	f.Add([]byte(`{"responses":[{}]}`))
-	f.Add([]byte(""))
-	f.Add([]byte("null"))
-	f.Add([]byte(`{"responses":[{"publicKey":"!!!","request":"!!!","response":"!!!"}]}`))
-
-	f.Fuzz(func(t *testing.T, data []byte) {
-		chain, err := ParseMalfeasanceReport(data)
-		if err != nil {
-			return
-		}
-		out, err := chain.MalfeasanceReport()
-		if err != nil {
-			return
-		}
-		chain2, err := ParseMalfeasanceReport(out)
-		if err != nil {
-			t.Fatalf("round-trip failed: %v", err)
-		}
-		if len(chain2.Links) != len(chain.Links) {
-			t.Fatalf("link count mismatch: %d vs %d", len(chain2.Links), len(chain.Links))
-		}
-		for i := range chain.Links {
-			if !bytes.Equal(chain.Links[i].Rand, chain2.Links[i].Rand) {
-				t.Fatalf("link %d rand mismatch", i)
-			}
-			if !bytes.Equal(chain.Links[i].PublicKey, chain2.Links[i].PublicKey) {
-				t.Fatalf("link %d publicKey mismatch", i)
-			}
-			if !bytes.Equal(chain.Links[i].Request, chain2.Links[i].Request) {
-				t.Fatalf("link %d request mismatch", i)
-			}
-			if !bytes.Equal(chain.Links[i].Response, chain2.Links[i].Response) {
-				t.Fatalf("link %d response mismatch", i)
-			}
-		}
-	})
-}
-
-// FuzzChainNonce ensures nonce derivation never panics across wire groups.
+// FuzzChainNonce fuzzes ChainNonce length and truncation invariants across wire
+// groups.
 func FuzzChainNonce(f *testing.F) {
 	f.Add([]byte{}, byte(0))
 	f.Add(make([]byte, 128), byte(1))
@@ -1014,52 +859,8 @@ func FuzzChainNonce(f *testing.F) {
 	})
 }
 
-// TestParseMalfeasanceReportLegacy verifies the drafts 10–11 {nonces,responses}
-// format parses.
-func TestParseMalfeasanceReportLegacy(t *testing.T) {
-	legacy := []byte(`{"nonces":["","` +
-		base64.StdEncoding.EncodeToString(make([]byte, 32)) +
-		`"],"responses":["` +
-		base64.StdEncoding.EncodeToString([]byte("resp1")) +
-		`","` +
-		base64.StdEncoding.EncodeToString([]byte("resp2")) +
-		`"]}`)
-	chain, err := ParseMalfeasanceReport(legacy)
-	if err != nil {
-		t.Fatalf("parse legacy report: %v", err)
-	}
-	if len(chain.Links) != 2 {
-		t.Fatalf("expected 2 links, got %d", len(chain.Links))
-	}
-	if chain.Links[0].Rand != nil {
-		t.Error("first link rand should be nil")
-	}
-	if len(chain.Links[1].Rand) != 32 {
-		t.Errorf("second link rand length = %d, want 32", len(chain.Links[1].Rand))
-	}
-	if !bytes.Equal(chain.Links[0].Response, []byte("resp1")) {
-		t.Error("first response mismatch")
-	}
-	if !bytes.Equal(chain.Links[1].Response, []byte("resp2")) {
-		t.Error("second response mismatch")
-	}
-	if chain.Links[0].Request != nil || chain.Links[0].PublicKey != nil {
-		t.Error("legacy link should have nil Request and PublicKey")
-	}
-}
-
-// TestParseMalfeasanceReportLegacyLengthMismatch verifies legacy parser rejects
-// mismatched array lengths.
-func TestParseMalfeasanceReportLegacyLengthMismatch(t *testing.T) {
-	legacy := []byte(`{"nonces":["",""],"responses":["` +
-		base64.StdEncoding.EncodeToString([]byte("x")) + `"]}`)
-	if _, err := ParseMalfeasanceReport(legacy); err == nil {
-		t.Fatal("expected length mismatch error")
-	}
-}
-
-// FuzzChainVerify ensures Chain.Verify never panics on arbitrary parsed
-// reports.
+// FuzzChainVerify fuzzes ParseMalfeasanceReport and Chain.Verify for
+// panic-safety.
 func FuzzChainVerify(f *testing.F) {
 	chain, _ := buildChain(&testing.T{}, VersionDraft12, 2)
 	seed, _ := chain.MalfeasanceReport()
@@ -1074,206 +875,4 @@ func FuzzChainVerify(f *testing.F) {
 		}
 		_ = c.Verify()
 	})
-}
-
-// errReader is an io.Reader that always returns its configured error.
-type errReader struct{ err error }
-
-func (r errReader) Read([]byte) (int, error) { return 0, r.err }
-
-// TestChainNonceRejectsEmptyVersions verifies ChainNonce surfaces the
-// empty-versions error.
-func TestChainNonceRejectsEmptyVersions(t *testing.T) {
-	if _, _, err := ChainNonce(nil, rand.Reader, nil); err == nil {
-		t.Fatal("expected error for empty versions")
-	}
-}
-
-// TestChainNonceFirstReadError verifies an entropy failure on the first link is
-// wrapped.
-func TestChainNonceFirstReadError(t *testing.T) {
-	want := errors.New("entropy boom")
-	_, _, err := ChainNonce(nil, errReader{want}, []Version{VersionDraft12})
-	if err == nil || !errors.Is(err, want) {
-		t.Fatalf("expected wrapped %v, got %v", want, err)
-	}
-}
-
-// TestChainNonceDerivedReadError verifies an entropy failure on a derived link
-// is wrapped.
-func TestChainNonceDerivedReadError(t *testing.T) {
-	want := errors.New("entropy boom")
-	prev := []byte("previous response")
-	_, _, err := ChainNonce(prev, errReader{want}, []Version{VersionDraft12})
-	if err == nil || !errors.Is(err, want) {
-		t.Fatalf("expected wrapped %v, got %v", want, err)
-	}
-}
-
-// TestNextRequestRejectsEmptyVersions verifies NextRequest surfaces the
-// version-preference error.
-func TestNextRequestRejectsEmptyVersions(t *testing.T) {
-	rootSK, _ := testKeys(t)
-	rootPK := rootSK.Public().(ed25519.PublicKey)
-	var c Chain
-	if _, err := c.NextRequest(nil, rootPK, rand.Reader); err == nil {
-		t.Fatal("expected error for empty versions")
-	}
-}
-
-// TestNextRequestEntropyError verifies an entropy failure in NextRequest is
-// propagated.
-func TestNextRequestEntropyError(t *testing.T) {
-	rootSK, _ := testKeys(t)
-	rootPK := rootSK.Public().(ed25519.PublicKey)
-	var c Chain
-	_, err := c.NextRequest([]Version{VersionDraft12}, rootPK, errReader{errors.New("no entropy")})
-	if err == nil {
-		t.Fatal("expected entropy error")
-	}
-}
-
-// TestParseMalfeasanceReportRejectsTooManyLinks verifies the parser caps link
-// count.
-func TestParseMalfeasanceReportRejectsTooManyLinks(t *testing.T) {
-	const n = 1025
-	entries := make([]string, n)
-	for i := range entries {
-		entries[i] = `""`
-	}
-	data := []byte(`{"nonces":[` + joinStrings(entries) + `],"responses":[` + joinStrings(entries) + `]}`)
-	if _, err := ParseMalfeasanceReport(data); err == nil {
-		t.Fatal("expected error for too many links")
-	}
-}
-
-// joinStrings concatenates parts with ',' separators.
-func joinStrings(parts []string) string {
-	var b []byte
-	for i, p := range parts {
-		if i > 0 {
-			b = append(b, ',')
-		}
-		b = append(b, p...)
-	}
-	return string(b)
-}
-
-// TestParseMalfeasanceReportLegacyBadBase64 verifies bad base64 in legacy
-// nonces or responses is rejected.
-func TestParseMalfeasanceReportLegacyBadBase64(t *testing.T) {
-	good := base64.StdEncoding.EncodeToString([]byte("ok"))
-	t.Run("nonce", func(t *testing.T) {
-		data := []byte(`{"nonces":["!!!"],"responses":["` + good + `"]}`)
-		if _, err := ParseMalfeasanceReport(data); err == nil {
-			t.Fatal("expected error for bad legacy nonce")
-		}
-	})
-	t.Run("response", func(t *testing.T) {
-		data := []byte(`{"nonces":["` + good + `"],"responses":["!!!"]}`)
-		if _, err := ParseMalfeasanceReport(data); err == nil {
-			t.Fatal("expected error for bad legacy response")
-		}
-	})
-}
-
-// TestParseMalfeasanceReportRejectsBadRand verifies bad base64 in the rand
-// field is rejected.
-func TestParseMalfeasanceReportRejectsBadRand(t *testing.T) {
-	good := base64.StdEncoding.EncodeToString([]byte("ok"))
-	entry := map[string]string{
-		"rand":      "!!!not-base64!!!",
-		"publicKey": good,
-		"request":   good,
-		"response":  good,
-	}
-	data, _ := json.Marshal(map[string]any{"responses": []any{entry}})
-	if _, err := ParseMalfeasanceReport(data); err == nil {
-		t.Fatal("expected error for bad rand")
-	}
-}
-
-// TestVerifyRejectsTooManyLinks verifies Verify rejects chains longer than
-// [maxChainLinks].
-func TestVerifyRejectsTooManyLinks(t *testing.T) {
-	c := &Chain{Links: make([]ChainLink, maxChainLinks+1)}
-	err := c.Verify()
-	if err == nil {
-		t.Fatal("expected error for chain length > maxChainLinks")
-	}
-	if !bytes.Contains([]byte(err.Error()), []byte("max")) {
-		t.Fatalf("error should mention max link count, got: %v", err)
-	}
-}
-
-// TestVerifyCausalOrderFiveLinks exercises the running-max algorithm where the
-// violating link's midpoint precedes an older (non-adjacent) link's upper
-// bound.
-func TestVerifyCausalOrderFiveLinks(t *testing.T) {
-	ver := VersionDraft12
-	versions := []Version{ver}
-
-	servers := make([]chainServer, 5)
-	for i := range servers {
-		servers[i] = newChainServer(t, ver)
-	}
-
-	// link 2 is the peak; link 4 drops below it, violating running max even
-	// though link 3 (immediate predecessor) does not
-	base := time.Now().Truncate(time.Second)
-	midpoints := []time.Time{
-		base.Add(-10 * time.Minute),
-		base.Add(-5 * time.Minute),
-		base.Add(30 * time.Minute),
-		base.Add(10 * time.Minute),
-		base.Add(-15 * time.Minute),
-	}
-
-	var c Chain
-	for i, srv := range servers {
-		link, err := c.NextRequest(versions, srv.rootPK, rand.Reader)
-		if err != nil {
-			t.Fatalf("next request %d: %v", i, err)
-		}
-		req, err := ParseRequest(link.Request)
-		if err != nil {
-			t.Fatalf("parse %d: %v", i, err)
-		}
-		replies, err := CreateReplies(ver, []Request{*req}, midpoints[i], time.Second, srv.cert)
-		if err != nil {
-			t.Fatalf("create reply %d: %v", i, err)
-		}
-		link.Response = replies[0]
-		c.Append(link)
-	}
-
-	err := c.Verify()
-	if err == nil {
-		t.Fatal("expected causal ordering error")
-	}
-	if !errors.Is(err, ErrCausalOrder) {
-		t.Fatalf("expected ErrCausalOrder, got: %v", err)
-	}
-}
-
-// TestNextRequestPopulatesNonce confirms ChainLink.Nonce matches the nonce in
-// the framed Request, so callers can verify replies without re-parsing.
-func TestNextRequestPopulatesNonce(t *testing.T) {
-	rootSK, _ := testKeys(t)
-	rootPK := rootSK.Public().(ed25519.PublicKey)
-	var c Chain
-	link, err := c.NextRequest([]Version{VersionDraft12}, rootPK, rand.Reader)
-	if err != nil {
-		t.Fatalf("NextRequest: %v", err)
-	}
-	if len(link.Nonce) == 0 {
-		t.Fatal("link.Nonce not populated")
-	}
-	parsed, err := ParseRequest(link.Request)
-	if err != nil {
-		t.Fatalf("ParseRequest: %v", err)
-	}
-	if !bytes.Equal(parsed.Nonce, link.Nonce) {
-		t.Fatalf("link.Nonce != ParseRequest(link.Request).Nonce: %x vs %x", link.Nonce, parsed.Nonce)
-	}
 }

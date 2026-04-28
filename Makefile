@@ -3,10 +3,12 @@
 BINARIES     = roughtime roughtime-client roughtime-debug roughtime-bench roughtime-stamp
 # name:pkg — split on ':' by the fuzz rule
 FUZZ_TARGETS = \
+    FuzzConsensus:./ \
     FuzzParseEcosystem:./ \
     FuzzDecodePublicKey:./ \
     FuzzVersionsForScheme:./ \
     FuzzParseProof:./ \
+    FuzzVerify:./ \
     FuzzDecode:./protocol/ \
     FuzzParsePacketHeader:./protocol/ \
     FuzzParseRequest:./protocol/ \
@@ -18,6 +20,7 @@ FUZZ_TARGETS = \
     FuzzCreateRepliesBatch:./protocol/ \
     FuzzCreateRequestWithNonce:./protocol/ \
     FuzzNonceOffsetInRequest:./protocol/ \
+    FuzzFindTagRange:./protocol/ \
     FuzzDecodeTimestamp:./protocol/ \
     FuzzEncode:./protocol/ \
     FuzzExtractVersion:./protocol/ \
@@ -26,13 +29,13 @@ FUZZ_TARGETS = \
     FuzzParseMalfeasanceReport:./protocol/ \
     FuzzChainNonce:./protocol/ \
     FuzzChainVerify:./protocol/ \
-    FuzzValidateRequest:./server/ \
-    FuzzServeOnce:./server/ \
-    FuzzReadTCPFrame:./server/
+    FuzzValidateRequest:./cmd/roughtime/ \
+    FuzzServeOnce:./cmd/roughtime/ \
+    FuzzReadTCPFrame:./cmd/roughtime/
 FUZZ_TIME   ?= 30s
 
 .PHONY: all deps build test test-verbose test-race test-cover test-race-cover \
-        test-all fuzz lint vet fmt verify coverage-report check clean
+        test-all fuzz lint vet fmt verify verify-tidy coverage-report check clean
 
 # Default: fmt, vet, build, race tests
 all: fmt vet build test-race
@@ -45,13 +48,20 @@ deps:
 	go install golang.org/x/tools/gopls@latest
 	go install github.com/gojp/goreportcard/cmd/goreportcard-cli@latest
 
+# Inject commit + build date into binaries via -ldflags. Empty when git is
+# absent; the version package falls back to the bare release string.
+COMMIT      ?= $(shell git rev-parse --short HEAD 2>/dev/null)
+BUILD_DATE  ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+VERSION_PKG  = github.com/tannerryan/roughtime/internal/version
+LDFLAGS      = -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).Date=$(BUILD_DATE)
+
 # Build binaries
 build:
-	go build -o roughtime ./server
-	go build -o roughtime-client ./client
-	go build -o roughtime-debug ./debug
-	go build -o roughtime-bench ./bench
-	go build -o roughtime-stamp ./stamp
+	go build -ldflags "$(LDFLAGS)" -o roughtime ./cmd/roughtime
+	go build -ldflags "$(LDFLAGS)" -o roughtime-client ./cmd/roughtime-client
+	go build -ldflags "$(LDFLAGS)" -o roughtime-debug ./cmd/roughtime-debug
+	go build -ldflags "$(LDFLAGS)" -o roughtime-bench ./cmd/roughtime-bench
+	go build -ldflags "$(LDFLAGS)" -o roughtime-stamp ./cmd/roughtime-stamp
 
 # Unit tests
 test:
@@ -67,16 +77,21 @@ test-race:
 
 # Unit tests with coverage
 test-cover:
-	go test -cover ./ ./protocol/ ./server/
+	go test -cover ./ ./protocol/ ./cmd/roughtime/
 
 # Race + coverage profile (CI)
 test-race-cover:
-	go test -race -covermode=atomic -coverprofile=coverage.out ./ ./protocol/ ./server/
+	go test -race -covermode=atomic -coverprofile=coverage.out ./ ./protocol/ ./cmd/roughtime/
 
 # Verify module checksums
 verify:
 	go mod download
 	go mod verify
+
+# Verify go.mod and go.sum are tidy (CI guard)
+verify-tidy:
+	go mod tidy
+	git diff --exit-code go.mod go.sum
 
 # Per-function summary + HTML coverage report
 coverage-report: test-race-cover
@@ -112,10 +127,12 @@ vet:
 lint: vet
 	staticcheck ./...
 	golangci-lint run ./...
-	gopls check ./protocol/protocol.go ./protocol/chain.go ./protocol/sigscheme.go ./protocol/transport.go ./server/main.go ./server/listen_linux.go ./server/listen_other.go ./server/listen_tcp.go ./server/listen_unix.go ./debug/main.go ./client/main.go ./bench/main.go ./stamp/main.go ./roughtime.go
+	@files=$$(find . -maxdepth 4 -name '*.go' ! -name '*_test.go' ! -path './vendor/*'); \
+	    test -n "$$files" || { echo "lint: no Go files found for gopls check" >&2; exit 1; }; \
+	    gopls check $$files
 
-# Full check: verify, fmt, vet, lint, build, race+cover, report card
-check: verify fmt vet lint build test-race-cover
+# Full check: verify, fmt, lint, build, race+cover, report card
+check: verify fmt lint build test-race-cover
 	goreportcard-cli -v
 
 # Remove binaries and coverage artifacts

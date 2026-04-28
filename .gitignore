@@ -1,8 +1,17 @@
-roughtime
-roughtime-client
-roughtime-debug
-roughtime-bench
-roughtime-stamp
-coverage.out
-coverage.txt
-coverage.html
+# Built binaries (from `make build`)
+/roughtime
+/roughtime-client
+/roughtime-debug
+/roughtime-bench
+/roughtime-stamp
+
+# Coverage artifacts
+/coverage.out
+/coverage.txt
+/coverage.html
+
+# Editor / OS cruft
+.idea
+.vscode
+.DS_Store
+*.swp

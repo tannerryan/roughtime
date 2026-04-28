@@ -15,12 +15,14 @@ debug, bench, stamp), and two Go packages: a high-level client in the [roughtime
 package](roughtime.go) and wire primitives in the [protocol
 package](protocol/protocol.go). Interop-tested with
 [ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
+Drafts 12-19 share wire version `0x8000000c`; peers advertise this single tag
+regardless of which draft they implement internally.
 
 Try it against the public server at `time.txryan.com:2002`
 ([details](https://time.txryan.com)):
 
-```
-go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+```bash
+go run ./cmd/roughtime-client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 ```
 
 > ⚠️ **ML-DSA-44 (FIPS 204) is experimental and not part of any IETF draft.**
@@ -32,6 +34,25 @@ This implementation uses hash-first Merkle path verification across drafts
 multi-request batches against those two drafts diverge; single-request replies
 have an empty PATH and are unaffected.
 
+## Building
+
+Requires Go 1.26 or newer.
+
+```bash
+make build
+```
+
+Produces five binaries at the repo root:
+
+- `roughtime` — Roughtime server daemon
+- `roughtime-client` — query servers, print timestamps
+- `roughtime-debug` — diagnostic version probe
+- `roughtime-bench` — closed-loop load generator
+- `roughtime-stamp` — document timestamp proofs
+
+To build one directly: `go build ./cmd/roughtime` (or any other `./cmd/<name>`).
+See [Development](#development) for the full make targets.
+
 ## Server
 
 Listens on a single port: UDP carries Ed25519 and Google-Roughtime, TCP carries
@@ -41,7 +62,7 @@ seeds, and online delegation certificates auto-refresh before expiry. Set
 `-pq-keygen` write a fresh seed (mode `0600`) and print its public key;
 `-pubkey` and `-pq-pubkey` re-derive a public key from an existing seed.
 
-```
+```bash
 roughtime -keygen /path/to/root.key
 roughtime -pq-keygen /path/to/pq-root.key
 roughtime -root-key-file /path/to/root.key -pq-root-key-file /path/to/pq-root.key
@@ -66,10 +87,10 @@ supported (`//go:build unix`).
 ### TCP framing
 
 Each message is prefixed with an 8-byte `ROUGHTIM` magic and a little-endian
-`uint32` length. Google-Roughtime (no header) is UDP-only; Ed25519 works over
-either transport; ML-DSA-44 is TCP-only. The TCP server is hardened against
-malformed input: bad magic, frames over 8192 bytes, zero-length bodies, and
-stalled reads close the connection.
+`uint32` length (12-byte header total). Google-Roughtime (no header) is
+UDP-only; Ed25519 works over either transport; ML-DSA-44 is TCP-only. The TCP
+server is hardened against malformed input: bad magic, request frames over 8192
+bytes, zero-length bodies, and stalled reads close the connection.
 
 ### ML-DSA-44 wire variant (experimental)
 
@@ -89,7 +110,7 @@ version per suite. No interop guaranteed.
 
 ### Docker
 
-```
+```bash
 docker build -t roughtime:latest .
 mkdir -p keys
 docker run --rm -v "$PWD/keys:/keys" roughtime:latest -keygen /keys/root.key
@@ -99,6 +120,11 @@ docker run -d --name roughtime --restart unless-stopped \
   -p 2002:2002/udp -p 2002:2002/tcp -v "$PWD/keys:/keys:ro" \
   roughtime:latest -root-key-file /keys/root.key -pq-root-key-file /keys/pq-root.key
 ```
+
+The distroless `nonroot` runtime writes keys as UID `65532`. If the host
+`./keys` directory is owned by another UID, prefix the `-keygen` lines with
+`--user "$(id -u):$(id -g)"` or `chown` the directory afterwards so the server
+can read the seeds.
 
 ## CLIs
 
@@ -112,9 +138,9 @@ drift. With `-servers`, it samples 3 entries (or `-all`) and queries each twice
 to surface pairwise inconsistencies. Multi-server queries are chained by
 default.
 
-```
-go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
-go run client/main.go -servers ecosystem.json [-all] [-tcp] [-chain=false]
+```bash
+go run ./cmd/roughtime-client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+go run ./cmd/roughtime-client -servers ecosystem.json [-all] [-tcp] [-chain=false]
 ```
 
 | Flag       | Default | Description                                                     |
@@ -134,8 +160,8 @@ go run client/main.go -servers ecosystem.json [-all] [-tcp] [-chain=false]
 Probes one server, lists supported versions, and dumps request, response,
 signatures, and delegation certificate.
 
-```
-go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA= [-tcp] [-ver draft-12]
+```bash
+go run ./cmd/roughtime-debug -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA= [-tcp] [-ver draft-12]
 ```
 
 | Flag       | Default | Description                                          |
@@ -154,8 +180,8 @@ error breakdown. `-verify` signature-checks every reply client-side; since
 ML-DSA-44 verification is materially slower than Ed25519, leave it off when
 measuring raw throughput.
 
-```
-go run bench/main.go -addr <host:port> -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s [-tcp] [-verify]
+```bash
+go run ./cmd/roughtime-bench -addr <host:port> -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s [-tcp] [-verify]
 ```
 
 | Flag        | Default        | Description                                   |
@@ -176,9 +202,9 @@ to a chain of witness signatures, and later re-validates that proof against the
 document and a trusted ecosystem. Witnesses need 32-byte nonces (IETF Ed25519
 drafts 05+ and experimental ML-DSA-44); Google-Roughtime entries are skipped.
 
-```
-go run stamp/main.go -doc README.md -servers ecosystem.json -out README.md.proof
-go run stamp/main.go -mode verify -doc README.md -servers ecosystem.json -in README.md.proof
+```bash
+go run ./cmd/roughtime-stamp -doc README.md -servers ecosystem.json -out README.md.proof
+go run ./cmd/roughtime-stamp -mode verify -doc README.md -servers ecosystem.json -in README.md.proof
 ```
 
 | Flag       | Default          | Description                       |
@@ -255,54 +281,45 @@ replies, err := protocol.CreateReplies(version, requests, midpoint, radius, cert
 
 Single server:
 
-```
-$ go run client/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+```text
+$ go run ./cmd/roughtime-client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 Address:   udp://time.txryan.com:2002
 Version:   draft-ietf-ntp-roughtime-12
-Midpoint:  2026-04-26T17:44:31Z
+Midpoint:  2026-04-28T00:57:28Z
 Radius:    3s
-Window:    [2026-04-26T17:44:28Z, 2026-04-26T17:44:34Z]
-RTT:       42ms
-Local:     2026-04-26T17:44:31.208678Z
-Drift:     -187ms
+Window:    [2026-04-28T00:57:25Z, 2026-04-28T00:57:31Z]
+RTT:       51ms
+Local:     2026-04-28T00:57:28.195661Z
+Drift:     -170ms
 Status:    in-sync
 ```
 
 Ecosystem (chained, queried twice in opposite halves):
 
-```
-$ go run client/main.go -servers ecosystem.json -all
+```text
+$ go run ./cmd/roughtime-client -servers ecosystem.json -all
 NAME                            ADDRESS                                    VERSION    MIDPOINT              RADIUS    RTT     DRIFT     STATUS
-time.txryan.com                 udp://time.txryan.com:2002                 draft-12   2026-04-26T17:44:31Z  ±3s       47ms    -298ms    in-sync
-time.txryan.com-pq              tcp://time.txryan.com:2002                 ml-dsa-44  2026-04-26T17:44:31Z  ±3s       50ms    -394ms    in-sync
-Cloudflare-Roughtime-2          udp://roughtime.cloudflare.com:2003        draft-11   2026-04-26T17:44:31Z  ±1s       17ms    -430ms    in-sync
-roughtime.se                    udp://roughtime.se:2002                    draft-12   2026-04-26T17:44:31Z  ±1s       145ms   -514ms    in-sync
-sth1.roughtime.netnod.se        udp://sth1.roughtime.netnod.se:2002        draft-07   2026-04-26T17:44:31Z  ±72µs     147ms   6ms       out-of-sync
-sth2.roughtime.netnod.se        udp://sth2.roughtime.netnod.se:2002        draft-07   2026-04-26T17:44:31Z  ±30µs     140ms   3ms       out-of-sync
-time.teax.dev                   udp://time.teax.dev:2002                   draft-12   2026-04-26T17:44:31Z  ±3s       155ms   -965ms    in-sync
-roughtime.sturdystatistics.com  udp://roughtime.sturdystatistics.com:2002  draft-12   2026-04-26T17:44:32Z  ±10s      183ms   -140ms    in-sync
-TimeNL-Roughtime                udp://rough.time.nl:2002                   draft-12   2026-04-26T17:44:32Z  ±3s       146ms   -308ms    in-sync
-time.txryan.com                 udp://time.txryan.com:2002                 draft-12   2026-04-26T17:44:32Z  ±3s       47ms    -408ms    in-sync
-time.txryan.com-pq              tcp://time.txryan.com:2002                 ml-dsa-44  2026-04-26T17:44:32Z  ±3s       44ms    -500ms    in-sync
-Cloudflare-Roughtime-2          udp://roughtime.cloudflare.com:2003        draft-11   2026-04-26T17:44:32Z  ±1s       17ms    -535ms    in-sync
-roughtime.se                    udp://roughtime.se:2002                    draft-12   2026-04-26T17:44:32Z  ±1s       146ms   -621ms    in-sync
-sth1.roughtime.netnod.se        udp://sth1.roughtime.netnod.se:2002        draft-07   2026-04-26T17:44:32Z  ±72µs     137ms   1ms       out-of-sync
-sth2.roughtime.netnod.se        udp://sth2.roughtime.netnod.se:2002        draft-07   2026-04-26T17:44:32Z  ±30µs     138ms   2ms       out-of-sync
-time.teax.dev                   udp://time.teax.dev:2002                   draft-12   2026-04-26T17:44:33Z  ±3s       152ms   -56ms     in-sync
-roughtime.sturdystatistics.com  udp://roughtime.sturdystatistics.com:2002  draft-12   2026-04-26T17:44:33Z  ±10s      185ms   -228ms    in-sync
-TimeNL-Roughtime                udp://rough.time.nl:2002                   draft-12   2026-04-26T17:44:33Z  ±3s       144ms   -396ms    in-sync
+time.txryan.com                 udp://time.txryan.com:2002                 draft-12   2026-04-28T00:57:28Z  ±3s       49ms    -290ms    in-sync
+time.txryan.com-pq              tcp://time.txryan.com:2002                 ml-dsa-44  2026-04-28T00:57:28Z  ±3s       50ms    -387ms    in-sync
+Cloudflare-Roughtime-2          udp://roughtime.cloudflare.com:2003        draft-11   2026-04-28T00:57:28Z  ±1s       17ms    -423ms    in-sync
+roughtime.se                    udp://roughtime.se:2002                    draft-12   2026-04-28T00:57:28Z  ±1s       146ms   -506ms    in-sync
+sth1.roughtime.netnod.se        udp://sth1.roughtime.netnod.se:2002        draft-07   2026-04-28T00:57:28Z  ±66µs     139ms   12ms      out-of-sync
+sth2.roughtime.netnod.se        udp://sth2.roughtime.netnod.se:2002        draft-07   2026-04-28T00:57:28Z  ±41µs     137ms   10ms      out-of-sync
+time.teax.dev                   udp://time.teax.dev:2002                   draft-12   2026-04-28T00:57:28Z  ±3s       156ms   -943ms    in-sync
+roughtime.sturdystatistics.com  udp://roughtime.sturdystatistics.com:2002  draft-12   2026-04-28T00:57:29Z  ±10s      184ms   -120ms    in-sync
+TimeNL-Roughtime                udp://rough.time.nl:2002                   draft-12   2026-04-28T00:57:29Z  ±3s       148ms   -290ms    in-sync
 
-18/18 servers responded
-Consensus drift:    -308ms (median of 9 samples)
-Consensus midpoint: 2026-04-26T17:44:33Z
-Drift spread:       971ms (min=-965ms, max=6ms)
+9/9 servers responded
+Consensus drift:    -290ms (median of 9 samples)
+Corrected local:    2026-04-28T00:57:30Z (now + median drift)
+Drift spread:       955ms (min=-943ms, max=12ms)
 Chain:              ok (18 links verified)
 ```
 
 ### debug
 
-```
-$ go run debug/main.go -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
+```text
+$ go run ./cmd/roughtime-debug -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 === Version Probe: time.txryan.com:2002 (udp) ===
 Timeout: 500ms
   draft-ietf-ntp-roughtime-12              OK
@@ -331,10 +348,10 @@ Size: 1024 bytes
 ...
 
 --- Request Tags ---
-  VER: 0c000080
+  VER:  0c000080 (draft-12)
   SRV: a8f7e4051782a37194a6cb51d94ac8f13d2c3c9e32d0c049ec3de42b40bc6c66
-  NONC: bfe7023ab4ed5cd16239b61cdf4d0f1135b8490f8da9e5279493dcccdeb1a842
-  TYPE: 00000000
+  NONC: 6f6614ece1871bb4b8c15e4c6f21e627fabaf520daf2f213aa148b79ed6fdb1d
+  TYPE: 00000000 (request)
   ZZZZ: (900 bytes of padding)
 
 === Response ===
@@ -345,55 +362,57 @@ Size: 460 bytes
 ...
 
 --- Response Tags ---
-  SIG: a994343e4e4eb889d082ddf6bda3ce105117ffedf4fe6b55f462681351b71b62afdea69c662a5b4c10030feb7007870e130193d088630bb44b827f7150d95706
-  NONC: bfe7023ab4ed5cd16239b61cdf4d0f1135b8490f8da9e5279493dcccdeb1a842
+  SIG: 68ac3af8a4baeef2c00b798f5be26767e5e5251aabdf82d6b0ea5691a232f19fc8f920c3a268a33ab1cf06b8f1b53d63db2057a4660ee97c5e1dee8a3fc1800b
+  NONC: 6f6614ece1871bb4b8c15e4c6f21e627fabaf520daf2f213aa148b79ed6fdb1d
+  TYPE: 01000000 (response)
   PATH: (empty)
   SREP: (136 bytes)
   CERT: (152 bytes)
   INDX: 00000000
-  TYPE: 01000000
 
 === Verified Result ===
-Round-trip time: 45.537708ms
-Midpoint:        2026-04-26T17:44:33Z
+Round-trip time: 46.027917ms
+Midpoint:        2026-04-28T00:57:30Z
 Radius:          3s
-Local time:      2026-04-26T17:44:33.61018Z
-Clock drift:     -587ms
+Local time:      2026-04-28T00:57:30.622688Z
+Clock drift:     -600ms
 Amplification:   ok (reply 460 <= request 1024)
 
 === Response Details ===
-Signature:       a994343e4e4eb889d082ddf6bda3ce105117ffedf4fe6b55f462681351b71b62afdea69c662a5b4c10030feb7007870e130193d088630bb44b827f7150d95706
-Nonce:           bfe7023ab4ed5cd16239b61cdf4d0f1135b8490f8da9e5279493dcccdeb1a842
+Signature:       68ac3af8a4baeef2c00b798f5be26767e5e5251aabdf82d6b0ea5691a232f19fc8f920c3a268a33ab1cf06b8f1b53d63db2057a4660ee97c5e1dee8a3fc1800b
+Nonce:           6f6614ece1871bb4b8c15e4c6f21e627fabaf520daf2f213aa148b79ed6fdb1d
 Merkle index:    0
 Merkle path:     0 node(s)
 
 === Signed Response (SREP) ===
-Merkle root:     08deee3fd4e3b11fdf20b22cdd1cd6e90d8157bd4a9ebb1733f61c7953b86ac0
-Midpoint (raw):  1777225473 (2026-04-26T17:44:33Z)
-Radius (raw):    3
+Merkle root:     2ecde0b0360b0bd0086c940b1dcf1385b86d0096b4099f05a85a8b51764efeae
+Midpoint (raw):  1777337850 Unix-s (2026-04-28T00:57:30Z)
+Radius (raw):    3 s
 VER in SREP:     0x8000000c (draft-ietf-ntp-roughtime-12)
 VERS in SREP:    draft-01, draft-02, draft-03, draft-04, draft-05, draft-06, draft-07, draft-08, draft-09, draft-10, draft-11, draft-12
 
 === Certificate ===
-Signature:       8dec91ab8c95b84476a9003e9d654d5a61b7ae605b103ab6a488c966f8707f211f92de68ea4d6b09ba107fc593dcc4afd4507b1f4b266f562da1c044de70430b
-Online key:      4fde663e4fc597d004319f3815209a3748d56e85fb66f214f3a14294b80799f1
-Not before:      2026-04-26T11:44:06Z
-Not after:       2026-04-27T11:44:06Z
-Expires in:      17h59m33s
+Signature:       4bfcc753ecda7695784078a1d1583606186372dd9014666f7375258e778a3c18d0ef109deee538c9fd25daa6196a8a0d01e4fa4ca9bd50ae9ddb9d2114c90204
+Online key:      502a004699b6805d67914caab3e6a46454aa77925494497fd34af7858d1bfc9b
+Not before:      2026-04-27T13:36:14Z
+Not after:       2026-04-28T13:36:14Z
+Expires in:      12h38m44s
 Cert validity:   ok (midpoint within window)
 ```
 
 ## Development
 
-```
+```bash
 make deps             # install dev tools
+make all              # default: fmt, vet, build, race tests
 make build            # build all five binaries
 make test             # unit tests
 make test-race        # unit tests with race detector
-make test-cover       # coverage (roughtime + protocol + server)
+make test-cover       # coverage (roughtime + protocol + cmd/roughtime)
 make test-race-cover  # race + coverage profile (CI)
 make fuzz             # all fuzz targets (FUZZ_TIME=30s each)
 make verify           # go mod download + verify
+make verify-tidy      # confirm go.mod and go.sum are tidy
 make coverage-report  # per-function summary + HTML report
 make lint             # vet + staticcheck + golangci-lint + gopls
 make check            # full suite (verify, fmt, vet, lint, build, race+cover, report card)

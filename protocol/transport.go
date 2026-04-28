@@ -12,19 +12,18 @@ import (
 	"time"
 )
 
-// MaxUDPReply is the IPv4 maximum datagram size; real replies fit in an MTU.
+// MaxUDPReply is the maximum UDP datagram size accepted as a reply.
 const MaxUDPReply = 65535
 
-// MaxTCPReplyBody caps the declared body of a TCP reply (experimental
-// post-quantum schemes push the largest wire shape near 7 KiB).
+// MaxTCPReplyBody caps the declared body length of a TCP reply.
 const MaxTCPReplyBody = 16 * 1024
 
-// ErrPeerClosedNoReply is returned by [RoundTripTCP] when the peer accepted the
-// request but closed before writing any reply bytes.
+// ErrPeerClosedNoReply is returned by [RoundTripTCP] when the peer closes
+// before writing any reply.
 var ErrPeerClosedNoReply = errors.New("peer closed connection with no reply (server may not support the requested version, scheme, or transport)")
 
-// RoundTripUDP sends one Roughtime request over UDP and returns the reply, the
-// round-trip time, and the local wall clock at reply receipt.
+// RoundTripUDP sends one Roughtime request over UDP and returns the reply, RTT,
+// and receipt time.
 func RoundTripUDP(ctx context.Context, address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
 	raddr, err := net.ResolveUDPAddr("udp", address)
 	if err != nil {
@@ -63,17 +62,13 @@ func RoundTripUDP(ctx context.Context, address string, request []byte, timeout t
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr
 		}
-		if errors.Is(err, net.ErrClosed) {
-			return nil, 0, time.Time{}, err
-		}
 		return nil, 0, time.Time{}, fmt.Errorf("reading: %w", err)
 	}
 	return buf[:n], time.Since(start), time.Now(), nil
 }
 
 // RoundTripTCP sends one ROUGHTIM-framed request over TCP and returns the
-// framed reply, round-trip time, and local wall clock at receipt. A peer that
-// closes without replying surfaces [ErrPeerClosedNoReply].
+// reply, RTT, and receipt time.
 func RoundTripTCP(ctx context.Context, address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
 	deadline := time.Now().Add(timeout)
 	dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
@@ -115,7 +110,7 @@ func RoundTripTCP(ctx context.Context, address string, request []byte, timeout t
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr
 		}
-		// io.EOF here means zero bytes read — peer closed without replying
+		// io.EOF means zero bytes read; peer closed without replying
 		if errors.Is(err, io.EOF) {
 			return nil, 0, time.Time{}, ErrPeerClosedNoReply
 		}

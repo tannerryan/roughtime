@@ -7,16 +7,16 @@ README.md
 LICENSE
 
 # Built binaries (from `make build`)
-roughtime
-roughtime-client
-roughtime-debug
-roughtime-bench
-roughtime-stamp
+/roughtime
+/roughtime-client
+/roughtime-debug
+/roughtime-bench
+/roughtime-stamp
 
 # Coverage artifacts
-coverage.out
-coverage.txt
-coverage.html
+/coverage.out
+/coverage.txt
+/coverage.html
 
 # Editor / OS cruft
 .idea

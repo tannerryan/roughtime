@@ -15,8 +15,7 @@ import (
 	"time"
 )
 
-// udpEcho spins up a loopback UDP listener that echoes datagrams until ctx is
-// cancelled.
+// udpEcho starts a loopback UDP listener that echoes datagrams.
 func udpEcho(t *testing.T, ctx context.Context) string {
 	t.Helper()
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback, Port: 0})
@@ -38,8 +37,8 @@ func udpEcho(t *testing.T, ctx context.Context) string {
 	return conn.LocalAddr().String()
 }
 
-// tcpEchoFramed accepts one ROUGHTIM-framed request and echoes it back until
-// ctx is cancelled.
+// tcpEchoFramed starts a TCP listener that runs handler on each ROUGHTIM-framed
+// request.
 func tcpEchoFramed(t *testing.T, ctx context.Context, handler func(req []byte) []byte) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "[::1]:0")
@@ -81,8 +80,8 @@ func tcpEchoFramed(t *testing.T, ctx context.Context, handler func(req []byte) [
 	return ln.Addr().String()
 }
 
-// TestRoundTripUDP verifies the happy-path exchange against a loopback echo
-// server.
+// TestRoundTripUDP verifies RoundTripUDP returns the echoed reply, positive
+// RTT, and a non-zero localNow.
 func TestRoundTripUDP(t *testing.T) {
 	addr := udpEcho(t, t.Context())
 
@@ -102,7 +101,8 @@ func TestRoundTripUDP(t *testing.T) {
 	}
 }
 
-// TestRoundTripUDPTimeout confirms the timeout path surfaces an error.
+// TestRoundTripUDPTimeout verifies RoundTripUDP errors on a closed-socket
+// blackhole.
 func TestRoundTripUDPTimeout(t *testing.T) {
 	// blackhole: valid address, closed socket
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback, Port: 0})
@@ -118,8 +118,7 @@ func TestRoundTripUDPTimeout(t *testing.T) {
 	}
 }
 
-// TestRoundTripTCP verifies a ROUGHTIM-framed exchange returns the reply
-// intact.
+// TestRoundTripTCP verifies RoundTripTCP returns the framed echoed reply.
 func TestRoundTripTCP(t *testing.T) {
 	addr := tcpEchoFramed(t, t.Context(), func(req []byte) []byte { return req })
 
@@ -143,8 +142,8 @@ func TestRoundTripTCP(t *testing.T) {
 	}
 }
 
-// TestRoundTripTCPRejectsBadMagic confirms a non-ROUGHTIM reply surfaces an
-// error.
+// TestRoundTripTCPRejectsBadMagic verifies RoundTripTCP errors on a reply
+// lacking ROUGHTIM magic.
 func TestRoundTripTCPRejectsBadMagic(t *testing.T) {
 	ln, err := net.Listen("tcp", "[::1]:0")
 	if err != nil {
@@ -157,7 +156,6 @@ func TestRoundTripTCPRejectsBadMagic(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		// consume request, return garbage header
 		var scratch [64]byte
 		_, _ = conn.Read(scratch[:])
 		_, _ = conn.Write([]byte("NOTMAGIC\x00\x00\x00\x00"))
@@ -169,9 +167,8 @@ func TestRoundTripTCPRejectsBadMagic(t *testing.T) {
 	}
 }
 
-// TestRoundTripTCPPeerClosedNoReply confirms a peer closing without replying
-// surfaces ErrPeerClosedNoReply (the signal for unsupported
-// version/scheme/transport).
+// TestRoundTripTCPPeerClosedNoReply verifies RoundTripTCP surfaces
+// ErrPeerClosedNoReply when the peer closes silently.
 func TestRoundTripTCPPeerClosedNoReply(t *testing.T) {
 	ln, err := net.Listen("tcp", "[::1]:0")
 	if err != nil {
@@ -183,7 +180,7 @@ func TestRoundTripTCPPeerClosedNoReply(t *testing.T) {
 		if err != nil {
 			return
 		}
-		// drain request, close without reply (mirrors unsupported version)
+		// drain request, close without reply
 		var scratch [4096]byte
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		_, _ = conn.Read(scratch[:])
@@ -196,8 +193,8 @@ func TestRoundTripTCPPeerClosedNoReply(t *testing.T) {
 	}
 }
 
-// TestRoundTripTCPHonorsTotalTimeout confirms dial + r/w share one deadline so
-// a non-responsive peer cannot extend the budget beyond timeout.
+// TestRoundTripTCPHonorsTotalTimeout verifies RoundTripTCP enforces a single
+// shared deadline across dial and I/O.
 func TestRoundTripTCPHonorsTotalTimeout(t *testing.T) {
 	ln, err := net.Listen("tcp", "[::1]:0")
 	if err != nil {
@@ -209,7 +206,6 @@ func TestRoundTripTCPHonorsTotalTimeout(t *testing.T) {
 		if err != nil {
 			return
 		}
-		// hold open without responding so read blocks
 		<-t.Context().Done()
 		_ = conn.Close()
 	}()
@@ -221,15 +217,99 @@ func TestRoundTripTCPHonorsTotalTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected timeout error from non-responsive peer")
 	}
-	// allow 1.5× for scheduling slack; reject old 2× behavior
+	// allow 1.5× for scheduling slack
 	if elapsed > 3*budget/2 {
 		t.Fatalf("RoundTripTCP took %s; want ≤ 1.5×%s (single shared deadline)", elapsed, budget)
 	}
 }
 
-// TestRoundTripUDPContextCancel confirms cancelling ctx unblocks the read.
+// TestRoundTripTCPRejectsZeroBodyLen verifies RoundTripTCP rejects a zero
+// declared body length.
+func TestRoundTripTCPRejectsZeroBodyLen(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var scratch [64]byte
+		_, _ = conn.Read(scratch[:])
+		var hdr [PacketHeaderSize]byte
+		copy(hdr[:8], []byte("ROUGHTIM"))
+		_, _ = conn.Write(hdr[:])
+	}()
+
+	_, _, _, err = RoundTripTCP(context.Background(), ln.Addr().String(), []byte("x"), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("RoundTripTCP: err=%v; want length-range error", err)
+	}
+}
+
+// TestRoundTripTCPRejectsOversizeBodyLen verifies RoundTripTCP rejects body
+// lengths above MaxTCPReplyBody.
+func TestRoundTripTCPRejectsOversizeBodyLen(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var scratch [64]byte
+		_, _ = conn.Read(scratch[:])
+		var hdr [PacketHeaderSize]byte
+		copy(hdr[:8], []byte("ROUGHTIM"))
+		binary.LittleEndian.PutUint32(hdr[8:], uint32(MaxTCPReplyBody+1))
+		_, _ = conn.Write(hdr[:])
+	}()
+
+	_, _, _, err = RoundTripTCP(context.Background(), ln.Addr().String(), []byte("x"), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "out of range") {
+		t.Fatalf("RoundTripTCP: err=%v; want length-range error", err)
+	}
+}
+
+// TestRoundTripTCPPartialBody verifies RoundTripTCP errors when the body is
+// shorter than the declared length.
+func TestRoundTripTCPPartialBody(t *testing.T) {
+	ln, err := net.Listen("tcp", "[::1]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var scratch [64]byte
+		_, _ = conn.Read(scratch[:])
+		var hdr [PacketHeaderSize]byte
+		copy(hdr[:8], []byte("ROUGHTIM"))
+		binary.LittleEndian.PutUint32(hdr[8:], 64)
+		_, _ = conn.Write(hdr[:])
+		_, _ = conn.Write(make([]byte, 8))
+	}()
+
+	_, _, _, err = RoundTripTCP(context.Background(), ln.Addr().String(), []byte("x"), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "reading body") {
+		t.Fatalf("RoundTripTCP: err=%v; want body-read error", err)
+	}
+}
+
+// TestRoundTripUDPContextCancel verifies cancelling ctx unblocks RoundTripUDP's
+// pending read.
 func TestRoundTripUDPContextCancel(t *testing.T) {
-	// blackholed address; read would otherwise block for the full timeout
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback, Port: 0})
 	if err != nil {
 		t.Fatal(err)

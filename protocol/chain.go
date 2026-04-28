@@ -6,8 +6,6 @@ package protocol
 import (
 	"bytes"
 	"crypto/sha512"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -15,42 +13,40 @@ import (
 	"time"
 )
 
-// Sentinel errors returned by [Chain.Verify].
 var (
-	// ErrChainNonce indicates a nonce linkage failure (corrupted or forged
-	// chain).
+	// ErrChainNonce indicates a nonce linkage failure in [Chain.Verify].
 	ErrChainNonce = errors.New("protocol: chain nonce mismatch")
 
-	// ErrCausalOrder indicates a causal ordering violation (server
-	// malfeasance).
+	// ErrCausalOrder indicates a causal ordering violation in [Chain.Verify].
 	ErrCausalOrder = errors.New("protocol: causal ordering violation")
 )
 
+// maxChainLinks caps the link count of a parsed malfeasance report.
 const maxChainLinks = 1024
 
-// 1024 links * ~64 KiB packets * 4/3 base64 ~ 88 MiB worst case; 4 MiB fits
-// realistic reports
-const maxMalfeasanceReportBytes = 4 * 1024 * 1024
-
 // ChainLink is one server query in a Roughtime measurement chain.
-// Rand/PublicKey/Request/Response map 1:1 to the malfeasance report JSON; Nonce
-// is in-memory only, populated by NextRequest.
 type ChainLink struct {
-	Rand      []byte // blind, sized to version's nonce length; nil for first link
-	PublicKey []byte // server long-term key (Ed25519 or ML-DSA-44, experimental)
-	Nonce     []byte // nonce sent in Request, not serialized
-	Request   []byte // full request packet
-	Response  []byte // full response packet
+	// Rand is the blind, nil for the first link.
+	Rand []byte
+	// PublicKey is the server's long-term key.
+	PublicKey []byte
+	// Nonce is the nonce sent in Request; not serialized.
+	Nonce []byte
+	// Request is the full request packet.
+	Request []byte
+	// Response is the full response packet.
+	Response []byte
 }
 
 // Chain accumulates sequential Roughtime queries for causal ordering and
-// malfeasance reporting. A Chain is not safe for concurrent use.
+// malfeasance reporting; not safe for concurrent use.
 type Chain struct {
+	// Links holds the chain's queries in order.
 	Links []ChainLink
 }
 
-// ChainNonce derives the next link's nonce: random for the first link (nil
-// rand), otherwise H(prevResponse || rand).
+// ChainNonce derives the next link's nonce, returning random bytes for the
+// first link or H(prevResponse || rand) thereafter.
 func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (nonce, rand []byte, err error) {
 	_, g, err := clientVersionPreference(versions)
 	if err != nil {
@@ -76,15 +72,14 @@ func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (non
 	return nonce, rand, nil
 }
 
-// SHA-512: must yield up to 64 bytes (Google, drafts 01-04); SHA-512/256 only
-// gives 32
+// chainHasher returns the chain-nonce hasher; SHA-512 is used for every group
+// since drafts 01-04 require up to 64 bytes.
 func chainHasher(_ wireGroup) hash.Hash {
 	return sha512.New()
 }
 
 // NextRequest creates the next chained request with Rand, PublicKey, Nonce, and
-// Request populated; the caller sets Response then calls [Chain.Append]. rootPK
-// length selects Ed25519 or ML-DSA-44 (experimental).
+// Request populated.
 func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader) (ChainLink, error) {
 	var prevResp []byte
 	if n := len(c.Links); n > 0 {
@@ -113,9 +108,8 @@ func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader
 	}, nil
 }
 
-// NextRequestWithNonce is [Chain.NextRequest] with a caller-supplied nonce.
-// Only valid as the first link — subsequent links must derive nonces causally
-// so the malfeasance proof binds.
+// NextRequestWithNonce creates the first chained request with a caller-supplied
+// nonce.
 func (c *Chain) NextRequestWithNonce(versions []Version, rootPK, nonce []byte) (ChainLink, error) {
 	if len(c.Links) > 0 {
 		return ChainLink{}, errors.New("protocol: NextRequestWithNonce only valid for the first chain link")
@@ -137,9 +131,8 @@ func (c *Chain) Append(link ChainLink) {
 	c.Links = append(c.Links, link)
 }
 
-// Verify checks nonce linkage, signature validity, and causal ordering. Nonce
-// failures wrap [ErrChainNonce]; causal-ordering failures wrap
-// [ErrCausalOrder]; signature failures are returned unwrapped.
+// Verify checks nonce linkage, signature validity, and causal ordering across
+// the chain.
 func (c *Chain) Verify() error {
 	if len(c.Links) == 0 {
 		return errors.New("protocol: empty chain")
@@ -161,7 +154,6 @@ func (c *Chain) Verify() error {
 			return fmt.Errorf("protocol: chain link %d: parse request: %w", i, err)
 		}
 
-		// empty VER list means Google-Roughtime
 		versions := req.Versions
 		if len(versions) == 0 {
 			versions = []Version{VersionGoogle}
@@ -196,7 +188,7 @@ func (c *Chain) Verify() error {
 		}
 	}
 
-	// require lower[i] <= upper[j] for all i < j; running max of lower[] keeps
+	// require lower[i] <= upper[j] for all i < j; running max of lower keeps
 	// this O(n)
 	maxLowerIdx := 0
 	for j := 1; j < len(results); j++ {
@@ -209,154 +201,4 @@ func (c *Chain) Verify() error {
 	}
 
 	return nil
-}
-
-// drafts-12+ JSON report
-type malfeasanceReport struct {
-	Responses []malfeasanceLink `json:"responses"`
-}
-
-type malfeasanceLink struct {
-	Rand      string `json:"rand,omitempty"`
-	PublicKey string `json:"publicKey"`
-	Request   string `json:"request"`
-	Response  string `json:"response"`
-}
-
-// drafts 10-11 format: parallel arrays, no request or publicKey
-type malfeasanceReportLegacy struct {
-	Nonces    []string `json:"nonces"`
-	Responses []string `json:"responses"`
-}
-
-// MalfeasanceReport serializes the chain as JSON. All-drafts-10-11 chains use
-// the legacy format; everything else uses drafts-12+
-// (application/roughtime-malfeasance+json).
-func (c *Chain) MalfeasanceReport() ([]byte, error) {
-	if len(c.Links) == 0 {
-		return nil, errors.New("protocol: empty chain")
-	}
-	if c.isLegacyChain() {
-		return c.marshalLegacyReport()
-	}
-	report := malfeasanceReport{
-		Responses: make([]malfeasanceLink, len(c.Links)),
-	}
-	for i, link := range c.Links {
-		ml := malfeasanceLink{
-			PublicKey: base64.StdEncoding.EncodeToString(link.PublicKey),
-			Request:   base64.StdEncoding.EncodeToString(link.Request),
-			Response:  base64.StdEncoding.EncodeToString(link.Response),
-		}
-		if link.Rand != nil {
-			ml.Rand = base64.StdEncoding.EncodeToString(link.Rand)
-		}
-		report.Responses[i] = ml
-	}
-	return json.Marshal(report)
-}
-
-// every link must be groupD10 for the legacy parallel-array format to conform
-func (c *Chain) isLegacyChain() bool {
-	if len(c.Links) == 0 {
-		return false
-	}
-	for _, link := range c.Links {
-		ver, ok := ExtractVersion(link.Response)
-		if !ok {
-			return false
-		}
-		if wireGroupOf(ver, false) != groupD10 {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Chain) marshalLegacyReport() ([]byte, error) {
-	report := malfeasanceReportLegacy{
-		Nonces:    make([]string, len(c.Links)),
-		Responses: make([]string, len(c.Links)),
-	}
-	for i, link := range c.Links {
-		if link.Rand != nil {
-			report.Nonces[i] = base64.StdEncoding.EncodeToString(link.Rand)
-		}
-		report.Responses[i] = base64.StdEncoding.EncodeToString(link.Response)
-	}
-	return json.Marshal(report)
-}
-
-// ParseMalfeasanceReport deserializes a JSON malfeasance report (drafts-12+ or
-// legacy drafts 10-11) into a Chain. Legacy reports lack Request and PublicKey,
-// so [Chain.Verify] cannot be used on them.
-func ParseMalfeasanceReport(data []byte) (*Chain, error) {
-	if len(data) > maxMalfeasanceReportBytes {
-		return nil, fmt.Errorf("protocol: malfeasance report is %d bytes (max %d)", len(data), maxMalfeasanceReportBytes)
-	}
-	// legacy: top-level "nonces" + string entries; drafts-12+: object entries
-	var probe struct {
-		Nonces    json.RawMessage   `json:"nonces"`
-		Responses []json.RawMessage `json:"responses"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return nil, fmt.Errorf("protocol: parse malfeasance report: %w", err)
-	}
-	if len(probe.Responses) == 0 {
-		return nil, errors.New("protocol: malfeasance report has no responses")
-	}
-	if len(probe.Responses) > maxChainLinks {
-		return nil, fmt.Errorf("protocol: malfeasance report has %d links (max %d)", len(probe.Responses), maxChainLinks)
-	}
-	legacy := len(probe.Nonces) > 0 && len(probe.Responses[0]) > 0 && probe.Responses[0][0] == '"'
-
-	if legacy {
-		var report malfeasanceReportLegacy
-		if err := json.Unmarshal(data, &report); err != nil {
-			return nil, fmt.Errorf("protocol: parse legacy malfeasance report: %w", err)
-		}
-		if len(report.Nonces) != len(report.Responses) {
-			return nil, fmt.Errorf("protocol: legacy report nonces/responses length mismatch (%d vs %d)", len(report.Nonces), len(report.Responses))
-		}
-		c := &Chain{Links: make([]ChainLink, len(report.Responses))}
-		for i := range report.Responses {
-			var err error
-			if report.Nonces[i] != "" {
-				if c.Links[i].Rand, err = base64.StdEncoding.DecodeString(report.Nonces[i]); err != nil {
-					return nil, fmt.Errorf("protocol: legacy report link %d: decode nonce: %w", i, err)
-				}
-			}
-			if c.Links[i].Response, err = base64.StdEncoding.DecodeString(report.Responses[i]); err != nil {
-				return nil, fmt.Errorf("protocol: legacy report link %d: decode response: %w", i, err)
-			}
-		}
-		return c, nil
-	}
-
-	var report malfeasanceReport
-	if err := json.Unmarshal(data, &report); err != nil {
-		return nil, fmt.Errorf("protocol: parse malfeasance report: %w", err)
-	}
-
-	c := &Chain{Links: make([]ChainLink, len(report.Responses))}
-	for i, ml := range report.Responses {
-		var err error
-
-		if ml.Rand != "" {
-			if c.Links[i].Rand, err = base64.StdEncoding.DecodeString(ml.Rand); err != nil {
-				return nil, fmt.Errorf("protocol: report link %d: decode rand: %w", i, err)
-			}
-		}
-		if c.Links[i].PublicKey, err = base64.StdEncoding.DecodeString(ml.PublicKey); err != nil {
-			return nil, fmt.Errorf("protocol: report link %d: decode publicKey: %w", i, err)
-		}
-		if c.Links[i].Request, err = base64.StdEncoding.DecodeString(ml.Request); err != nil {
-			return nil, fmt.Errorf("protocol: report link %d: decode request: %w", i, err)
-		}
-		if c.Links[i].Response, err = base64.StdEncoding.DecodeString(ml.Response); err != nil {
-			return nil, fmt.Errorf("protocol: report link %d: decode response: %w", i, err)
-		}
-	}
-
-	return c, nil
 }
