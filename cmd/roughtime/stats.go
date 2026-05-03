@@ -16,15 +16,9 @@ import (
 // statsInterval is the cadence of the periodic stats log.
 var statsInterval = 60 * time.Second
 
-// Server-wide counters read by stats loop and shutdown log.
+// Server-wide un-labeled counters; labeled request/response/drop counters live
+// in metrics.go.
 var (
-	// statsReceived counts requests that arrived on the listener.
-	statsReceived atomic.Uint64
-	// statsResponded counts responses written to the wire.
-	statsResponded atomic.Uint64
-	// statsDropped counts requests that failed to ship for any listener-side
-	// reason.
-	statsDropped atomic.Uint64
 	// statsPanics counts goroutine panics absorbed by recoverGoroutine.
 	statsPanics atomic.Uint64
 	// statsBatches counts signing batches flushed by either listener.
@@ -51,9 +45,9 @@ func statsLoop(ctx context.Context, log *zap.Logger, edState, pqState *atomic.Po
 			return
 		case <-ticker.C:
 		}
-		r := statsReceived.Load()
-		s := statsResponded.Load()
-		d := statsDropped.Load()
+		r := requestsReceived.total()
+		s := requestsResponded.total()
+		d := requestsDropped.total()
 		p := statsPanics.Load()
 		bc := statsBatches.Load()
 		bt := statsBatchedReqs.Load()
@@ -78,7 +72,7 @@ func statsLoop(ctx context.Context, log *zap.Logger, edState, pqState *atomic.Po
 			zap.Uint64("tcp_accepted", ta-lastTCPAccepted),
 			zap.Uint64("tcp_rejected", tr-lastTCPRejected),
 			zap.Uint64("tcp_completed", tc-lastTCPCompleted),
-			zap.Uint64("amp_suppressed", amp-lastAmp),
+			zap.Uint64("udp_amp_suppressed", amp-lastAmp),
 		}
 		if edState != nil {
 			fields = append(fields, zap.Duration("cert_remaining", time.Until(edState.Load().expiry)))

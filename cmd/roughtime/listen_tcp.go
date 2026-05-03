@@ -50,8 +50,8 @@ var (
 	maxTCPReplyBytes = 8 * 1024
 )
 
-// TCP-specific counters; the statsTCPDrop* counters split statsDropped by
-// reason.
+// TCP-specific connection-lifecycle counters. Reason-classified drop counters
+// live as labeled series under requests_dropped_total in metrics.go.
 var (
 	// statsTCPAccepted counts conns accepted by the listener.
 	statsTCPAccepted atomic.Uint64
@@ -59,21 +59,6 @@ var (
 	statsTCPRejected atomic.Uint64
 	// statsTCPCompleted counts request/reply round-trips that finished cleanly.
 	statsTCPCompleted atomic.Uint64
-	// statsTCPDropFraming counts drops due to bad magic, bad length, or header
-	// parse.
-	statsTCPDropFraming atomic.Uint64
-	// statsTCPDropRead counts drops due to body short-read or read timeout.
-	statsTCPDropRead atomic.Uint64
-	// statsTCPDropPrepare counts drops due to parse, version, or SRV mismatch.
-	statsTCPDropPrepare atomic.Uint64
-	// statsTCPDropQueue counts drops due to batcher queue saturation past
-	// submit wait.
-	statsTCPDropQueue atomic.Uint64
-	// statsTCPDropBatchErr counts drops due to batch-level signing or oversize
-	// reply.
-	statsTCPDropBatchErr atomic.Uint64
-	// statsTCPDropWrite counts drops due to a failed socket write.
-	statsTCPDropWrite atomic.Uint64
 )
 
 // tcpBatchItem is a request submitted to the batcher by a handler.
@@ -266,15 +251,18 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 		zap.Uint64("accepted_total", statsTCPAccepted.Load()),
 		zap.Uint64("rejected_total", statsTCPRejected.Load()),
 		zap.Uint64("completed_total", statsTCPCompleted.Load()),
-		zap.Uint64("received_total", statsReceived.Load()),
-		zap.Uint64("responded_total", statsResponded.Load()),
-		zap.Uint64("dropped_total", statsDropped.Load()),
-		zap.Uint64("drop_framing_total", statsTCPDropFraming.Load()),
-		zap.Uint64("drop_read_total", statsTCPDropRead.Load()),
-		zap.Uint64("drop_prepare_total", statsTCPDropPrepare.Load()),
-		zap.Uint64("drop_queue_total", statsTCPDropQueue.Load()),
-		zap.Uint64("drop_batch_err_total", statsTCPDropBatchErr.Load()),
-		zap.Uint64("drop_write_total", statsTCPDropWrite.Load()),
+		zap.Uint64("received_total", requestsReceived.total()),
+		zap.Uint64("responded_total", requestsResponded.total()),
+		zap.Uint64("dropped_total", requestsDropped.total()),
+		zap.Uint64("drop_framing_total", droppedFor(transportTCP, dropFraming)),
+		zap.Uint64("drop_read_total", droppedFor(transportTCP, dropRead)),
+		zap.Uint64("drop_parse_total", droppedFor(transportTCP, dropParse)),
+		zap.Uint64("drop_version_total", droppedFor(transportTCP, dropVersion)),
+		zap.Uint64("drop_config_total", droppedFor(transportTCP, dropConfig)),
+		zap.Uint64("drop_srv_total", droppedFor(transportTCP, dropSRV)),
+		zap.Uint64("drop_queue_total", droppedFor(transportTCP, dropQueue)),
+		zap.Uint64("drop_batch_err_total", droppedFor(transportTCP, dropBatchErr)),
+		zap.Uint64("drop_write_total", droppedFor(transportTCP, dropWrite)),
 		zap.Uint64("batches_total", statsBatches.Load()),
 		zap.Uint64("batched_reqs_total", statsBatchedReqs.Load()),
 		zap.Uint64("batch_errs_total", statsBatchErrs.Load()),
@@ -312,17 +300,22 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		}
 		bodyLen, err := protocol.ParsePacketHeader(hdr)
 		if err != nil {
-			statsDropped.Add(1)
-			statsTCPDropFraming.Add(1)
+			incDropped(transportTCP, dropFraming)
 			if ce := log.Check(zap.DebugLevel, "TCP bad header"); ce != nil {
 				ce.Write(zap.Stringer("peer", conn.RemoteAddr()), zap.Error(err))
 			}
 			return
 		}
-		if bodyLen == 0 || bodyLen > maxTCPRequestSize {
-			statsDropped.Add(1)
-			statsTCPDropFraming.Add(1)
-			if ce := log.Check(zap.DebugLevel, "TCP bad length"); ce != nil {
+		if bodyLen == 0 {
+			incDropped(transportTCP, dropFraming)
+			if ce := log.Check(zap.DebugLevel, "TCP zero body length"); ce != nil {
+				ce.Write(zap.Stringer("peer", conn.RemoteAddr()))
+			}
+			return
+		}
+		if bodyLen > maxTCPRequestSize {
+			incDropped(transportTCP, dropOversize)
+			if ce := log.Check(zap.DebugLevel, "TCP oversize body"); ce != nil {
 				ce.Write(zap.Stringer("peer", conn.RemoteAddr()), zap.Uint32("len", bodyLen))
 			}
 			return
@@ -333,21 +326,20 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		_ = conn.SetReadDeadline(time.Now().Add(tcpReadTimeout))
 		pkt := reqBuf[:protocol.PacketHeaderSize+int(bodyLen)]
 		if _, err := io.ReadFull(conn, pkt[protocol.PacketHeaderSize:]); err != nil {
-			statsDropped.Add(1)
-			statsTCPDropRead.Add(1)
+			incDropped(transportTCP, dropRead)
 			if ce := log.Check(zap.DebugLevel, "TCP short read"); ce != nil {
 				ce.Write(zap.Stringer("peer", conn.RemoteAddr()), zap.Error(err))
 			}
 			return
 		}
-		statsReceived.Add(1)
 
-		item, ch, err := prepareTCPItem(log, conn.RemoteAddr(), pkt, edState, pqState, edBatchCh, pqBatchCh, prefs)
+		item, ch, reason, err := prepareTCPItem(log, conn.RemoteAddr(), pkt, edState, pqState, edBatchCh, pqBatchCh, prefs)
 		if err != nil {
-			statsDropped.Add(1)
-			statsTCPDropPrepare.Add(1)
+			incDropped(transportTCP, reason)
 			return
 		}
+		scheme := schemeForVersion(item.version)
+		incReceived(transportTCP, scheme)
 
 		// fast path non-blocking; on a queue spike, fall back to a short
 		// bounded wait so a transient burst doesn't tear down every conn
@@ -363,8 +355,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 				submitTimer.Stop()
 				return
 			case <-submitTimer.C:
-				statsDropped.Add(1)
-				statsTCPDropQueue.Add(1)
+				incDropped(transportTCP, dropQueue)
 				if ce := log.Check(zap.WarnLevel, "TCP batcher queue full"); ce != nil {
 					ce.Write(zap.Stringer("peer", conn.RemoteAddr()))
 				}
@@ -387,57 +378,56 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		}
 		if br.err != nil {
 			// batch-level failure already logged by flushTCPBatch
-			statsDropped.Add(1)
-			statsTCPDropBatchErr.Add(1)
+			incDropped(transportTCP, dropBatchErr)
 			return
 		}
 
 		_ = conn.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
 		if err := writeTCPReply(conn, br.bytes); err != nil {
-			statsDropped.Add(1)
-			statsTCPDropWrite.Add(1)
+			incDropped(transportTCP, dropWrite)
 			if ce := log.Check(zap.DebugLevel, "TCP write failed"); ce != nil {
 				ce.Write(zap.Stringer("peer", conn.RemoteAddr()), zap.Error(err))
 			}
 			return
 		}
-		statsResponded.Add(1)
+		incResponded(transportTCP, scheme, 1)
 		statsTCPCompleted.Add(1)
 	}
 }
 
 // prepareTCPItem parses, negotiates, and SRV-checks reqBytes, returning the
-// tcpBatchItem and destination batch channel.
-func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) (tcpBatchItem, chan<- tcpBatchItem, error) {
+// tcpBatchItem and destination batch channel. On failure the dropReason
+// classifies the rejection; empty on success.
+func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) (tcpBatchItem, chan<- tcpBatchItem, dropReason, error) {
 	req, err := protocol.ParseRequest(reqBytes)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "request parse failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Int("size", len(reqBytes)), zap.Error(err))
 		}
-		return tcpBatchItem{}, nil, err
+		return tcpBatchItem{}, nil, dropParse, err
 	}
 	ver, err := protocol.SelectVersion(req.Versions, len(req.Nonce), prefs)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "version negotiation failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
 		}
-		return tcpBatchItem{}, nil, err
+		return tcpBatchItem{}, nil, dropVersion, err
 	}
 	st, ch, err := tcpRouteForVersion(ver, edState, pqState, edBatchCh, pqBatchCh)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "TCP route unavailable"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
 		}
-		return tcpBatchItem{}, nil, err
+		return tcpBatchItem{}, nil, dropConfig, err
 	}
 	// drafts 10+: reject SRV not addressing a key we control
 	if req.SRV != nil && !bytes.Equal(req.SRV, st.srvHash) {
 		if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer))
 		}
-		return tcpBatchItem{}, nil, errors.New("SRV mismatch")
+		return tcpBatchItem{}, nil, dropSRV, errors.New("SRV mismatch")
 	}
-	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, nil
+	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, "", nil
 }
 
 // tcpRouteForVersion picks the certState snapshot and batcher channel for ver's

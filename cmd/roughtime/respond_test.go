@@ -27,9 +27,12 @@ func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	vr, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st)
+	vr, reason, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st)
 	if !ok {
 		t.Fatal("validateRequest rejected a well-formed request")
+	}
+	if reason != "" {
+		t.Fatalf("reason=%q want empty on success", reason)
 	}
 	if vr.version != protocol.VersionDraft12 {
 		t.Fatalf("version=%s want Draft12", vr.version)
@@ -48,7 +51,7 @@ func TestValidateRequestAcceptsGoogle(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	vr, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st)
+	vr, _, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st)
 	if !ok {
 		t.Fatal("validateRequest rejected Google request")
 	}
@@ -65,8 +68,8 @@ func TestValidateRequestRejectsParseError(t *testing.T) {
 
 	// debug logger exercises parse-failure branch
 	junk := make([]byte, 1024)
-	if _, ok := validateRequest(zaptest.NewLogger(t), junk, peer, 1024, nil, st); ok {
-		t.Fatal("validateRequest accepted all-zero bytes")
+	if _, reason, ok := validateRequest(zaptest.NewLogger(t), junk, peer, 1024, nil, st); ok || reason != dropParse {
+		t.Fatalf("validateRequest junk: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropParse)
 	}
 }
 
@@ -86,8 +89,8 @@ func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	if _, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok {
-		t.Fatal("validateRequest accepted request with wrong SRV")
+	if _, reason, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok || reason != dropSRV {
+		t.Fatalf("validateRequest SRV mismatch: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropSRV)
 	}
 }
 
@@ -100,7 +103,7 @@ func TestValidateRequestAcceptsAbsentSRV(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	if _, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st); !ok {
+	if _, _, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st); !ok {
 		t.Fatal("validateRequest rejected draft-09 request without SRV")
 	}
 }
@@ -115,8 +118,8 @@ func TestValidateRequestRejectsUnsupportedVersion(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	if _, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok {
-		t.Fatal("validateRequest accepted request with unsupported version")
+	if _, reason, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok || reason != dropVersion {
+		t.Fatalf("validateRequest unsupported version: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropVersion)
 	}
 }
 
@@ -129,7 +132,7 @@ func TestValidateRequestStoresBufPtr(t *testing.T) {
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
 	buf := make([]byte, len(req))
 	copy(buf, req)
-	vr, ok := validateRequest(zap.NewNop(), buf, peer, len(req), &buf, st)
+	vr, _, ok := validateRequest(zap.NewNop(), buf, peer, len(req), &buf, st)
 	if !ok {
 		t.Fatal("validateRequest rejected valid request")
 	}
@@ -292,7 +295,7 @@ func FuzzServeOnce(f *testing.F) {
 
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
 	f.Fuzz(func(_ *testing.T, data []byte) {
-		vr, ok := validateRequest(zap.NewNop(), data, peer, len(data), nil, st)
+		vr, _, ok := validateRequest(zap.NewNop(), data, peer, len(data), nil, st)
 		if !ok {
 			return
 		}

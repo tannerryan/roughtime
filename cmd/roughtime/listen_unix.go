@@ -3,7 +3,6 @@
 
 //go:build unix
 
-// Shared UDP receive-buffer sizing for Linux and non-Linux listeners.
 package main
 
 import (

@@ -6,8 +6,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +33,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	origPubkey := *pubkey
 	origPQKeygen := *pqKeygen
 	origPQPubkey := *pqPubkey
+	origMetrics := *metricsAddr
 	t.Cleanup(func() {
 		*port = origPort
 		*rootKeySeedHexFile = origEd
@@ -41,6 +45,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 		*pubkey = origPubkey
 		*pqKeygen = origPQKeygen
 		*pqPubkey = origPQPubkey
+		*metricsAddr = origMetrics
 	})
 	*port = p
 	*rootKeySeedHexFile = edKey
@@ -52,6 +57,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	*pubkey = ""
 	*pqKeygen = ""
 	*pqPubkey = ""
+	*metricsAddr = ""
 }
 
 // TestServeDualStack verifies serve starts and stops cleanly with both Ed25519
@@ -89,7 +95,13 @@ func TestServeDualStack(t *testing.T) {
 // elapses.
 func waitForTCPReady(t *testing.T, port int, timeout time.Duration) {
 	t.Helper()
-	addr := net.JoinHostPort("::1", strconv.Itoa(port))
+	waitForTCPDialReady(t, net.JoinHostPort("::1", strconv.Itoa(port)), timeout)
+}
+
+// waitForTCPDialReady polls a literal host:port until a TCP dial succeeds or
+// timeout elapses.
+func waitForTCPDialReady(t *testing.T, addr string, timeout time.Duration) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
@@ -100,6 +112,73 @@ func waitForTCPReady(t *testing.T, port int, timeout time.Duration) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("TCP listener on %s not ready within %s", addr, timeout)
+}
+
+// TestServeWithMetricsAddr verifies serve brings up the Prometheus endpoint
+// when -metrics-addr is set, and that a scrape returns the registry.
+func TestServeWithMetricsAddr(t *testing.T) {
+	dir := t.TempDir()
+	edPath := filepath.Join(dir, "ed.key")
+	if err := generateKeypair(edPath); err != nil {
+		t.Fatalf("generateKeypair: %v", err)
+	}
+	metricsPort := pickFreeTCPPort(t)
+	metricsHostPort := net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort))
+
+	withFlagGlobals(t, edPath, "", "error", pickFreeTCPPort(t), 0)
+	*metricsAddr = metricsHostPort
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serve(ctx) }()
+
+	waitForTCPReady(t, *port, 2*time.Second)
+	waitForTCPDialReady(t, metricsHostPort, 2*time.Second)
+
+	resp, err := http.Get("http://" + metricsHostPort + "/metrics")
+	if err != nil {
+		cancel()
+		<-done
+		t.Fatalf("scrape: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		cancel()
+		<-done
+		t.Fatalf("scrape status=%d body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("roughtime_build_info")) {
+		cancel()
+		<-done
+		t.Fatalf("scrape missing build_info:\n%s", body)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after cancel")
+	}
+}
+
+// TestServeRejectsBadMetricsAddr verifies validateFlags catches a bad host:port
+// for -metrics-addr.
+func TestServeRejectsBadMetricsAddr(t *testing.T) {
+	dir := t.TempDir()
+	edPath := filepath.Join(dir, "ed.key")
+	if err := generateKeypair(edPath); err != nil {
+		t.Fatalf("generateKeypair: %v", err)
+	}
+	withFlagGlobals(t, edPath, "", "error", pickFreeTCPPort(t), 0)
+	*metricsAddr = "not a host port"
+
+	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "metrics-addr") {
+		t.Fatalf("dispatch: %v; want metrics-addr error", err)
+	}
 }
 
 // TestServeRejectsBadLogLevel verifies serve reports an error for an

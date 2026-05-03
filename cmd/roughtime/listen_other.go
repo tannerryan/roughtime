@@ -3,8 +3,6 @@
 
 //go:build unix && !linux
 
-// Non-Linux unix UDP listener: single socket with a channel-fed batcher, since
-// recvmmsg/sendmmsg and SO_REUSEPORT semantics vary across BSD/Darwin.
 package main
 
 import (
@@ -22,6 +20,10 @@ import (
 // batchQueueSize bounds the batcher channel; overflow is dropped for
 // backpressure.
 const batchQueueSize = 4096
+
+// udpHasQueue is true: the channel-fed batcher here can saturate and produce
+// dropQueue.
+const udpHasQueue = true
 
 // readErrorBackoff throttles the read loop after a UDP read error.
 const readErrorBackoff = 100 * time.Millisecond
@@ -96,26 +98,27 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			}
 			return false
 		}
-		statsReceived.Add(1)
 		// undersize packets are always droppable per the drafts
 		if reqLen < minRequestSize {
 			bufPool.Put(bufPtr)
-			statsDropped.Add(1)
+			incDropped(transportUDP, dropUndersize)
 			if ce := listenLog.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
 				ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen))
 			}
 			return false
 		}
-		vr, ok := validateRequest(listenLog, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, state.Load())
+		vr, reason, ok := validateRequest(listenLog, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, state.Load())
 		if !ok {
 			bufPool.Put(bufPtr)
+			incDropped(transportUDP, reason)
 			return false
 		}
+		incReceived(transportUDP, schemeEd25519)
 		select {
 		case batchCh <- vr:
 		default:
 			bufPool.Put(bufPtr)
-			statsDropped.Add(1)
+			incDropped(transportUDP, dropQueue)
 			listenLog.Warn("dropped request: batcher queue full",
 				zap.Stringer("peer", peer),
 				zap.Int("size", reqLen),
@@ -132,9 +135,9 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	batcherWg.Wait()
 	_ = conn.Close()
 	listenLog.Info("shutdown complete",
-		zap.Uint64("received_total", statsReceived.Load()),
-		zap.Uint64("responded_total", statsResponded.Load()),
-		zap.Uint64("dropped_total", statsDropped.Load()),
+		zap.Uint64("received_total", requestsReceived.total()),
+		zap.Uint64("responded_total", requestsResponded.total()),
+		zap.Uint64("dropped_total", requestsDropped.total()),
 		zap.Uint64("amp_suppressed_total", statsAmpDropped.Load()),
 		zap.Uint64("panics_total", statsPanics.Load()),
 		zap.Uint64("batches_total", statsBatches.Load()),
@@ -248,10 +251,10 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 	for _, r := range replies {
 		if _, err := conn.WriteToUDP(r.bytes, r.peer); err != nil {
 			log.Warn("UDP write failed", zap.Stringer("peer", r.peer), zap.Error(err))
-			statsDropped.Add(1)
+			incDropped(transportUDP, dropWrite)
 			continue
 		}
-		statsResponded.Add(1)
+		incResponded(transportUDP, schemeEd25519, 1)
 		if ce := log.Check(zap.DebugLevel, "sent response"); ce != nil {
 			ce.Write(
 				zap.Stringer("peer", r.peer),

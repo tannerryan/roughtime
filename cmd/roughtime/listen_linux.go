@@ -3,8 +3,6 @@
 
 //go:build linux
 
-// Linux UDP listener: one SO_REUSEPORT socket per CPU with recvmmsg/sendmmsg
-// batching.
 package main
 
 import (
@@ -30,6 +28,10 @@ import (
 // promptly.
 const idleReadTimeout = 500 * time.Millisecond
 
+// udpHasQueue is false: the SO_REUSEPORT fast path processes batches inline, so
+// dropQueue can't fire and the series is not registered.
+const udpHasQueue = false
+
 // readErrorBackoff throttles the worker loop after a non-deadline ReadBatch
 // error.
 const readErrorBackoff = 100 * time.Millisecond
@@ -45,6 +47,16 @@ var reqBufPool = sync.Pool{
 
 // statsWorkerExits counts worker returns before ctx cancellation.
 var statsWorkerExits atomic.Uint64
+
+// udpWorkerExits is registered here because non-Linux builds omit
+// statsWorkerExits.
+var udpWorkerExits = newCounterFn(
+	"roughtime_udp_worker_exits_total",
+	"UDP worker goroutines that exited unexpectedly. Linux only.",
+	func() uint64 { return statsWorkerExits.Load() },
+)
+
+func init() { addMetric(udpWorkerExits) }
 
 // listen starts one SO_REUSEPORT worker per CPU, each driving its own
 // recvmmsg/sendmmsg loop.
@@ -98,9 +110,9 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		_ = c.Close()
 	}
 	listenLog.Info("shutdown complete",
-		zap.Uint64("received_total", statsReceived.Load()),
-		zap.Uint64("responded_total", statsResponded.Load()),
-		zap.Uint64("dropped_total", statsDropped.Load()),
+		zap.Uint64("received_total", requestsReceived.total()),
+		zap.Uint64("responded_total", requestsResponded.total()),
+		zap.Uint64("dropped_total", requestsDropped.total()),
 		zap.Uint64("amp_suppressed_total", statsAmpDropped.Load()),
 		zap.Uint64("panics_total", statsPanics.Load()),
 		zap.Uint64("batches_total", statsBatches.Load()),
@@ -176,9 +188,8 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]validatedRequest) {
 	for i := range msgs {
 		n := msgs[i].N
-		statsReceived.Add(1)
 		if n < minRequestSize {
-			statsDropped.Add(1)
+			incDropped(transportUDP, dropUndersize)
 			if ce := log.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
 				ce.Write(zap.Any("peer", msgs[i].Addr), zap.Int("size", n))
 			}
@@ -186,17 +197,20 @@ func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]valid
 		}
 		peer, ok := msgs[i].Addr.(*net.UDPAddr)
 		if !ok {
-			statsDropped.Add(1)
+			// non-UDP address family from recvmmsg counts as malformed input
+			incDropped(transportUDP, dropParse)
 			continue
 		}
 		bufPtr := reqBufPool.Get().(*[]byte)
 		copy(*bufPtr, msgs[i].Buffers[0][:n])
 
-		vr, ok := validateRequest(log, (*bufPtr)[:n], peer, n, bufPtr, st)
+		vr, reason, ok := validateRequest(log, (*bufPtr)[:n], peer, n, bufPtr, st)
 		if !ok {
 			reqBufPool.Put(bufPtr)
+			incDropped(transportUDP, reason)
 			continue
 		}
+		incReceived(transportUDP, schemeEd25519)
 		*batch = append(*batch, vr)
 	}
 }
@@ -250,16 +264,20 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 		n, err := p.WriteBatch(out, 0)
 		if err != nil {
 			log.Warn("WriteBatch failed", zap.Error(err), zap.Int("dropped", len(out)))
-			statsDropped.Add(uint64(len(out)))
+			for range out {
+				incDropped(transportUDP, dropWrite)
+			}
 			return
 		}
 		if n <= 0 {
 			// guard against infinite loop on degenerate returns
 			log.Warn("WriteBatch wrote 0", zap.Int("dropped", len(out)))
-			statsDropped.Add(uint64(len(out)))
+			for range out {
+				incDropped(transportUDP, dropWrite)
+			}
 			return
 		}
-		statsResponded.Add(uint64(n))
+		incResponded(transportUDP, schemeEd25519, uint64(n))
 		out = out[n:]
 	}
 }

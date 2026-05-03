@@ -47,8 +47,9 @@ type readyReply struct {
 	bytes []byte
 }
 
-// validateRequest parses a request, validates SRV, and negotiates a version.
-func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, bool) {
+// validateRequest parses a request, validates SRV, and negotiates a version. On
+// failure the dropReason classifies the rejection; empty on success.
+func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, dropReason, bool) {
 	req, err := protocol.ParseRequest(requestBytes)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "request parse failed"); ce != nil {
@@ -58,21 +59,21 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 				zap.Error(err),
 			)
 		}
-		return validatedRequest{}, false
+		return validatedRequest{}, dropParse, false
 	}
 	// drafts 10+: reject when SRV does not address a long-term key
 	if req.SRV != nil && !bytes.Equal(req.SRV, st.srvHash) {
 		if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer))
 		}
-		return validatedRequest{}, false
+		return validatedRequest{}, dropSRV, false
 	}
 	responseVer, err := protocol.SelectVersion(req.Versions, len(req.Nonce), protocol.ServerPreferenceEd25519)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "version negotiation failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
 		}
-		return validatedRequest{}, false
+		return validatedRequest{}, dropVersion, false
 	}
 	return validatedRequest{
 		req:         *req,
@@ -80,7 +81,7 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 		requestSize: reqSize,
 		bufPtr:      bufPtr,
 		version:     responseVer,
-	}, true
+	}, "", true
 }
 
 // signAndBuildReplies signs a homogeneous batch and returns grease-applied,
@@ -95,6 +96,10 @@ func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, i
 	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
 	if err != nil {
 		statsBatchErrs.Add(1)
+		// per-item bumps keep dropped/batch_err parity with the TCP path
+		for range items {
+			incDropped(transportUDP, dropBatchErr)
+		}
 		log.Warn("batch CreateReplies failed",
 			zap.Stringer("version", ver),
 			zap.Int("batch_size", len(items)),

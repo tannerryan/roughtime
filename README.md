@@ -3,8 +3,6 @@
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/tannerryan/roughtime)](https://pkg.go.dev/github.com/tannerryan/roughtime)
 [![GitHub
 license](https://img.shields.io/github/license/tannerryan/roughtime.svg?style=flat-square)](https://github.com/tannerryan/roughtime/blob/main/LICENSE)
-![GitHub go.mod Go
-version](https://img.shields.io/github/go-mod/go-version/tannerryan/roughtime?style=flat-square&color=blue)
 [![Go Report
 Card](https://goreportcard.com/badge/github.com/tannerryan/roughtime?style=flat-square)](https://goreportcard.com/report/github.com/tannerryan/roughtime)
 
@@ -75,6 +73,7 @@ roughtime -root-key-file /path/to/root.key -pq-root-key-file /path/to/pq-root.ke
 | `-pq-root-key-file` |         | ML-DSA-44 root seed (TCP ML-DSA-44)            |
 | `-grease-rate`      | 0.01    | Fraction of responses to grease (0 disables)   |
 | `-log-level`        | info    | `debug`, `info`, `warn`, or `error`            |
+| `-metrics-addr`     |         | `host:port` for Prometheus `/metrics` (no auth)|
 
 ### Architecture
 

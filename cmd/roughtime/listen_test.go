@@ -32,8 +32,8 @@ func TestMain(m *testing.M) {
 // TestListenEndToEnd verifies the UDP listener completes a closed-loop run of
 // requests and exits cleanly.
 func TestListenEndToEnd(t *testing.T) {
-	statsReceived.Store(0)
-	statsResponded.Store(0)
+	requestsReceived.reset()
+	requestsResponded.reset()
 	statsPanics.Store(0)
 
 	rootPK, st := newCertState(t)
@@ -53,11 +53,11 @@ func TestListenEndToEnd(t *testing.T) {
 		t.Fatal("listen did not exit after cancel")
 	}
 
-	if got := statsReceived.Load(); got < reqs {
-		t.Fatalf("statsReceived=%d want >=%d", got, reqs)
+	if got := requestsReceived.total(); got < reqs {
+		t.Fatalf("requestsReceived total=%d want >=%d", got, reqs)
 	}
-	if got := statsResponded.Load(); got < reqs {
-		t.Fatalf("statsResponded=%d want >=%d", got, reqs)
+	if got := requestsResponded.total(); got < reqs {
+		t.Fatalf("requestsResponded total=%d want >=%d", got, reqs)
 	}
 	if got := statsPanics.Load(); got != 0 {
 		t.Fatalf("statsPanics=%d want 0", got)
@@ -70,8 +70,8 @@ func TestListenShutdownLeaksNoGoroutines(t *testing.T) {
 	// ignore runtime workers
 	baseline := goleak.IgnoreCurrent()
 
-	statsReceived.Store(0)
-	statsResponded.Store(0)
+	requestsReceived.reset()
+	requestsResponded.reset()
 	statsPanics.Store(0)
 
 	rootPK, st := newCertState(t)
@@ -154,9 +154,9 @@ func waitForServerReady(t *testing.T, p int, rootPK ed25519.PublicKey) {
 // startServer resets stats, launches listen, and registers a shutdown cleanup.
 func startServer(t *testing.T) (int, ed25519.PublicKey) {
 	t.Helper()
-	statsReceived.Store(0)
-	statsResponded.Store(0)
-	statsDropped.Store(0)
+	requestsReceived.reset()
+	requestsResponded.reset()
+	requestsDropped.reset()
 	statsPanics.Store(0)
 	statsBatches.Store(0)
 	statsBatchedReqs.Store(0)
@@ -314,12 +314,12 @@ func TestListenConcurrentBatches(t *testing.T) {
 	// so a stalled server still trips the assertion below
 	want := uint64(senders * perSender)
 	deadline := time.Now().Add(time.Second)
-	for statsReceived.Load() < want && time.Now().Before(deadline) {
+	for requestsReceived.total() < want && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if got := statsReceived.Load(); got < want {
-		t.Fatalf("statsReceived=%d want >=%d", got, want)
+	if got := requestsReceived.total(); got < want {
+		t.Fatalf("requestsReceived total=%d want >=%d", got, want)
 	}
 	if got := statsPanics.Load(); got != 0 {
 		t.Fatalf("statsPanics=%d want 0", got)
@@ -409,8 +409,8 @@ func TestListenUndersizeRequestDropped(t *testing.T) {
 	if _, err := conn.Read(buf); err == nil {
 		t.Fatal("expected undersize request to be dropped, got reply")
 	}
-	if got := statsDropped.Load(); got == 0 {
-		t.Fatal("statsDropped=0, want >=1")
+	if got := requestsDropped.total(); got == 0 {
+		t.Fatal("requestsDropped total=0, want >=1")
 	}
 }
 

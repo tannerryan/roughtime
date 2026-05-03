@@ -31,7 +31,10 @@ FUZZ_TARGETS = \
     FuzzChainVerify:./protocol/ \
     FuzzValidateRequest:./cmd/roughtime/ \
     FuzzServeOnce:./cmd/roughtime/ \
-    FuzzReadTCPFrame:./cmd/roughtime/
+    FuzzReadTCPFrame:./cmd/roughtime/ \
+    FuzzEscapeHelp:./cmd/roughtime/ \
+    FuzzEscapeLabel:./cmd/roughtime/ \
+    FuzzFormatValue:./cmd/roughtime/
 FUZZ_TIME   ?= 30s
 
 .PHONY: all deps build test test-verbose test-race test-cover test-race-cover \
@@ -55,6 +58,13 @@ BUILD_DATE  ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 VERSION_PKG  = github.com/tannerryan/roughtime/internal/version
 LDFLAGS      = -X $(VERSION_PKG).Commit=$(COMMIT) -X $(VERSION_PKG).Date=$(BUILD_DATE)
 
+# Cross-compile knobs. `make build GOOS=linux GOARCH=arm64` produces a Linux
+# arm64 binary with the same -ldflags as a host build.
+GOOS        ?= $(shell go env GOOS)
+GOARCH      ?= $(shell go env GOARCH)
+CGO_ENABLED ?= 0
+export GOOS GOARCH CGO_ENABLED
+
 # Build binaries
 build:
 	go build -ldflags "$(LDFLAGS)" -o roughtime ./cmd/roughtime
@@ -71,7 +81,8 @@ test:
 test-verbose:
 	go test -v ./...
 
-# Unit tests with race detector
+# Unit tests with race detector (-race requires cgo)
+test-race: export CGO_ENABLED = 1
 test-race:
 	go test -race ./...
 
@@ -80,6 +91,7 @@ test-cover:
 	go test -cover ./ ./protocol/ ./cmd/roughtime/
 
 # Race + coverage profile (CI)
+test-race-cover: export CGO_ENABLED = 1
 test-race-cover:
 	go test -race -covermode=atomic -coverprofile=coverage.out ./ ./protocol/ ./cmd/roughtime/
 

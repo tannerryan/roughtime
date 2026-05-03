@@ -7,15 +7,17 @@
 // the experimental ML-DSA-44 extension over TCP. Run with -h for flags.
 //
 // File layout:
-//   - main.go        — flags, dispatch, serve orchestration
-//   - bootstrap.go   — key files, cert provisioning, refresh loops
-//   - respond.go     — per-request validation and reply signing
-//   - stats.go       — server-wide counters and periodic stats log
-//   - lifecycle.go   — recoverGoroutine and superviseLoop
-//   - listen_unix.go  — UDP RCVBUF helper shared by Linux and non-Linux
-//   - listen_linux.go — UDP listener (Linux fast path: SO_REUSEPORT, recvmmsg/sendmmsg)
-//   - listen_other.go — UDP listener (non-Linux unix fallback, single socket)
-//   - listen_tcp.go   — TCP listener and per-scheme batcher
+//   - main.go           — flags, dispatch, serve orchestration
+//   - bootstrap.go      — key files, cert provisioning, refresh loops
+//   - respond.go        — per-request validation and reply signing
+//   - stats.go          — server-wide counters and periodic stats log
+//   - lifecycle.go      — recoverGoroutine and superviseLoop
+//   - metrics.go        — Prometheus metric primitives, registry
+//   - listen_unix.go    — UDP RCVBUF helper shared by Linux and non-Linux
+//   - listen_linux.go   — UDP listener (Linux fast path: SO_REUSEPORT, recvmmsg/sendmmsg)
+//   - listen_other.go   — UDP listener (non-Linux unix fallback, single socket)
+//   - listen_tcp.go     — TCP listener and per-scheme batcher
+//   - listen_metrics.go — optional Prometheus /metrics + /healthz HTTP listener
 package main
 
 import (
@@ -24,6 +26,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -63,6 +66,9 @@ var (
 	pqPubkey = flag.String("pq-pubkey", "", "derive and print the ML-DSA-44 public key from an existing PQ root key file")
 	// greaseRate is the fraction of responses to grease.
 	greaseRate = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
+	// metricsAddr is the host:port for the optional Prometheus /metrics
+	// endpoint; empty disables the listener entirely.
+	metricsAddr = flag.String("metrics-addr", "", "address (host:port) for the Prometheus /metrics endpoint; empty disables. No auth — use 127.0.0.1:PORT to restrict to loopback")
 )
 
 // Server-wide tunable constants.
@@ -96,6 +102,11 @@ func validateFlags() error {
 	}
 	if *greaseRate < 0 || *greaseRate > 1 {
 		return fmt.Errorf("-grease-rate %v out of range (must be in [0, 1])", *greaseRate)
+	}
+	if *metricsAddr != "" {
+		if _, _, err := net.SplitHostPort(*metricsAddr); err != nil {
+			return fmt.Errorf("-metrics-addr %q invalid (want host:port): %w", *metricsAddr, err)
+		}
 	}
 	return nil
 }
@@ -171,6 +182,7 @@ func serve(ctx context.Context) error {
 		zap.String("pq_root_key", *pqRootKeySeedHexFile),
 		zap.Stringer("log_level", lvl),
 		zap.Float64("grease_rate", *greaseRate),
+		zap.String("metrics_addr", *metricsAddr),
 		zap.Object("tunables", zapcore.ObjectMarshalerFunc(func(enc zapcore.ObjectEncoder) error {
 			enc.AddInt("recv_buffer", socketRecvBuffer)
 			enc.AddInt("max_packet_size", maxPacketSize)
@@ -188,6 +200,23 @@ func serve(ctx context.Context) error {
 	)
 
 	certLog := logger.Named("cert")
+	statsLog := logger.Named("stats")
+
+	// listenerCtx fans cancellation across all spawned goroutines; the deferred
+	// wg.Wait ensures serve does not return while any of them is still alive.
+	listenerCtx, cancelListeners := context.WithCancel(ctx)
+	var listenerErr atomic.Pointer[error]
+	recordListenerErr := func(role string, err error) {
+		logger.Error(role+" listener exited with error", zap.Error(err))
+		wrapped := fmt.Errorf("%s listener: %w", role, err)
+		listenerErr.CompareAndSwap(nil, &wrapped)
+		cancelListeners()
+	}
+	var wg sync.WaitGroup
+	defer func() {
+		cancelListeners()
+		wg.Wait()
+	}()
 
 	var edState *atomic.Pointer[certState]
 	if *rootKeySeedHexFile != "" {
@@ -203,10 +232,13 @@ func serve(ctx context.Context) error {
 		)
 		edState = &atomic.Pointer[certState]{}
 		edState.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
+		noteCertProvisioned(schemeEd25519, onlinePK, rootPK, expiry, time.Now())
 
 		// captured so refreshLoop detects silent on-disk root-key changes
 		initialRootPK := append(ed25519.PublicKey(nil), rootPK...)
-		go superviseLoop(ctx, certLog, "refreshLoop", func() { refreshLoop(ctx, certLog, edState, initialRootPK) })
+		wg.Go(func() {
+			superviseLoop(listenerCtx, certLog, "refreshLoop", func() { refreshLoop(listenerCtx, certLog, edState, initialRootPK) })
+		})
 	}
 
 	var pqState *atomic.Pointer[certState]
@@ -223,27 +255,21 @@ func serve(ctx context.Context) error {
 		)
 		pqState = &atomic.Pointer[certState]{}
 		pqState.Store(&certState{cert: cert, expiry: expiry, srvHash: protocol.ComputeSRV(rootPK)})
+		noteCertProvisioned(schemeMLDSA44, onlinePK, rootPK, expiry, time.Now())
 
 		initialRootPK := append([]byte(nil), rootPK...)
-		go superviseLoop(ctx, certLog, "refreshLoopMLDSA44", func() { refreshLoopMLDSA44(ctx, certLog, pqState, initialRootPK) })
+		wg.Go(func() {
+			superviseLoop(listenerCtx, certLog, "refreshLoopMLDSA44", func() { refreshLoopMLDSA44(listenerCtx, certLog, pqState, initialRootPK) })
+		})
 	}
 
-	statsLog := logger.Named("stats")
-	go superviseLoop(ctx, statsLog, "statsLoop", func() { statsLoop(ctx, statsLog, edState, pqState) })
+	wg.Go(func() {
+		superviseLoop(listenerCtx, statsLog, "statsLoop", func() { statsLoop(listenerCtx, statsLog, edState, pqState) })
+	})
 
 	// UDP carries only Ed25519 (ML-DSA breaks the amplification budget); TCP
-	// carries both. A listener error cancels the shared context so the peer
-	// drains, and serve returns the first error.
-	listenerCtx, cancelListeners := context.WithCancel(ctx)
-	defer cancelListeners()
-	var listenerErr atomic.Pointer[error]
-	recordListenerErr := func(role string, err error) {
-		logger.Error(role+" listener exited with error", zap.Error(err))
-		wrapped := fmt.Errorf("%s listener: %w", role, err)
-		listenerErr.CompareAndSwap(nil, &wrapped)
-		cancelListeners()
-	}
-	var wg sync.WaitGroup
+	// carries both. A listener error cancels listenerCtx and serve returns the
+	// first error.
 	if edState != nil {
 		wg.Go(func() {
 			if err := listen(listenerCtx, edState); err != nil {
@@ -256,6 +282,13 @@ func serve(ctx context.Context) error {
 			recordListenerErr("TCP", err)
 		}
 	})
+	if *metricsAddr != "" {
+		wg.Go(func() {
+			if err := listenMetrics(listenerCtx, *metricsAddr); err != nil {
+				recordListenerErr("metrics", err)
+			}
+		})
+	}
 	wg.Wait()
 	if err := listenerErr.Load(); err != nil {
 		return *err

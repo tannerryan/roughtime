@@ -325,7 +325,7 @@ func provisionMLDSA44CertificateKey() (*protocol.Certificate, []byte, []byte, ti
 // refreshLoop replaces the Ed25519 certificate near expiry, rejecting refresh
 // if the root key on disk has changed.
 func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK ed25519.PublicKey) {
-	runRefreshLoop(ctx, log, "Ed25519", state, func() (*certState, []byte, error) {
+	runRefreshLoop(ctx, log, "Ed25519", schemeEd25519, initialRootPK, state, func() (*certState, []byte, error) {
 		return tryRefreshCert(initialRootPK)
 	})
 }
@@ -333,20 +333,20 @@ func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[cer
 // refreshLoopMLDSA44 is the ML-DSA-44 counterpart of refreshLoop, gated by the
 // encoded root public key captured at startup.
 func refreshLoopMLDSA44(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK []byte) {
-	runRefreshLoop(ctx, log, "ML-DSA-44", state, func() (*certState, []byte, error) {
+	runRefreshLoop(ctx, log, "ML-DSA-44", schemeMLDSA44, initialRootPK, state, func() (*certState, []byte, error) {
 		return tryRefreshCertMLDSA44(initialRootPK)
 	})
 }
 
 // runRefreshLoop is the scheme-agnostic refresh driver invoked by refreshLoop
 // and refreshLoopMLDSA44.
-func runRefreshLoop(ctx context.Context, log *zap.Logger, scheme string, state *atomic.Pointer[certState], refresh func() (*certState, []byte, error)) {
+func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetric string, rootPK []byte, state *atomic.Pointer[certState], refresh func() (*certState, []byte, error)) {
 	ticker := time.NewTicker(certCheckInterval)
 	defer ticker.Stop()
 	var lastAttempt time.Time
 
 	log.Info("certificate refresh loop started",
-		zap.String("scheme", scheme),
+		zap.String("scheme", schemeName),
 		zap.Duration("check_interval", certCheckInterval),
 		zap.Duration("refresh_threshold", certRefreshThreshold),
 		zap.Duration("retry_cooldown", refreshRetryCooldown),
@@ -370,7 +370,7 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, scheme string, state *
 		lastAttempt = now
 
 		log.Info("attempting certificate refresh",
-			zap.String("scheme", scheme),
+			zap.String("scheme", schemeName),
 			zap.Time("current_expiry", cur.expiry),
 			zap.Duration("remaining", time.Until(cur.expiry)),
 		)
@@ -381,7 +381,7 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, scheme string, state *
 			// supervisor restarts rather than serving an expiring cert
 			if remaining < 2*refreshRetryCooldown {
 				log.Fatal("certificate refresh failed near expiry; restart required",
-					zap.String("scheme", scheme),
+					zap.String("scheme", schemeName),
 					zap.Error(err),
 					zap.Time("current_expiry", cur.expiry),
 					zap.Duration("remaining", remaining),
@@ -390,7 +390,7 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, scheme string, state *
 			}
 			if ce := log.Check(zap.ErrorLevel, "certificate refresh failed"); ce != nil {
 				ce.Write(
-					zap.String("scheme", scheme),
+					zap.String("scheme", schemeName),
 					zap.Error(err),
 					zap.Time("current_expiry", cur.expiry),
 					zap.Duration("remaining", remaining),
@@ -400,10 +400,12 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, scheme string, state *
 			continue
 		}
 		state.Store(newState)
+		noteCertProvisioned(schemeMetric, newOnlinePK, rootPK, newState.expiry, time.Now())
+		noteCertRotation(schemeMetric)
 		oldCert := cur.cert
 		time.AfterFunc(certWipeGrace, oldCert.Wipe)
 		log.Info("certificate refreshed",
-			zap.String("scheme", scheme),
+			zap.String("scheme", schemeName),
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),
 			zap.Time("previous_expiry", cur.expiry),
 			zap.Time("expiry", newState.expiry),
