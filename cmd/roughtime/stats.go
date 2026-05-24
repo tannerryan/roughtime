@@ -30,9 +30,10 @@ var (
 
 // statsLoop emits a periodic summary of server activity until ctx is cancelled.
 func statsLoop(ctx context.Context, log *zap.Logger, edState, pqState *atomic.Pointer[certState]) {
-	ticker := time.NewTicker(*statsIntervalFlag)
+	interval := *statsIntervalFlag
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	log.Info("stats loop started", zap.Duration("interval", *statsIntervalFlag))
+	log.Info("stats loop started", zap.Duration("interval", interval))
 
 	var lastReceived, lastResponded, lastDropped, lastPanics, lastBatchCount, lastBatchTotal, lastBatchErrs uint64
 	var lastTCPAccepted, lastTCPRejected, lastTCPCompleted, lastAmp uint64
