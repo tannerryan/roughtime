@@ -39,7 +39,7 @@ func TestStatsLoopExitsOnCtxCancel(t *testing.T) {
 // TestStatsLoopTicks verifies statsLoop emits at least one log line on its tick
 // interval.
 func TestStatsLoopTicks(t *testing.T) {
-	withInterval(t, &statsInterval, 5*time.Millisecond)
+	withInterval(t, statsIntervalFlag, 5*time.Millisecond)
 	_, st := newUnitCertState(t)
 	statePtr := &atomic.Pointer[certState]{}
 	statePtr.Store(st)

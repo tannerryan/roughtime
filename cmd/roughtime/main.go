@@ -69,6 +69,8 @@ var (
 	// metricsAddr is the host:port for the optional Prometheus /metrics
 	// endpoint; empty disables the listener entirely.
 	metricsAddr = flag.String("metrics-addr", "", "address (host:port) for the Prometheus /metrics endpoint; empty disables. No auth — use 127.0.0.1:PORT to restrict to loopback")
+	// statsIntervalFlag is the cadence of the periodic stats log.
+	statsIntervalFlag = flag.Duration("stats-interval", 60*time.Second, "cadence of the periodic stats log (e.g. 10s, 5m); must be positive")
 )
 
 // Server-wide tunable constants.
@@ -107,6 +109,9 @@ func validateFlags() error {
 		if _, _, err := net.SplitHostPort(*metricsAddr); err != nil {
 			return fmt.Errorf("-metrics-addr %q invalid (want host:port): %w", *metricsAddr, err)
 		}
+	}
+	if *statsIntervalFlag <= 0 {
+		return fmt.Errorf("-stats-interval %v must be positive", *statsIntervalFlag)
 	}
 	return nil
 }
@@ -194,7 +199,7 @@ func serve(ctx context.Context) error {
 			enc.AddDuration("cert_end_offset", certEndOffset)
 			enc.AddDuration("cert_refresh_threshold", certRefreshThreshold)
 			enc.AddDuration("cert_check_interval", certCheckInterval)
-			enc.AddDuration("stats_interval", statsInterval)
+			enc.AddDuration("stats_interval", *statsIntervalFlag)
 			return nil
 		})),
 	)
