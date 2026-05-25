@@ -147,15 +147,21 @@ func TestValidateFlagsRejects(t *testing.T) {
 		}, "-grease-rate"},
 		{"stats interval zero", func(t *testing.T) {
 			setRootKeyPath(t, "/x")
-			prev := *statsIntervalFlag
-			*statsIntervalFlag = 0
-			t.Cleanup(func() { *statsIntervalFlag = prev })
+			prev := *statsInterval
+			*statsInterval = 0
+			t.Cleanup(func() { *statsInterval = prev })
 		}, "-stats-interval"},
 		{"stats interval negative", func(t *testing.T) {
 			setRootKeyPath(t, "/x")
-			prev := *statsIntervalFlag
-			*statsIntervalFlag = -time.Second
-			t.Cleanup(func() { *statsIntervalFlag = prev })
+			prev := *statsInterval
+			*statsInterval = -time.Second
+			t.Cleanup(func() { *statsInterval = prev })
+		}, "-stats-interval"},
+		{"stats interval below floor", func(t *testing.T) {
+			setRootKeyPath(t, "/x")
+			prev := *statsInterval
+			*statsInterval = 500 * time.Millisecond
+			t.Cleanup(func() { *statsInterval = prev })
 		}, "-stats-interval"},
 	}
 	for _, tc := range cases {

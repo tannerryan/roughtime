@@ -74,7 +74,7 @@ roughtime -root-key-file /path/to/root.key -pq-root-key-file /path/to/pq-root.ke
 | `-grease-rate`      | 0.01    | Fraction of responses to grease (0 disables)   |
 | `-log-level`        | info    | `debug`, `info`, `warn`, or `error`            |
 | `-metrics-addr`     |         | `host:port` for Prometheus `/metrics` (no auth)|
-| `-stats-interval`   | 60s     | Cadence of the periodic stats log (e.g. `10s`, `5m`) |
+| `-stats-interval`   | 60s     | Cadence of the periodic stats log (e.g. `10s`, `5m`); minimum 1s |
 
 ### Architecture
 

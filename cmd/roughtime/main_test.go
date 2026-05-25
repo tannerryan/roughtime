@@ -34,7 +34,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	origPQKeygen := *pqKeygen
 	origPQPubkey := *pqPubkey
 	origMetrics := *metricsAddr
-	origStatsInterval := *statsIntervalFlag
+	origStatsInterval := *statsInterval
 	t.Cleanup(func() {
 		*port = origPort
 		*rootKeySeedHexFile = origEd
@@ -47,7 +47,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 		*pqKeygen = origPQKeygen
 		*pqPubkey = origPQPubkey
 		*metricsAddr = origMetrics
-		*statsIntervalFlag = origStatsInterval
+		*statsInterval = origStatsInterval
 	})
 	*port = p
 	*rootKeySeedHexFile = edKey
