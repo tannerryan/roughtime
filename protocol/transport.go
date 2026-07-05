@@ -110,7 +110,7 @@ func RoundTripTCP(ctx context.Context, address string, request []byte, timeout t
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr
 		}
-		// io.EOF means zero bytes read; peer closed without replying
+		// io.EOF means zero bytes read, so the peer closed without replying
 		if errors.Is(err, io.EOF) {
 			return nil, 0, time.Time{}, ErrPeerClosedNoReply
 		}

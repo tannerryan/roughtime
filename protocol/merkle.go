@@ -72,8 +72,10 @@ type merkleTree struct {
 	paths    [][][]byte
 }
 
-// merkleNodeFirst reports whether node precedes hash when INDX bit is 0 (drafts
-// 05-13 and 14-19 without TYPE).
+// merkleNodeFirst reports whether the sibling precedes the running hash when
+// the INDX bit is 0. Node-first covers drafts 05-15. Drafts 14-15 are
+// wire-collapsed into groupD14 (16-19, hash-first) as they share version
+// 0x8000000c.
 func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }
@@ -160,22 +162,22 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 		return errors.New("protocol: PATH exceeds 32 hash values")
 	}
 
-	hash := leafHash(g, leafInput)
+	acc := leafHash(g, leafInput)
 	steps := len(pathBytes) / hs
 	nf := merkleNodeFirst(g)
 	for i := range steps {
 		sibling := pathBytes[i*hs : (i+1)*hs]
 		if index&1 == 0 {
 			if nf {
-				hash = nodeHash(g, sibling, hash)
+				acc = nodeHash(g, sibling, acc)
 			} else {
-				hash = nodeHash(g, hash, sibling)
+				acc = nodeHash(g, acc, sibling)
 			}
 		} else {
 			if nf {
-				hash = nodeHash(g, hash, sibling)
+				acc = nodeHash(g, acc, sibling)
 			} else {
-				hash = nodeHash(g, sibling, hash)
+				acc = nodeHash(g, sibling, acc)
 			}
 		}
 		index >>= 1
@@ -185,7 +187,7 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 		return errors.New("protocol: INDX has trailing non-zero bits")
 	}
 
-	if !bytes.Equal(hash, rootHash) {
+	if !bytes.Equal(acc, rootHash) {
 		return ErrMerkleMismatch
 	}
 	return nil

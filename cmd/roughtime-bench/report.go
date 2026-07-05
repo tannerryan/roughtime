@@ -54,7 +54,7 @@ func report(meta runMeta, results []workerResult, elapsed time.Duration) {
 	fmt.Printf("Sent:         %d\n", sent)
 	fmt.Printf("Received:     %d\n", received)
 	if meta.verify {
-		fmt.Printf("Verify fail:  %d (grease + genuine faults — indistinguishable on the wire; counted in Received)\n", errVerify)
+		fmt.Printf("Verify fail:  %d (grease and genuine faults, indistinguishable on the wire, counted in Received)\n", errVerify)
 	}
 	fmt.Printf("Errors:       %d\n", errs)
 	fmt.Printf("Timeouts:     %d\n", timeouts)

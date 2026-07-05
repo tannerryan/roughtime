@@ -32,7 +32,7 @@ type Response struct {
 	// Reply is the verified reply bytes.
 	Reply []byte
 	// AmplificationOK reports that on UDP the reply fits within the request
-	// size; always true on TCP.
+	// size. It is always true on TCP.
 	AmplificationOK bool
 }
 

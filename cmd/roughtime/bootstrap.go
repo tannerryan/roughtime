@@ -26,7 +26,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// Seed-file headers bind a seed to its scheme; Ed25519 still accepts legacy
+// Seed-file headers bind a seed to its scheme. Ed25519 still accepts legacy
 // bare hex while PQ files must carry the header.
 const (
 	ed25519SeedHeader = "roughtime-ed25519-seed-v1"
@@ -39,7 +39,7 @@ const (
 	certEndOffset   = 18 * time.Hour
 )
 
-// Cert refresh tunables; var so tests can shrink them.
+// Cert refresh tunables. A var so tests can shrink them.
 var (
 	// certRefreshThreshold is the remaining-validity window that triggers a
 	// refresh attempt.
@@ -159,7 +159,7 @@ func derivePublicKey(path string) error {
 }
 
 // deriveMLDSA44PublicKey reads an ML-DSA-44 root seed and prints the public
-// key; the header is required.
+// key. The header is required.
 func deriveMLDSA44PublicKey(path string) error {
 	path = filepath.Clean(path)
 	raw, err := readPrivateKeyFile(path, "PQ root")
@@ -377,7 +377,7 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetr
 		newState, newOnlinePK, err := refresh()
 		if err != nil {
 			remaining := time.Until(cur.expiry)
-			// below 2x cooldown the next attempt may miss expiry; fail so the
+			// below 2x cooldown the next attempt may miss expiry. Fail so the
 			// supervisor restarts rather than serving an expiring cert
 			if remaining < 2*refreshRetryCooldown {
 				log.Fatal("certificate refresh failed near expiry; restart required",

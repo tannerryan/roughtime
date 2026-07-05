@@ -246,7 +246,7 @@ func TestListenTCPDualStackPQPreferred(t *testing.T) {
 	pqRootPK, pqState := newPQCertState(t)
 	p, done, cancel := startListenTCP(t, edState, pqState)
 
-	// PQ is expected to win negotiation; SRV must address the PQ root
+	// PQ is expected to win negotiation, so SRV must address the PQ root
 	srv := protocol.ComputeSRV(pqRootPK)
 	offers := []protocol.Version{protocol.VersionDraft12, protocol.VersionMLDSA44}
 	nonce, req, err := protocol.CreateRequest(offers, rand.Reader, srv)
@@ -502,7 +502,7 @@ func TestListenTCPBatcherLatencyFlush(t *testing.T) {
 	reply := tcpRoundTrip(t, conn, req)
 	elapsed := time.Since(start)
 
-	// Must wait a fraction of the timer; upper bound absorbs CI jitter
+	// Must wait a fraction of the timer. The upper bound absorbs CI jitter
 	if elapsed < batchMaxLatency/2 {
 		t.Fatalf("reply returned in %s (< %s); size path likely triggered", elapsed, batchMaxLatency/2)
 	}
@@ -532,7 +532,7 @@ func TestListenTCPShutdownForceClose(t *testing.T) {
 
 	conn := dialTCP(t, p)
 	defer conn.Close()
-	// poll until accept counter advances; brief grace below covers the gap
+	// poll until accept counter advances. The brief grace below covers the gap
 	// before live.add(c) lands
 	deadline := time.Now().Add(time.Second)
 	for statsTCPAccepted.Load() <= initialAccepted && time.Now().Before(deadline) {
@@ -581,7 +581,7 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 	startAccepted := statsTCPAccepted.Load()
 	p, done, cancel := startListenTCP(t, edState, nil)
 
-	// First conn occupies the only slot; hold it idle so it stays counted
+	// First conn occupies the only slot, so hold it idle so it stays counted
 	hold := dialTCP(t, p)
 	defer hold.Close()
 	deadline := time.Now().Add(time.Second)
@@ -591,7 +591,7 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 	// brief settle so live.add lands before the second dial
 	time.Sleep(10 * time.Millisecond)
 
-	// Second conn must be rejected; the listener accepts then closes
+	// Second conn must be rejected. The listener accepts then closes
 	rej, err := net.DialTimeout("tcp", net.JoinHostPort("::1", strconv.Itoa(p)), time.Second)
 	if err != nil {
 		t.Fatalf("dial second: %v", err)

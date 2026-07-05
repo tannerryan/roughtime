@@ -17,7 +17,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// batchQueueSize bounds the batcher channel; overflow is dropped for
+// batchQueueSize bounds the batcher channel. Overflow is dropped for
 // backpressure.
 const batchQueueSize = 4096
 
@@ -77,7 +77,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		_ = conn.SetReadDeadline(time.Unix(1, 0))
 	}()
 
-	// readOne does one read-dispatch iteration; returns true on shutdown.
+	// readOne does one read-dispatch iteration and returns true on shutdown.
 	// Recovered panics leak the in-flight buffer rather than returning it
 	readOne := func() bool {
 		defer recoverGoroutine(listenLog, "listen")
@@ -90,7 +90,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 				return true
 			}
 			listenLog.Warn("UDP read error", zap.Error(err))
-			// throttle so a wedged socket can't spin a core; ctx.Done preempts
+			// throttle so a wedged socket can't spin a core, ctx.Done preempts
 			select {
 			case <-ctx.Done():
 				return true
@@ -113,7 +113,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			incDropped(transportUDP, reason)
 			return false
 		}
-		incReceived(transportUDP, schemeEd25519)
+		udpReceivedEd.Add(1)
 		select {
 		case batchCh <- vr:
 		default:
@@ -191,7 +191,7 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 		delete(batches, key)
 	}
 
-	// step runs one select iteration; returns true after incoming closes and
+	// step runs one select iteration and returns true after incoming closes and
 	// residual batches flush. Per-iteration recovery keeps batches alive across
 	// a recovered panic
 	step := func() (done bool) {
@@ -212,7 +212,7 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 			}
 			b.items = append(b.items, vr)
 
-			// NoncInSREP versions cannot batch; flush immediately
+			// NoncInSREP versions cannot batch, so flush immediately
 			if protocol.NoncInSREP(vr.version, vr.req.HasType) || len(b.items) >= maxSize {
 				flush(key)
 			}
@@ -254,7 +254,7 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 			incDropped(transportUDP, dropWrite)
 			continue
 		}
-		incResponded(transportUDP, schemeEd25519, 1)
+		udpRespondedEd.Add(1)
 		if ce := log.Check(zap.DebugLevel, "sent response"); ce != nil {
 			ce.Write(
 				zap.Stringer("peer", r.peer),

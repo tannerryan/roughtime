@@ -412,3 +412,17 @@ func TestVerifyMerkleReturnsErrMerkleMismatch(t *testing.T) {
 		t.Fatalf("expected ErrMerkleMismatch, got %v", err)
 	}
 }
+
+// FuzzVerifyMerkle exercises the adversarial INDX/PATH parser with arbitrary
+// index bytes, path lengths, and leaf inputs across every wire group. It must
+// never panic, only return an error or verify.
+func FuzzVerifyMerkle(f *testing.F) {
+	f.Add([]byte{0, 0, 0, 0}, []byte("leaf"), make([]byte, 32), uint32(0))
+	f.Add([]byte{1, 0, 0, 0}, []byte("x"), make([]byte, 64), uint32(9))
+	f.Add([]byte{0xff}, []byte(nil), make([]byte, 1024), uint32(3))
+	f.Fuzz(func(t *testing.T, indx, leaf, path []byte, groupSel uint32) {
+		g := wireGroup(groupSel % uint32(groupD14+1))
+		resp := map[uint32][]byte{TagINDX: indx, TagPATH: path}
+		_ = verifyMerkle(resp, leaf, make([]byte, hashSize(g)), g)
+	})
+}

@@ -13,7 +13,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// Server-wide un-labeled counters; labeled request/response/drop counters live
+// Server-wide un-labeled counters. Labeled request/response/drop counters live
 // in metrics.go.
 var (
 	// statsPanics counts goroutine panics absorbed by recoverGoroutine.

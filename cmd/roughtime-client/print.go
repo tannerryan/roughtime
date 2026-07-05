@@ -23,7 +23,7 @@ func printSingle(r *roughtime.Response) {
 	if r.InSync() {
 		status = "in-sync"
 	}
-	// in -addr mode Name duplicates Address; skip the redundant line
+	// in -addr mode Name duplicates Address, so skip the redundant line
 	if !strings.HasSuffix(displayAddr, safeName) {
 		fmt.Printf("Server:    %s\n", safeName)
 	}
@@ -57,19 +57,29 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof, servers []ro
 	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
 	errFmt := fmt.Sprintf("%%-%ds  %%-%ds  error: %%s\n", nameW, addrW)
 
-	var deduped []roughtime.Result
-	// dedupe rows on PublicKey (operator-supplied Name can collide across
-	// distinct servers)
-	seen := make(map[string]bool)
-	var succeeded int
+	// Dedupe rows on PublicKey (operator-supplied Name can collide across
+	// distinct servers). Each server is queried twice (the chain covers both
+	// halves), so a later success replaces an earlier failure for the same key.
+	var rows []roughtime.Result
+	idxByKey := make(map[string]int)
 	for _, r := range results {
 		key := string(r.Server.PublicKey)
-		if key != "" && seen[key] {
+		if key == "" {
+			rows = append(rows, r)
 			continue
 		}
-		if key != "" {
-			seen[key] = true
+		if i, ok := idxByKey[key]; ok {
+			if rows[i].Err != nil && r.Err == nil {
+				rows[i] = r
+			}
+			continue
 		}
+		idxByKey[key] = len(rows)
+		rows = append(rows, r)
+	}
+
+	var deduped []roughtime.Result
+	for _, r := range rows {
 		if r.Err != nil {
 			displayAddr := roughtime.SanitizeForDisplay(r.Address.String())
 			if displayAddr == "://" && len(r.Server.Addresses) > 0 {
@@ -95,14 +105,13 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof, servers []ro
 			resp.Drift().Round(time.Millisecond).String(),
 			status,
 		)
-		succeeded++
 	}
 	fmt.Printf("\n%d/%d servers responded\n", len(deduped), len(servers))
 	printConsensus(deduped)
 	if proof != nil {
 		printChainStatus(proof)
 	}
-	if succeeded == 0 {
+	if len(deduped) == 0 {
 		return errors.New("no servers responded")
 	}
 	return nil

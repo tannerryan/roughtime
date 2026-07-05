@@ -46,7 +46,7 @@ func TestCreateRepliesAllDrafts(t *testing.T) {
 		{VersionDraft10, groupD10, 32, false},
 		{VersionDraft11, groupD10, 32, false},
 		{VersionDraft12, groupD12, 32, false},
-		{VersionDraft12, groupD14, 32, true}, // drafts 14–19 set TYPE
+		{VersionDraft12, groupD14, 32, true}, // drafts 14-19 set TYPE
 	}
 	for _, tc := range cases {
 		name := tc.ver.ShortString()
@@ -152,7 +152,7 @@ func TestCreateRepliesRejectsMixedHasType(t *testing.T) {
 func TestCreateRepliesRejectsWrongNonceSize(t *testing.T) {
 	cert, _ := testCert(t)
 
-	// draft-12 expects 32-byte nonces; second request supplies 64
+	// draft-12 expects 32-byte nonces. The second request supplies 64
 	_, req0, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	if err != nil {
 		t.Fatal(err)

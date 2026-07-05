@@ -210,6 +210,25 @@ func TestDelegationContext(t *testing.T) {
 	}
 }
 
+// TestSigningContextsMatchSpec pins the exact context bytes: sign and verify
+// share these constants, so a typo would round-trip cleanly yet break interop.
+func TestSigningContextsMatchSpec(t *testing.T) {
+	tests := []struct {
+		name string
+		got  []byte
+		want []byte
+	}{
+		{"delegation old (Google, drafts 01-06/08-11)", delegationCtxOld, []byte("RoughTime v1 delegation signature--\x00")},
+		{"delegation new (draft 07, drafts 12+)", delegationCtxNew, []byte("RoughTime v1 delegation signature\x00")},
+		{"response (all versions)", responseCtx, []byte("RoughTime v1 response signature\x00")},
+	}
+	for _, tt := range tests {
+		if !bytes.Equal(tt.got, tt.want) {
+			t.Errorf("%s context = %q, want %q", tt.name, tt.got, tt.want)
+		}
+	}
+}
+
 // TestNoncInSREPExported verifies the exported NoncInSREP matches the internal
 // noncInSREP across versions.
 func TestNoncInSREPExported(t *testing.T) {

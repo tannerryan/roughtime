@@ -310,7 +310,7 @@ func TestListenConcurrentBatches(t *testing.T) {
 	}
 	wg.Wait()
 
-	// poll until the last in-flight batch is counted; bounded by the deadline
+	// poll until the last in-flight batch is counted, bounded by the deadline
 	// so a stalled server still trips the assertion below
 	want := uint64(senders * perSender)
 	deadline := time.Now().Add(time.Second)
@@ -656,8 +656,8 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	}
 }
 
-// sendAndVerify fires n closed-loop requests; verify failures tolerated under
-// default grease.
+// sendAndVerify fires n closed-loop requests. Verify failures are tolerated
+// under default grease.
 func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 	t.Helper()
 	versions := protocol.Supported()

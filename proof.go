@@ -131,7 +131,8 @@ func (p *Proof) Links() ([]ProofLink, error) {
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: link %d: %w", i, err)
 		}
-		// Google replies have no VER tag; zero equals protocol.VersionGoogle.
+		// Google replies have no VER tag, so zero equals
+		// protocol.VersionGoogle.
 		ver, _ := protocol.ExtractVersion(link.Response)
 		out[i] = ProofLink{
 			PublicKey: append([]byte(nil), link.PublicKey...),
@@ -144,7 +145,9 @@ func (p *Proof) Links() ([]ProofLink, error) {
 	return out, nil
 }
 
-// Trust errors if any link is signed by a key not in trusted.
+// Trust errors if any link's claimed witness key is absent from trusted. It
+// checks the key field only, so pair it with [(*Proof).Verify] to bind each
+// response to its key.
 func (p *Proof) Trust(trusted []Server) error {
 	if p == nil || p.chain == nil {
 		return errors.New("roughtime: nil proof")
@@ -174,11 +177,15 @@ func (p *Proof) SeedNonce() ([]byte, error) {
 	return append([]byte(nil), req.Nonce...), nil
 }
 
-// AttestationBound returns the existence interval the chain proves for the
-// seed.
+// AttestationBound verifies the full chain, then returns the interval it proves
+// for the seed: the seed existed no later than latest. earliest is the start of
+// link 0's window, not a proven lower bound on the seed's age.
 func (p *Proof) AttestationBound() (earliest, latest time.Time, err error) {
 	if p == nil || p.chain == nil {
 		return time.Time{}, time.Time{}, errors.New("roughtime: nil proof")
+	}
+	if err := p.chain.Verify(); err != nil {
+		return time.Time{}, time.Time{}, err
 	}
 	bounds, err := p.linkBounds()
 	if err != nil {

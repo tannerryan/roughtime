@@ -116,7 +116,9 @@ var (
 	delegationCtxNew = []byte("RoughTime v1 delegation signature\x00")
 )
 
-// delegationContext returns the delegation signature context for g.
+// delegationContext returns the delegation signature context for g. Draft-07
+// alone dropped the "--" suffix (08 restored it, 12+ dropped it again), so
+// groupD07 takes the new context unlike its neighbours.
 func delegationContext(g wireGroup) []byte {
 	if g == groupD07 || g >= groupD12 {
 		return delegationCtxNew

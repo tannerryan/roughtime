@@ -1363,7 +1363,7 @@ func TestPQVERSDowngradeRejected(t *testing.T) {
 		t.Fatalf("VerifyReply baseline: %v", err)
 	}
 
-	// mixed client offer; PQ-only VERS still yields PQ as mutual-best, so the
+	// mixed client offer. PQ-only VERS still yields PQ as mutual-best, so the
 	// check passes
 	offered := []Version{VersionDraft12, VersionMLDSA44}
 	if _, _, err := VerifyReply(offered, replies[0], rootPK, nonce, req); err != nil {

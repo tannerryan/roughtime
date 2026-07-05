@@ -58,11 +58,12 @@ var udpWorkerExits = newCounterFn(
 
 func init() { addMetric(udpWorkerExits) }
 
-// listen starts one SO_REUSEPORT worker per CPU, each driving its own
+// listen starts one SO_REUSEPORT worker per GOMAXPROCS (cgroup-aware, unlike
+// NumCPU, so it won't oversubscribe in CPU-limited containers), each on its own
 // recvmmsg/sendmmsg loop.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
-	numWorkers := runtime.NumCPU()
+	numWorkers := max(1, runtime.GOMAXPROCS(0))
 	addr := net.JoinHostPort("::", strconv.Itoa(*port))
 	maxSize := batchMaxSize
 	maxLatency := batchMaxLatency
@@ -140,7 +141,7 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 			respond(log, p, state.Load(), batch)
 		}
 		// throttle the loop on persistent non-deadline read errors so a wedged
-		// socket can't burn a core; ctx.Done preempts the sleep
+		// socket can't burn a core, ctx.Done preempts the sleep
 		if hardErr {
 			select {
 			case <-ctx.Done():
@@ -151,7 +152,7 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 	}
 }
 
-// collectBatch reads up to maxSize datagrams; hardErr signals a non-deadline
+// collectBatch reads up to maxSize datagrams. hardErr signals a non-deadline
 // error on the first read.
 func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs []ipv6.Message, maxSize int, maxLatency time.Duration, state *atomic.Pointer[certState]) (batch []validatedRequest, hardErr bool) {
 	_ = conn.SetReadDeadline(time.Now().Add(idleReadTimeout))
@@ -210,7 +211,7 @@ func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]valid
 			incDropped(transportUDP, reason)
 			continue
 		}
-		incReceived(transportUDP, schemeEd25519)
+		udpReceivedEd.Add(1)
 		*batch = append(*batch, vr)
 	}
 }
@@ -259,7 +260,7 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 		}
 	}
 
-	// sendmmsg may return a short count; loop until the slice drains
+	// sendmmsg may return a short count, so loop until the slice drains
 	for len(out) > 0 {
 		n, err := p.WriteBatch(out, 0)
 		if err != nil {
@@ -277,7 +278,7 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 			}
 			return
 		}
-		incResponded(transportUDP, schemeEd25519, uint64(n))
+		udpRespondedEd.Add(uint64(n))
 		out = out[n:]
 	}
 }

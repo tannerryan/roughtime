@@ -222,7 +222,7 @@ func TestIncReceivedRespondedDropped(t *testing.T) {
 	udpEdBefore := receivedSeries[transportUDP][schemeEd25519].Load()
 	tcpPQBefore := receivedSeries[transportTCP][schemeMLDSA44].Load()
 	tcpEdRespondedBefore := respondedSeries[transportTCP][schemeEd25519].Load()
-	// dropUndersize is UDP-only and always registered; dropQueue is gated by
+	// dropUndersize is UDP-only and always registered. dropQueue is gated by
 	// udpHasQueue and is nil on platforms with the inline UDP fast path.
 	udpUndersizeBefore := droppedSeries[transportUDP][dropUndersize].Load()
 	tcpFramingBefore := droppedSeries[transportTCP][dropFraming].Load()
@@ -239,7 +239,7 @@ func TestIncReceivedRespondedDropped(t *testing.T) {
 	if got := receivedSeries[transportTCP][schemeMLDSA44].Load() - tcpPQBefore; got != 1 {
 		t.Errorf("TCP/mldsa44 received delta = %d, want 1", got)
 	}
-	// UDP is Ed25519-only; the mldsa44 series under transport=udp must not
+	// UDP is Ed25519-only, so the mldsa44 series under transport=udp must not
 	// exist, and incReceived for that combination must be a no-op.
 	if _, ok := receivedSeries[transportUDP][schemeMLDSA44]; ok {
 		t.Error("unexpected UDP+mldsa44 series registered")
@@ -285,7 +285,7 @@ func TestNoteCertRotation(t *testing.T) {
 }
 
 // TestUDPDroppedReasonsRegistered verifies UDP drop reasons match what the
-// listener can actually produce; unreachable series would be misleading.
+// listener can actually produce. Unreachable series would be misleading.
 func TestUDPDroppedReasonsRegistered(t *testing.T) {
 	want := map[dropReason]bool{
 		dropUndersize: true,
@@ -374,7 +374,7 @@ func TestNoteCertProvisioned(t *testing.T) {
 }
 
 // TestNoteCertProvisionedPanicsOnUnknownScheme verifies the helper rejects an
-// unknown scheme constant; this catches refactor mistakes at boot.
+// unknown scheme constant. This catches refactor mistakes at boot.
 func TestNoteCertProvisionedPanicsOnUnknownScheme(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
@@ -595,7 +595,7 @@ func TestListenMetricsGracefulShutdownWithActiveScraper(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// fire a scrape in a goroutine, then cancel ctx mid-flight; the response
+	// fire a scrape in a goroutine, then cancel ctx mid-flight. The response
 	// should still arrive and listenMetrics should return within the grace
 	// window
 	scrapeDone := make(chan error, 1)

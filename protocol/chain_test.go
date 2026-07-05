@@ -636,8 +636,8 @@ func TestVerifyCausalOrder(t *testing.T) {
 		t.Fatalf("baseline chain should verify: %v", err)
 	}
 
-	// link 2 claims future, link 3 claims past — preserves nonce linkage,
-	// violates causal ordering
+	// link 2 claims future, link 3 claims past, which preserves nonce linkage
+	// but violates causal ordering
 	var bad Chain
 	blink1, _ := bad.NextRequest(versions, srv1.rootPK, rand.Reader)
 	breq1, _ := ParseRequest(blink1.Request)
@@ -677,7 +677,7 @@ func TestVerifyCausalOrderFiveLinks(t *testing.T) {
 		servers[i] = newChainServer(t, ver)
 	}
 
-	// link 2 is the peak; link 4 drops below it, violating running max
+	// link 2 is the peak. Link 4 drops below it, violating the running max
 	base := time.Now().Truncate(time.Second)
 	midpoints := []time.Time{
 		base.Add(-10 * time.Minute),

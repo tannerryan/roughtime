@@ -475,7 +475,7 @@ func TestProofTrustPartial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Proof: %v", err)
 	}
-	// trust f1 only; f2's link must surface as untrusted
+	// trust f1 only, so f2's link must surface as untrusted
 	if err := proof.Trust([]roughtime.Server{f1.server()}); err == nil {
 		t.Fatal("Trust accepted a chain with an untrusted key")
 	}
@@ -736,7 +736,7 @@ func TestVerifyRejectsReplyChoosingUnofferedVersion(t *testing.T) {
 // VersionGoogle rather than rejected outright.
 func TestVerifyFallsBackToGoogleForVERLess(t *testing.T) {
 	junkReply := []byte{0, 1, 2, 3}
-	junkRequest := []byte{0, 1, 2, 3} // unparsable; ParseRequest fails first
+	junkRequest := []byte{0, 1, 2, 3} // unparsable, ParseRequest fails first
 	_, _, err := roughtime.Verify(make([]byte, 32), junkRequest, junkReply)
 	if err == nil {
 		t.Fatal("Verify accepted junk")

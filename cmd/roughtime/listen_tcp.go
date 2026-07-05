@@ -25,7 +25,7 @@ import (
 // maxTCPRequestSize bounds the declared body length on a TCP request.
 const maxTCPRequestSize uint32 = 8192
 
-// TCP tunables; var so tests can shrink them.
+// TCP tunables. A var so tests can shrink them.
 var (
 	// maxTCPConnections caps concurrent accepted connections.
 	maxTCPConnections int32 = 16384
@@ -118,7 +118,7 @@ func (s *activeConnSet) closeAll() {
 	}
 }
 
-// listenTCP serves Roughtime over a dual-stack TCP listener on *port; edState
+// listenTCP serves Roughtime over a dual-stack TCP listener on *port. edState
 // and pqState are each nilable.
 func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState]) error {
 	if edState == nil && pqState == nil {
@@ -189,7 +189,7 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 				break
 			}
 			tcpLog.Warn("Accept failed", zap.Error(err))
-			// backoff to avoid hot spin; observe ctx.Done so shutdown isn't
+			// backoff to avoid hot spin, and observe ctx.Done so shutdown isn't
 			// held
 			select {
 			case <-time.After(acceptErrorBackoff):
@@ -237,7 +237,8 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 		<-done
 	}
 
-	// handlers exited; close batch channels so batchers flush and return
+	// handlers exited, so close batch channels to make batchers flush and
+	// return
 	if edBatchCh != nil {
 		close(edBatchCh)
 	}
@@ -286,8 +287,9 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 	reqBufPtr := tcpReqBufPool.Get().(*[]byte)
 	defer tcpReqBufPool.Put(reqBufPtr)
 	reqBuf := *reqBufPtr
-	// reused across requests; handler is sequential (read → submit → wait →
-	// write → next read) so the channel is always drained before next submit
+	// reused across requests. The handler is sequential (read, submit, wait,
+	// write, then next read) so the channel is always drained before next
+	// submit
 	replyCh := make(chan tcpBatchReply, 1)
 
 	for {
@@ -295,7 +297,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		_ = conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
 		hdr := reqBuf[:protocol.PacketHeaderSize]
 		if _, err := io.ReadFull(conn, hdr); err != nil {
-			// EOF / idle timeout / peer close — all terminal
+			// EOF, idle timeout, or peer close, all terminal
 			return
 		}
 		bodyLen, err := protocol.ParsePacketHeader(hdr)
@@ -321,7 +323,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 			return
 		}
 
-		// bound body read so a slow sender can't hold the slot; read in place
+		// bound body read so a slow sender can't hold the slot, read in place
 		// so prepareTCPItem gets the full framed packet
 		_ = conn.SetReadDeadline(time.Now().Add(tcpReadTimeout))
 		pkt := reqBuf[:protocol.PacketHeaderSize+int(bodyLen)]
@@ -341,7 +343,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		scheme := schemeForVersion(item.version)
 		incReceived(transportTCP, scheme)
 
-		// fast path non-blocking; on a queue spike, fall back to a short
+		// fast path is non-blocking. On a queue spike, fall back to a short
 		// bounded wait so a transient burst doesn't tear down every conn
 		item.reply = replyCh
 		select {
@@ -363,7 +365,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 			}
 		}
 
-		// wait for batcher to sign; ctx.Done() unblocks on shutdown. Peek
+		// wait for batcher to sign. ctx.Done() unblocks on shutdown. Peek
 		// replyCh first so a reply already produced by the batcher isn't
 		// discarded by a racing ctx cancellation
 		var br tcpBatchReply
@@ -397,7 +399,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 
 // prepareTCPItem parses, negotiates, and SRV-checks reqBytes, returning the
 // tcpBatchItem and destination batch channel. On failure the dropReason
-// classifies the rejection; empty on success.
+// classifies the rejection, empty on success.
 func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) (tcpBatchItem, chan<- tcpBatchItem, dropReason, error) {
 	req, err := protocol.ParseRequest(reqBytes)
 	if err != nil {
@@ -525,7 +527,7 @@ func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-ch
 				batches[key] = b
 			}
 			b.items = append(b.items, it)
-			// NoncInSREP versions cannot batch; flush immediately
+			// NoncInSREP versions cannot batch, so flush immediately
 			if protocol.NoncInSREP(it.version, it.hasType) || len(b.items) >= maxSize {
 				flush(key)
 			}
@@ -605,7 +607,7 @@ func flushTCPBatch(log *zap.Logger, st *certState, ver protocol.Version, items [
 			}
 		}
 		// signing-bug guard: oversized replies indicate a CreateReplies/Grease
-		// bug; fail the handler with an error rather than write garbage on the
+		// bug. Fail the handler with an error rather than write garbage on the
 		// wire
 		var br tcpBatchReply
 		if len(reply) > maxTCPReplyBytes {

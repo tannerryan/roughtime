@@ -16,10 +16,11 @@
 //
 // All path flags are resolved relative to the process working directory.
 //
-// IETF Ed25519 (drafts 05+) and experimental ML-DSA-44 witnesses; the SHA-256
-// seed requires a 32-byte nonce, so Google-Roughtime entries are skipped.
+// It uses IETF Ed25519 (drafts 05+) and experimental ML-DSA-44 witnesses. The
+// SHA-256 seed requires a 32-byte nonce, so Google-Roughtime entries are
+// skipped.
 //
-// Stamping requires >=2 witnesses by design; the spec recommends >=3 for
+// Stamping requires >=2 witnesses by design. The spec recommends >=3 for
 // malfeasance detection, but two are sufficient to bind a document to a
 // corroborated time window.
 package main
@@ -51,7 +52,7 @@ var (
 	// serversFile is the ecosystem JSON path flag.
 	serversFile = flag.String("servers", "ecosystem.json", "ecosystem JSON")
 	// outPath is the proof output path flag for stamp mode.
-	outPath = flag.String("out", "", "proof output path (stamp mode)")
+	outPath = flag.String("out", "", "proof output path, overwritten if it exists (stamp mode)")
 	// inPath is the proof input path flag for verify mode.
 	inPath = flag.String("in", "", "proof input path (verify mode)")
 	// timeout is the per-server timeout flag.
@@ -161,6 +162,13 @@ func stamp(ctx context.Context) error {
 		printFailures(cr.Results)
 		return fmt.Errorf("chain verify: %w", err)
 	}
+	// ensure the seed the library bound equals our digest, so the stamp always
+	// passes verify mode's document-binding check
+	if seed, err := proof.SeedNonce(); err != nil {
+		return err
+	} else if !bytes.Equal(seed, digest) {
+		return fmt.Errorf("seed nonce %x != SHA-256(document) %x", seed, digest)
+	}
 	links, err := proof.Links()
 	if err != nil {
 		return fmt.Errorf("inspecting proof: %w", err)
@@ -190,7 +198,7 @@ func stamp(ctx context.Context) error {
 	fmt.Printf("  Verify offline:   roughtime-stamp -mode verify -doc %s -servers %s -in %s\n", *docPath, *serversFile, *outPath)
 	fmt.Println()
 	fmt.Printf("STAMPED: %s is attested by %d independent Roughtime witnesses to have\n", *docPath, len(links))
-	fmt.Println("existed at a time within the verified window above. Any modification to the")
+	fmt.Println("existed no later than the upper bound above. Any modification to the")
 	fmt.Println("document or receipt invalidates this attestation.")
 	return nil
 }
@@ -347,7 +355,7 @@ func writeProofAtomic(path string, data []byte) error {
 		cleanup()
 		return fmt.Errorf("writing proof: %w", err)
 	}
-	// CreateTemp uses 0600; bump to 0644 so proofs are world-readable
+	// CreateTemp uses 0600, so bump to 0644 to make proofs world-readable
 	if err := os.Chmod(tmp, 0o644); err != nil {
 		cleanup()
 		return fmt.Errorf("chmod proof: %w", err)

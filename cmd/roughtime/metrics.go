@@ -24,7 +24,7 @@ import (
 // dropReason is the "reason" label value for requests_dropped_total.
 type dropReason string
 
-// Drop reasons. UDP cannot produce framing/read; TCP cannot produce undersize.
+// Drop reasons. UDP cannot produce framing/read, TCP cannot produce undersize.
 // Everything else applies to both transports.
 const (
 	// dropFraming is a TCP header magic, length, or parse failure.
@@ -72,12 +72,12 @@ type counterSeries struct {
 	val atomic.Uint64
 }
 
-// newCounter constructs a counter; labels may be empty for an un-labeled one.
+// newCounter constructs a counter. Labels may be empty for an un-labeled one.
 func newCounter(name, help string, labels ...string) *counter {
 	return &counter{name: name, help: help, labelNames: labels}
 }
 
-// (counter) register reserves a series and returns its atomic counter; must be
+// (counter) register reserves a series and returns its atomic counter. Must be
 // called from init.
 func (c *counter) register(values ...string) *atomic.Uint64 {
 	if len(values) != len(c.labelNames) {
@@ -97,7 +97,7 @@ func (c *counter) total() uint64 {
 	return n
 }
 
-// (counter) reset zeroes every series; for tests.
+// (counter) reset zeroes every series, for tests.
 func (c *counter) reset() {
 	for _, s := range c.series {
 		s.val.Store(0)
@@ -121,7 +121,7 @@ type gauge struct {
 	series     []*gaugeSeries
 }
 
-// gaugeSeries is one (label-tuple, value) sample; un-Set series are skipped at
+// gaugeSeries is one (label-tuple, value) sample. Un-Set series are skipped at
 // scrape time so an unconfigured scheme doesn't render a default-zero sample.
 type gaugeSeries struct {
 	labelValues []string
@@ -148,7 +148,7 @@ func newGauge(name, help string, labels ...string) *gauge {
 	return &gauge{name: name, help: help, labelNames: labels}
 }
 
-// (gauge) register reserves a series; must be called from init.
+// (gauge) register reserves a series. Must be called from init.
 func (g *gauge) register(values ...string) *gaugeSeries {
 	if len(values) != len(g.labelNames) {
 		panic(fmt.Sprintf("metrics: gauge %s expects %d label values, got %d", g.name, len(g.labelNames), len(values)))
@@ -158,7 +158,7 @@ func (g *gauge) register(values ...string) *gaugeSeries {
 	return s
 }
 
-// (gauge) writeTo renders every Set series; never-Set series are skipped.
+// (gauge) writeTo renders every Set series. Never-Set series are skipped.
 func (g *gauge) writeTo(w io.Writer) {
 	writeHelpType(w, g.name, "gauge", g.help)
 	for _, s := range g.series {
@@ -168,8 +168,8 @@ func (g *gauge) writeTo(w io.Writer) {
 	}
 }
 
-// infoGauge always reports 1; the signal is in label values, which may rotate
-// at runtime. Multiple series per metric supported.
+// infoGauge always reports 1. The signal is in label values, which may rotate
+// at runtime. Multiple series per metric are supported.
 type infoGauge struct {
 	name       string
 	help       string
@@ -181,7 +181,7 @@ type infoGauge struct {
 type infoSeries struct {
 	// parent enables label-count validation in Set.
 	parent *infoGauge
-	// state is the current label-value snapshot; nil before Set is called.
+	// state is the current label-value snapshot, nil before Set is called.
 	state atomic.Pointer[[]string]
 }
 
@@ -190,14 +190,14 @@ func newInfoGauge(name, help string, labels ...string) *infoGauge {
 	return &infoGauge{name: name, help: help, labelNames: labels}
 }
 
-// (infoGauge) register reserves a series; must be called from init.
+// (infoGauge) register reserves a series. Must be called from init.
 func (g *infoGauge) register() *infoSeries {
 	s := &infoSeries{parent: g}
 	g.series = append(g.series, s)
 	return s
 }
 
-// (infoSeries) Set publishes label values atomically; values is copied so the
+// (infoSeries) Set publishes label values atomically. values is copied so the
 // caller may mutate it.
 func (s *infoSeries) Set(values ...string) {
 	if len(values) != len(s.parent.labelNames) {
@@ -207,7 +207,7 @@ func (s *infoSeries) Set(values ...string) {
 	s.state.Store(&cp)
 }
 
-// (infoGauge) writeTo renders every Set series; never-Set series are skipped.
+// (infoGauge) writeTo renders every Set series. Never-Set series are skipped.
 func (g *infoGauge) writeTo(w io.Writer) {
 	writeHelpType(w, g.name, "gauge", g.help)
 	for _, s := range g.series {
@@ -241,14 +241,15 @@ type exporter interface {
 	writeTo(w io.Writer)
 }
 
-// registry is the metrics list rendered by /metrics; populated at init.
+// registry is the metrics list rendered by /metrics, populated at init.
 var registry []exporter
 
-// addMetric appends m to the registry; init-only.
+// addMetric appends m to the registry. Init-only.
 func addMetric(m exporter) { registry = append(registry, m) }
 
-// Labeled counters; every valid label tuple is pre-registered in
-// initLabeledSeries so increment sites can index a flat map lock-free.
+// Labeled counters. Every valid label tuple is pre-registered in
+// initLabeledSeries, read via a cached pointer (UDP hot path) or the map
+// (cold).
 var (
 	requestsReceived = newCounter(
 		"roughtime_requests_received_total",
@@ -349,7 +350,7 @@ type schemeCertMetrics struct {
 	info        *infoSeries
 }
 
-// Pre-registered series pointers used directly by increment-site helpers; the
+// Pre-registered series pointers used directly by increment-site helpers. The
 // stored *atomic.Uint64 avoids a per-event map lookup on the hot path.
 var (
 	// receivedSeries[transport][scheme] = atomic counter pointer.
@@ -357,13 +358,17 @@ var (
 	// respondedSeries[transport][scheme] = atomic counter pointer.
 	respondedSeries map[string]map[string]*atomic.Uint64
 	droppedSeries   map[string]map[dropReason]*atomic.Uint64
+	// udpReceivedEd and udpRespondedEd are the per-datagram UDP series (UDP is
+	// Ed25519-only), cached to skip the nested-map lookup on every packet.
+	udpReceivedEd  *atomic.Uint64
+	udpRespondedEd *atomic.Uint64
 	// certMetricsByScheme[scheme] holds rotations/expiry/provisioned/info
 	// series for that scheme.
 	certMetricsByScheme map[string]*schemeCertMetrics
 	buildInfoSeries     *infoSeries
 )
 
-// Label constants — bare strings would invite typos at increment sites.
+// Label constants. Bare strings would invite typos at increment sites.
 const (
 	schemeEd25519 = "ed25519"
 	schemeMLDSA44 = "mldsa44"
@@ -380,7 +385,7 @@ func schemeForVersion(v protocol.Version) string {
 }
 
 // init wires every metric into the registry and pre-registers each valid label
-// tuple. Build info is set here; other gauges are populated by serve.
+// tuple. Build info is set here. Other gauges are populated by serve.
 func init() {
 	addMetric(requestsReceived)
 	addMetric(requestsResponded)
@@ -406,7 +411,7 @@ func init() {
 
 // initLabeledSeries pre-registers an atomic for every valid label tuple.
 func initLabeledSeries() {
-	// UDP carries Ed25519 only; ML-DSA-44 is TCP-exclusive.
+	// UDP carries Ed25519 only. ML-DSA-44 is TCP-exclusive.
 	receivedSeries = map[string]map[string]*atomic.Uint64{
 		transportUDP: {
 			schemeEd25519: requestsReceived.register(transportUDP, schemeEd25519),
@@ -425,9 +430,12 @@ func initLabeledSeries() {
 			schemeMLDSA44: requestsResponded.register(transportTCP, schemeMLDSA44),
 		},
 	}
+	udpReceivedEd = receivedSeries[transportUDP][schemeEd25519]
+	udpRespondedEd = respondedSeries[transportUDP][schemeEd25519]
 
-	// UDP can't produce framing/read (TCP-only) or oversize (kernel truncates);
-	// TCP can't produce undersize. udpHasQueue gates dropQueue per-platform.
+	// UDP can't produce framing/read (TCP-only) or oversize (kernel truncates),
+	// and TCP can't produce undersize. udpHasQueue gates dropQueue
+	// per-platform.
 	udpReasons := []dropReason{dropUndersize, dropParse, dropVersion, dropSRV, dropBatchErr, dropWrite}
 	if udpHasQueue {
 		udpReasons = append(udpReasons, dropQueue)
@@ -477,7 +485,7 @@ func incDropped(transport string, reason dropReason) {
 	}
 }
 
-// droppedFor returns requests_dropped_total for one (transport, reason); used
+// droppedFor returns requests_dropped_total for one (transport, reason), used
 // by shutdown logs that surface per-reason totals.
 func droppedFor(transport string, reason dropReason) uint64 {
 	if c := droppedSeries[transport][reason]; c != nil {
@@ -486,7 +494,7 @@ func droppedFor(transport string, reason dropReason) uint64 {
 	return 0
 }
 
-// certMetricsFor returns the cert lifecycle series for scheme; panics on
+// certMetricsFor returns the cert lifecycle series for scheme. It panics on
 // unknown so a refactor mistake fails fast.
 func certMetricsFor(scheme string) *schemeCertMetrics {
 	sm, ok := certMetricsByScheme[scheme]
@@ -529,8 +537,8 @@ func writeHelpType(w io.Writer, name, kind, help string) {
 	_, _ = io.WriteString(w, "\n")
 }
 
-// writeSample emits one sample; nil/empty labels produce an un-labeled sample.
-// Labels render in alphabetical key order for deterministic output.
+// writeSample emits one sample. Nil or empty labels produce an un-labeled
+// sample. Labels render in alphabetical key order for deterministic output.
 func writeSample(w io.Writer, name string, labelNames, labelValues []string, value float64) {
 	_, _ = io.WriteString(w, name)
 	if len(labelNames) > 0 {

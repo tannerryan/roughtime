@@ -48,7 +48,7 @@ type readyReply struct {
 }
 
 // validateRequest parses a request, validates SRV, and negotiates a version. On
-// failure the dropReason classifies the rejection; empty on success.
+// failure the dropReason classifies the rejection, empty on success.
 func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, dropReason, bool) {
 	req, err := protocol.ParseRequest(requestBytes)
 	if err != nil {

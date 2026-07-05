@@ -28,7 +28,7 @@ func printDocument(path string, size int64, digest []byte) {
 // equals the document hash.
 func printSeedLink(l roughtime.ProofLink, docDigest []byte, names map[string]string) {
 	lo, hi := l.Window()
-	fmt.Println("Document Binding (Link 0 — Seed)")
+	fmt.Println("Document Binding (Link 0, Seed)")
 	fmt.Printf("  Witness:          %s\n", nameOf(l.PublicKey, names))
 	fmt.Printf("  Wire version:     %s\n", l.Version.ShortString())
 	fmt.Printf("  Key (fp):         %s\n", fingerprint(l.PublicKey))
@@ -100,10 +100,12 @@ func printAttestationWindow(links []roughtime.ProofLink) {
 	for _, l := range links {
 		keys[string(l.PublicKey)] = struct{}{}
 	}
+	// The chain proves only an upper bound: earliest is where link 0's window
+	// opens, not a proven lower bound on the document's age.
 	fmt.Println("Verified Attestation Window")
-	fmt.Printf("  No earlier than:  %s  (link 0 lower bound)\n", earliest.UTC().Format(tsFormat))
-	fmt.Printf("  No later than:    %s  (link %d upper bound)\n", latest.UTC().Format(tsFormat), boundIdx)
-	fmt.Printf("  Width:            %s\n", latest.Sub(earliest))
-	fmt.Printf("  Witnesses:        %d independent keys\n", len(keys))
+	fmt.Printf("  Existed no later than:  %s  (link %d upper bound)\n", latest.UTC().Format(tsFormat), boundIdx)
+	fmt.Printf("  Stamp window opens:     %s  (link 0 lower bound)\n", earliest.UTC().Format(tsFormat))
+	fmt.Printf("  Width:                  %s\n", latest.Sub(earliest))
+	fmt.Printf("  Witnesses:              %d independent keys\n", len(keys))
 	fmt.Println()
 }

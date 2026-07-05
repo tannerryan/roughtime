@@ -8,7 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
+	"net"
 	"strings"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // MaxEcosystemServers caps the size of a parsed ecosystem file.
@@ -101,7 +105,54 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 	return out, nil
 }
 
-// MarshalEcosystem serializes servers as ecosystem JSON; empty input produces a
+// SampleByOperator returns up to n servers, at most one per operator (grouped
+// by [OperatorKey]), so no operator can dominate the consensus median however
+// many entries it registers. Operators, and the server within each, are chosen
+// at random. Fewer than n are returned when operators are scarce.
+func SampleByOperator(servers []Server, n int) []Server {
+	if n <= 0 {
+		return nil
+	}
+	groups := map[string][]Server{}
+	order := make([]string, 0, len(servers))
+	for _, s := range servers {
+		k := OperatorKey(s)
+		if _, seen := groups[k]; !seen {
+			order = append(order, k)
+		}
+		groups[k] = append(groups[k], s)
+	}
+	mrand.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
+	out := make([]Server, 0, n)
+	for _, k := range order {
+		if len(out) == n {
+			break
+		}
+		g := groups[k]
+		out = append(out, g[mrand.IntN(len(g))])
+	}
+	return out
+}
+
+// OperatorKey identifies a server's operator by the registered domain (eTLD+1)
+// of its primary address, falling back to the bare host for IP literals and
+// single-label names.
+func OperatorKey(s Server) string {
+	if len(s.Addresses) == 0 {
+		return s.Name
+	}
+	host, _, err := net.SplitHostPort(s.Addresses[0].Address)
+	if err != nil {
+		host = s.Addresses[0].Address
+	}
+	host = strings.ToLower(host)
+	if reg, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
+		return reg
+	}
+	return host
+}
+
+// MarshalEcosystem serializes servers as ecosystem JSON. Empty input produces a
 // doc [ParseEcosystem] rejects.
 func MarshalEcosystem(servers []Server) ([]byte, error) {
 	if len(servers) > MaxEcosystemServers {

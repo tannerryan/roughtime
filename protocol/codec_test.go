@@ -524,7 +524,7 @@ func TestNonceOffsetInRequest(t *testing.T) {
 		}
 	}
 
-	// framed but truncated body — exercises unwrapRequest error path
+	// framed but truncated body, exercises the unwrapRequest error path
 	pkt := make([]byte, 12)
 	copy(pkt[:8], packetMagic[:])
 	binary.LittleEndian.PutUint32(pkt[8:12], 9999)

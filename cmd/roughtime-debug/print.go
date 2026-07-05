@@ -174,7 +174,7 @@ func printResponseDetail(r probeResult, tags map[uint32][]byte) {
 		fmt.Printf("Merkle index:    %d\n", binary.LittleEndian.Uint32(indx))
 	}
 	if path, ok := tags[protocol.TagPATH]; ok {
-		// Google uses full 64-byte SHA-512 nodes; IETF truncates to 32 bytes.
+		// Google uses full 64-byte SHA-512 nodes. IETF truncates to 32 bytes.
 		hs := 32
 		if r.version == protocol.VersionGoogle {
 			hs = 64
@@ -216,7 +216,7 @@ func printSREP(r probeResult, tags map[uint32][]byte) {
 	}
 	if radi, ok := srep[protocol.TagRADI]; ok && len(radi) == 4 {
 		raw := binary.LittleEndian.Uint32(radi)
-		// Google and drafts 01-07 encode RADI in µs; drafts 08+ in seconds.
+		// Google and drafts 01-07 encode RADI in µs. Drafts 08+ use seconds.
 		unit := "s"
 		if radiusUsesMicroseconds(r.version) {
 			unit = "µs"

@@ -765,7 +765,7 @@ func TestRefreshLoopPQRefreshesNearExpiry(t *testing.T) {
 	path, pk := withPQSeedFile(t)
 	setPQRootKeyPath(t, path)
 
-	// seed state with an arbitrary cert; refresh path overwrites it
+	// seed state with an arbitrary cert. The refresh path overwrites it
 	_, stSeed := newUnitCertState(t)
 	stSeed.expiry = time.Now().Add(time.Minute)
 	statePtr := &atomic.Pointer[certState]{}

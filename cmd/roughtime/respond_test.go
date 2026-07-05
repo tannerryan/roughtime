@@ -232,6 +232,43 @@ func TestSignAndBuildRepliesAmplificationDrop(t *testing.T) {
 	}
 }
 
+// TestSignAndBuildRepliesGreaseNeverAmplifies drives the grease path with
+// greaseRate=1 and a budget equal to the ungreased reply size. Whatever mode
+// Grease picks, the result must still fit the budget (greased when it fits,
+// ungreased fallback when it would grow), so a reply is always returned and
+// never exceeds the request size.
+func TestSignAndBuildRepliesGreaseNeverAmplifies(t *testing.T) {
+	rootPK, st := newUnitCertState(t)
+	srv := protocol.ComputeSRV(rootPK)
+	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 9}
+	_, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+	parsed, _ := protocol.ParseRequest(req)
+
+	prevGrease := *greaseRate
+	t.Cleanup(func() { *greaseRate = prevGrease })
+
+	// baseline ungreased reply size, used as a tight amplification budget
+	*greaseRate = 0
+	base := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12,
+		[]validatedRequest{{req: *parsed, peer: peer, requestSize: len(req), version: protocol.VersionDraft12}})
+	if len(base) != 1 {
+		t.Fatalf("baseline replies=%d want 1", len(base))
+	}
+	budget := len(base[0].bytes)
+
+	*greaseRate = 1
+	for i := range 300 {
+		got := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12,
+			[]validatedRequest{{req: *parsed, peer: peer, requestSize: budget, version: protocol.VersionDraft12}})
+		if len(got) != 1 {
+			t.Fatalf("iter %d: replies=%d want 1 (fallback must keep the ungreased reply)", i, len(got))
+		}
+		if len(got[0].bytes) > budget {
+			t.Fatalf("iter %d: grease amplified reply=%d budget=%d", i, len(got[0].bytes), budget)
+		}
+	}
+}
+
 // TestSignAndBuildRepliesEmpty verifies signAndBuildReplies returns nil for an
 // empty batch.
 func TestSignAndBuildRepliesEmpty(t *testing.T) {
