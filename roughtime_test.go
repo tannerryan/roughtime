@@ -817,7 +817,7 @@ func TestSendWithRetryBackoffCancel(t *testing.T) {
 		cancel()
 	}()
 	c := roughtime.Client{Timeout: 10 * time.Millisecond, MaxAttempts: 5}
-	// closed port; first attempt fails fast, then sleepCtx triggers
+	// closed port. First attempt fails fast, then sleepCtx triggers
 	_, err := c.Query(ctx, roughtime.Server{
 		PublicKey: make([]byte, ed25519.PublicKeySize),
 		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},

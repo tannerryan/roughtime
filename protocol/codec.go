@@ -79,6 +79,11 @@ func encodeTo(msg map[uint32][]byte, prefix int) ([]byte, error) {
 	}
 
 	totalLen := uint64(headerLen) + uint64(valsLen)
+	// cap symmetrically with Decode. This also keeps the uint32 accumulators
+	// below from wrapping
+	if totalLen > maxMessageSize {
+		return nil, fmt.Errorf("protocol: encoded message exceeds %d bytes", maxMessageSize)
+	}
 	if totalLen > math.MaxInt-uint64(prefix) {
 		return nil, errors.New("protocol: message too large")
 	}
@@ -108,16 +113,16 @@ func encodeTo(msg map[uint32][]byte, prefix int) ([]byte, error) {
 
 // encodeWrapped encodes msg and prepends the ROUGHTIM header in one allocation.
 func encodeWrapped(msg map[uint32][]byte) ([]byte, error) {
-	out, err := encodeTo(msg, 12)
+	out, err := encodeTo(msg, PacketHeaderSize)
 	if err != nil {
 		return nil, err
 	}
-	copy(out[0:8], packetMagic[:])
-	binary.LittleEndian.PutUint32(out[8:12], uint32(len(out)-12))
+	copy(out[0:len(packetMagic)], packetMagic[:])
+	binary.LittleEndian.PutUint32(out[len(packetMagic):PacketHeaderSize], uint32(len(out)-PacketHeaderSize))
 	return out, nil
 }
 
-// Decode parses a Roughtime message into a tag-value map; returned slices alias
+// Decode parses a Roughtime message into a tag-value map. Returned slices alias
 // data.
 func Decode(data []byte) (map[uint32][]byte, error) {
 	if len(data) < 4 {
@@ -195,24 +200,24 @@ func decodeValues(data []byte, tags, offsets []uint32, headerLen uint32) (map[ui
 	return msg, nil
 }
 
-// unwrapPacket validates and strips the 12-byte ROUGHTIM header.
+// unwrapPacket validates and strips the ROUGHTIM header.
 func unwrapPacket(pkt []byte) ([]byte, error) {
-	if len(pkt) < 12 {
+	if len(pkt) < PacketHeaderSize {
 		return nil, errors.New("protocol: packet too short")
 	}
-	if !bytes.Equal(pkt[:8], packetMagic[:]) {
+	if !bytes.Equal(pkt[:len(packetMagic)], packetMagic[:]) {
 		return nil, errors.New("protocol: bad magic")
 	}
-	mlen := binary.LittleEndian.Uint32(pkt[8:12])
-	if uint32(len(pkt)-12) < mlen {
+	mlen := binary.LittleEndian.Uint32(pkt[len(packetMagic):PacketHeaderSize])
+	if uint32(len(pkt)-PacketHeaderSize) < mlen {
 		return nil, errors.New("protocol: truncated message")
 	}
-	return pkt[12 : 12+mlen], nil
+	return pkt[PacketHeaderSize : PacketHeaderSize+mlen], nil
 }
 
 // unwrapRequest strips the ROUGHTIM header if present, else returns raw.
 func unwrapRequest(raw []byte) ([]byte, error) {
-	if len(raw) >= 12 && bytes.Equal(raw[:8], packetMagic[:]) {
+	if len(raw) >= PacketHeaderSize && bytes.Equal(raw[:len(packetMagic)], packetMagic[:]) {
 		return unwrapPacket(raw)
 	}
 	return raw, nil
@@ -277,7 +282,7 @@ func findTagRange(msg []byte, tag uint32) (lo, hi uint32, ok bool) {
 	}
 
 	// uint64 arithmetic so a crafted offset near 2^32 cannot wrap past the
-	// bounds check; zero-length values are spec-legal so loAbs may equal hiAbs
+	// bounds check. Zero-length values are spec-legal, so loAbs may equal hiAbs
 	loAbs := uint64(lo) + uint64(valsOff)
 	hiAbs := uint64(hi) + uint64(valsOff)
 	if hiAbs > uint64(len(msg)) || loAbs > hiAbs {

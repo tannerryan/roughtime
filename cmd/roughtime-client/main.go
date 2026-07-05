@@ -22,11 +22,13 @@
 // Supports Google-Roughtime, IETF Roughtime drafts 01-19, and an experimental
 // ML-DSA-44 post-quantum extension.
 //
-// Server selection from a JSON list defaults to a random sample of three; -all
-// queries every server and -name pins to one. The three are mutually exclusive.
+// Server selection from a JSON list defaults to a random sample of five
+// distinct operators (by registered domain), so no operator can dominate the
+// consensus. -all queries every server and -name pins to one. The three are
+// mutually exclusive.
 //
 // Transport defaults to UDP and falls back to TCP when an address only lists
-// TCP; -tcp forces TCP for Ed25519 servers, while ML-DSA-44 keys always use TCP
+// TCP. -tcp forces TCP for Ed25519 servers, while ML-DSA-44 keys always use TCP
 // regardless of the flag.
 package main
 
@@ -36,7 +38,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	mrand "math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -60,13 +61,13 @@ var (
 	timeout     = flag.Duration("timeout", 500*time.Millisecond, "read/write timeout per attempt")
 	retries     = flag.Int("retries", 3, "max attempts per server (1 = single attempt; backoff 1s × 1.5^(n-1) between attempts, cap 24h)")
 	chainMode   = flag.Bool("chain", true, "chain queries sequentially: each nonce is H(previous reply || fresh random salt)")
-	all         = flag.Bool("all", false, "query every server in the ecosystem (default: random 3)")
+	all         = flag.Bool("all", false, "query every server in the ecosystem (default: random 5)")
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
 // defaultSampleSize is the number of servers randomly sampled from the
 // ecosystem when neither -all nor -name is set.
-const defaultSampleSize = 3
+const defaultSampleSize = 5
 
 // maxEcosystemFileBytes caps the ecosystem JSON read at 4 MiB, fitting
 // MaxEcosystemServers entries of base64-encoded ML-DSA-44 keys.
@@ -156,7 +157,7 @@ func run(ctx context.Context) error {
 		var cr *roughtime.ChainResult
 		cr, qcErr = c.QueryChain(ctx, slices.Concat(servers, servers))
 		if qcErr != nil {
-			// chain-construction failure aborts mid-run; per-row errors print
+			// chain-construction failure aborts mid-run, per-row errors print
 			// below
 			msg := strings.TrimPrefix(qcErr.Error(), "roughtime: ")
 			fmt.Fprintf(os.Stderr, "client: chain aborted: %s\n", roughtime.SanitizeForDisplay(msg))
@@ -204,10 +205,7 @@ func loadServers() ([]roughtime.Server, error) {
 			}
 		}
 		if !*all && len(servers) > defaultSampleSize {
-			mrand.Shuffle(len(servers), func(i, j int) {
-				servers[i], servers[j] = servers[j], servers[i]
-			})
-			servers = servers[:defaultSampleSize]
+			servers = roughtime.SampleByOperator(servers, defaultSampleSize)
 		}
 		return servers, nil
 	}

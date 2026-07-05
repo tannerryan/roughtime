@@ -5,19 +5,6 @@
 
 // Command roughtime is a Roughtime server. It serves Ed25519 over UDP/TCP and
 // the experimental ML-DSA-44 extension over TCP. Run with -h for flags.
-//
-// File layout:
-//   - main.go           — flags, dispatch, serve orchestration
-//   - bootstrap.go      — key files, cert provisioning, refresh loops
-//   - respond.go        — per-request validation and reply signing
-//   - stats.go          — server-wide counters and periodic stats log
-//   - lifecycle.go      — recoverGoroutine and superviseLoop
-//   - metrics.go        — Prometheus metric primitives, registry
-//   - listen_unix.go    — UDP RCVBUF helper shared by Linux and non-Linux
-//   - listen_linux.go   — UDP listener (Linux fast path: SO_REUSEPORT, recvmmsg/sendmmsg)
-//   - listen_other.go   — UDP listener (non-Linux unix fallback, single socket)
-//   - listen_tcp.go     — TCP listener and per-scheme batcher
-//   - listen_metrics.go — optional Prometheus /metrics + /healthz HTTP listener
 package main
 
 import (
@@ -40,7 +27,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-// logger is the package-wide structured logger; configured in serve.
+// logger is the package-wide structured logger, configured in serve.
 var logger *zap.Logger
 
 // Command-line flag bindings.
@@ -67,10 +54,10 @@ var (
 	// greaseRate is the fraction of responses to grease.
 	greaseRate = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
 	// metricsAddr is the host:port for the optional Prometheus /metrics
-	// endpoint; empty disables the listener entirely.
-	metricsAddr = flag.String("metrics-addr", "", "address (host:port) for the Prometheus /metrics endpoint; empty disables. No auth — use 127.0.0.1:PORT to restrict to loopback")
+	// endpoint. Empty disables the listener entirely.
+	metricsAddr = flag.String("metrics-addr", "", "address (host:port) for the Prometheus /metrics endpoint. Empty disables. No auth, so use 127.0.0.1:PORT to restrict to loopback")
 	// statsInterval is the cadence of the periodic stats log.
-	statsInterval = flag.Duration("stats-interval", 60*time.Second, "cadence of the periodic stats log (e.g. 10s, 5m); minimum 1s")
+	statsInterval = flag.Duration("stats-interval", 60*time.Second, "cadence of the periodic stats log (e.g. 10s, 5m). Minimum 1s")
 )
 
 // Server-wide tunable constants.
@@ -79,14 +66,16 @@ const (
 	radius = 3 * time.Second
 	// minRequestSize is the minimum accepted on-the-wire request size.
 	minRequestSize = 1024
-	// maxPacketSize is the IPv4 Ethernet MTU payload (1500 - 20 IP - 8 UDP).
+	// maxPacketSize caps a UDP read at the 1472-byte IPv4 MTU payload. The IPv6
+	// dual-stack payload is 1452, so oversize datagrams are truncated and
+	// dropped.
 	maxPacketSize = 1472
 	// socketRecvBuffer is the kernel UDP receive buffer per worker socket.
 	socketRecvBuffer = 8 * 1024 * 1024
 )
 
-// Not exposed as flags; misconfiguration craters throughput or latency. var so
-// tests can adjust.
+// Not exposed as flags because misconfiguration craters throughput or latency.
+// A var so tests can adjust.
 var (
 	// batchMaxSize bounds the requests-per-batch flush trigger.
 	batchMaxSize = 256
@@ -175,7 +164,7 @@ func serve(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("creating logger: %w", err)
 	}
-	// zap.Sync returns ENOTTY on terminal stderr; ignore
+	// zap.Sync returns ENOTTY on terminal stderr, so ignore it
 	defer func() { _ = base.Sync() }()
 	logger = base.Named("roughtime")
 
@@ -207,7 +196,7 @@ func serve(ctx context.Context) error {
 	certLog := logger.Named("cert")
 	statsLog := logger.Named("stats")
 
-	// listenerCtx fans cancellation across all spawned goroutines; the deferred
+	// listenerCtx fans cancellation across all spawned goroutines. The deferred
 	// wg.Wait ensures serve does not return while any of them is still alive.
 	listenerCtx, cancelListeners := context.WithCancel(ctx)
 	var listenerErr atomic.Pointer[error]
@@ -272,7 +261,7 @@ func serve(ctx context.Context) error {
 		superviseLoop(listenerCtx, statsLog, "statsLoop", func() { statsLoop(listenerCtx, statsLog, edState, pqState) })
 	})
 
-	// UDP carries only Ed25519 (ML-DSA breaks the amplification budget); TCP
+	// UDP carries only Ed25519 (ML-DSA breaks the amplification budget). TCP
 	// carries both. A listener error cancels listenerCtx and serve returns the
 	// first error.
 	if edState != nil {

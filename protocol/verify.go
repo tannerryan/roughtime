@@ -66,9 +66,9 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 		}
 	}
 
-	// drafts 01-11 require top-level VER (4 bytes); 12+ moved it into SREP.
+	// drafts 01-11 require top-level VER (4 bytes). 12+ moved it into SREP.
 	// Pre-12 VER is unsigned, so forging it just produces a signature mismatch
-	// downstream — this is a structural presence/length check only.
+	// downstream. This is a structural presence and length check only.
 	if hasResponseVER(g) {
 		vb, ok := resp[TagVER]
 		if !ok {
@@ -257,7 +257,7 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 		return time.Time{}, 0, errors.New("protocol: missing or invalid ROOT")
 	}
 
-	// drafts 01-02 bind nonce only via SREP.NONC; 03+ echo at top-level but the
+	// drafts 01-02 bind nonce only via SREP.NONC. 03+ echo at top-level but the
 	// Merkle proof already binds it
 	if noncInSREP(g) {
 		srepNonce, ok := srep[TagNONC]

@@ -36,7 +36,13 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 
 	// drafts 01-02 put NONC inside SREP, allowing only one request per batch
 	if noncInSREP(g) && len(requests) > 1 {
-		return nil, errors.New("protocol: drafts 01–02 do not support batched responses")
+		return nil, errors.New("protocol: drafts 01-02 do not support batched responses")
+	}
+
+	// reject a cert/version scheme mismatch before doing tree work
+	if schemeOfGroup(g) != cert.scheme {
+		return nil, fmt.Errorf("protocol: version %s requires %s cert, have %s",
+			ver, schemeOfGroup(g), cert.scheme)
 	}
 
 	leafData := make([][]byte, len(requests))
@@ -49,15 +55,10 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 	}
 	tree := newMerkleTree(g, leafData)
 
-	// zero midpoint uses the moment of signing; tests and replays needing
+	// zero midpoint uses the moment of signing. Tests and replays needing
 	// deterministic output must pass a non-zero midpoint
 	if midpoint.IsZero() {
 		midpoint = time.Now()
-	}
-
-	if schemeOfGroup(g) != cert.scheme {
-		return nil, fmt.Errorf("protocol: version %s requires %s cert, have %s",
-			ver, schemeOfGroup(g), cert.scheme)
 	}
 
 	srepBytes, err := buildSREP(ver, g, requests, midpoint, radius, tree.rootHash)

@@ -39,7 +39,7 @@ const (
 // scrapeBufPool recycles full-response buffers across scrapes.
 var scrapeBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-// listenMetrics serves /metrics and /healthz on addr until ctx is cancelled; a
+// listenMetrics serves /metrics and /healthz on addr until ctx is cancelled. A
 // bind failure returns immediately so the caller can fail fast.
 func listenMetrics(ctx context.Context, addr string) error {
 	log := logger.Named("metrics")
@@ -66,7 +66,7 @@ func listenMetrics(ctx context.Context, addr string) error {
 		zap.String("addr", ln.Addr().String()),
 	)
 
-	// serveCtx fires on parent cancel or on Serve returning early; the deferred
+	// serveCtx fires on parent cancel or on Serve returning early. The deferred
 	// wait ensures Shutdown drains handlers before we return.
 	serveCtx, serveCancel := context.WithCancel(ctx)
 	shutdownDone := make(chan struct{})

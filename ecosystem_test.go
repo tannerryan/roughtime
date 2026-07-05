@@ -15,6 +15,106 @@ import (
 	"github.com/tannerryan/roughtime"
 )
 
+func udpServer(name, addr string) roughtime.Server {
+	return roughtime.Server{Name: name, Addresses: []roughtime.Address{{Transport: "udp", Address: addr}}}
+}
+
+// TestOperatorKey verifies hosts collapse to their registered domain, with a
+// bare-host fallback for IP literals and single-label names, and a name
+// fallback when a server has no addresses.
+func TestOperatorKey(t *testing.T) {
+	cases := map[string]string{
+		"fr.ntp.inutile.pro:2002":       "inutile.pro",
+		"sth1.roughtime.netnod.se:2002": "netnod.se",
+		"127.0.0.1:2002":                "127.0.0.1",
+		"[::1]:2002":                    "::1",
+		"localhost:2002":                "localhost",
+	}
+	for addr, want := range cases {
+		if got := roughtime.OperatorKey(udpServer("s", addr)); got != want {
+			t.Errorf("OperatorKey(%q) = %q, want %q", addr, got, want)
+		}
+	}
+	if got := roughtime.OperatorKey(roughtime.Server{Name: "fallback"}); got != "fallback" {
+		t.Errorf("OperatorKey(no addresses) = %q, want %q", got, "fallback")
+	}
+}
+
+// TestSampleByOperator verifies the sample never repeats an operator.
+func TestSampleByOperator(t *testing.T) {
+	servers := []roughtime.Server{
+		udpServer("fr", "fr.ntp.inutile.pro:2002"),
+		udpServer("es", "es.ntp.inutile.pro:2002"),
+		udpServer("uk", "uk.ntp.inutile.pro:2002"),
+		udpServer("us", "us.ntp.inutile.pro:2002"),
+		udpServer("se", "roughtime.se:2002"),
+	}
+	for range 100 {
+		got := roughtime.SampleByOperator(servers, 3)
+		seen := map[string]bool{}
+		for _, s := range got {
+			k := roughtime.OperatorKey(s)
+			if seen[k] {
+				t.Fatalf("operator %q sampled twice: %v", k, got)
+			}
+			seen[k] = true
+		}
+		// Only two distinct operators exist, so n=3 yields at most two.
+		if len(got) != 2 {
+			t.Fatalf("len = %d, want 2 distinct operators", len(got))
+		}
+	}
+}
+
+// TestSampleByOperatorEdges covers n below the operator count, member validity,
+// and the empty/zero/negative degenerate cases.
+func TestSampleByOperatorEdges(t *testing.T) {
+	servers := []roughtime.Server{
+		udpServer("fr", "fr.ntp.inutile.pro:2002"),
+		udpServer("se", "roughtime.se:2002"),
+		udpServer("nl", "rough.time.nl:2002"),
+	}
+	inInput := func(name string) bool {
+		for _, in := range servers {
+			if in.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+	// n below the operator count returns exactly n distinct, valid members.
+	for range 100 {
+		got := roughtime.SampleByOperator(servers, 2)
+		if len(got) != 2 {
+			t.Fatalf("len = %d, want 2", len(got))
+		}
+		seen := map[string]bool{}
+		for _, s := range got {
+			k := roughtime.OperatorKey(s)
+			if seen[k] {
+				t.Fatalf("operator %q sampled twice", k)
+			}
+			seen[k] = true
+			if !inInput(s.Name) {
+				t.Fatalf("sampled server %q not in input", s.Name)
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		servers []roughtime.Server
+		n       int
+	}{
+		{"empty input", nil, 3},
+		{"n zero", servers, 0},
+		{"n negative", servers, -1},
+	} {
+		if got := roughtime.SampleByOperator(tc.servers, tc.n); len(got) != 0 {
+			t.Errorf("%s: len = %d, want 0", tc.name, len(got))
+		}
+	}
+}
+
 // TestParseEcosystemRoundTrip verifies a minimal ecosystem document parses back
 // to the original Server.
 func TestParseEcosystemRoundTrip(t *testing.T) {

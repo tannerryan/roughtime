@@ -44,7 +44,7 @@ func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 	if effective < socketRecvBuffer {
 		level := zap.WarnLevel
 		// BSD/Darwin default kern.ipc.maxsockbuf is well under socketRecvBuffer
-		// and rarely raised; demote to info there to avoid alarming logs
+		// and rarely raised, so demote to info there to avoid alarming logs
 		if runtime.GOOS != "linux" {
 			level = zap.InfoLevel
 		}

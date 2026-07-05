@@ -73,6 +73,34 @@
       "publicKeyType": "ed25519",
       "publicKey": "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY=",
       "addresses": [{ "protocol": "udp", "address": "rough.time.nl:2002" }]
+    },
+    {
+      "name": "Inutile-Roughtime-FR",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "caVakKYAW26s2mDSfY21nI1ctN/w3kPBL8oGRAqLxRg=",
+      "addresses": [{ "protocol": "udp", "address": "fr.ntp.inutile.pro:2002" }]
+    },
+    {
+      "name": "Inutile-Roughtime-ES",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "/z+14WcSjMU4evfyQoMKU8GGa5KSF9sW69tu3c+KBXs=",
+      "addresses": [{ "protocol": "udp", "address": "es.ntp.inutile.pro:2002" }]
+    },
+    {
+      "name": "Inutile-Roughtime-UK",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "bUjS5xMA6FBRQzhriEs71uyQu0+JDf/TeZ0IFNTdJZ0=",
+      "addresses": [{ "protocol": "udp", "address": "uk.ntp.inutile.pro:2002" }]
+    },
+    {
+      "name": "Inutile-Roughtime-US",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "V7hnCRDc7iR2uv0VrmGu37Yn3ovdHjcDW8oiFGC7hh4=",
+      "addresses": [{ "protocol": "udp", "address": "us.ntp.inutile.pro:2002" }]
     }
   ]
 }

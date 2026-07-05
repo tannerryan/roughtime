@@ -2,11 +2,11 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Package roughtime is the high-level Roughtime client for Go applications.
-// Most callers want this package; the protocol package is the low-level wire
+// Most callers want this package. The protocol package is the low-level wire
 // layer used internally and by diagnostic tools.
 //
-// Covers draft-ietf-ntp-roughtime 01–19, Google-Roughtime, and an experimental
-// ML-DSA-44 post-quantum wire variant.
+// It covers draft-ietf-ntp-roughtime 01-19, Google-Roughtime, and an
+// experimental ML-DSA-44 post-quantum wire variant.
 //
 // The zero [Client] is usable and safe for concurrent use:
 //
@@ -17,13 +17,13 @@
 //	    Addresses: []roughtime.Address{{Transport: "udp", Address: "time.txryan.com:2002"}},
 //	})
 //
-// [Client.QueryAll] fans out concurrently; [Consensus] aggregates drift across
-// the result slice. [Client.QueryChain] runs causal-chained queries;
+// [Client.QueryAll] fans out concurrently and [Consensus] aggregates drift
+// across the result slice. [Client.QueryChain] runs causal-chained queries, and
 // [Client.QueryChainWithNonce] seeds the chain for document timestamping.
 // [(*ChainResult).Proof] yields a [*Proof] for offline audit via
-// [(*Proof).MarshalGzip] / [(*Proof).MarshalJSON] and [ParseProof]. [Verify]
-// re-validates a single stored request/reply pair; [ParseEcosystem] decodes the
-// ecosystem JSON.
+// [(*Proof).MarshalGzip], [(*Proof).MarshalJSON], and [ParseProof]. [Verify]
+// re-validates a single stored request/reply pair, and [ParseEcosystem] decodes
+// the ecosystem JSON.
 package roughtime
 
 import (
@@ -106,7 +106,7 @@ type Client struct {
 	// [DefaultTimeout] when zero.
 	Timeout time.Duration
 	// MaxAttempts is the per-server attempt cap with 1s by 1.5^(n-1) backoff
-	// capped at 24h.
+	// capped at 24h. Zero or one means a single attempt with no retry.
 	MaxAttempts int
 	// Concurrency caps in-flight queries in [Client.QueryAll] and defaults to
 	// [MaxQueryAllConcurrency] when zero.

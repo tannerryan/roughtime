@@ -279,7 +279,7 @@ func TestGreaseDropTagSubTagsReachable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode grease output: %v", err)
 		}
-		// changed SREP/CERT = sub-tag drop; missing = top-level
+		// changed SREP/CERT means a sub-tag drop, missing means top-level
 		switch {
 		case outMsg[TagSREP] == nil, outMsg[TagCERT] == nil,
 			outMsg[TagPATH] == nil && origMsg[TagPATH] != nil,
@@ -320,6 +320,38 @@ func TestGreaseDoesNotPanicMLDSA44(t *testing.T) {
 	}
 	for range 50 {
 		Grease(replies[0], VersionMLDSA44)
+	}
+}
+
+// TestGreaseCorruptSigMLDSA44 verifies greaseCorruptSig breaks verification of
+// an ML-DSA-44 reply, matching the Ed25519 coverage in TestGreaseCorruptSig.
+func TestGreaseCorruptSigMLDSA44(t *testing.T) {
+	cert, rootPK := testPQCert(t)
+	versions := []Version{VersionMLDSA44}
+	srv := ComputeSRV(rootPK)
+	nonce, request, err := CreateRequest(versions, rand.Reader, srv)
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	parsed, err := ParseRequest(request)
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), 3*time.Second, cert)
+	if err != nil {
+		t.Fatalf("CreateReplies: %v", err)
+	}
+	if _, _, err := VerifyReply(versions, replies[0], rootPK, nonce, request); err != nil {
+		t.Fatalf("pristine reply failed to verify: %v", err)
+	}
+	for range 50 {
+		cp := append([]byte(nil), replies[0]...)
+		if !greaseCorruptSig(cp, VersionMLDSA44) {
+			t.Fatal("greaseCorruptSig returned false for a reply carrying SIG")
+		}
+		if _, _, err := VerifyReply(versions, cp, rootPK, nonce, request); err == nil {
+			t.Fatal("corrupted ML-DSA-44 reply still verifies")
+		}
 	}
 }
 

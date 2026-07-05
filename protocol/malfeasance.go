@@ -96,8 +96,8 @@ func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	if len(data) > maxMalfeasanceReportBytes {
 		return nil, fmt.Errorf("protocol: malfeasance report is %d bytes (max %d)", len(data), maxMalfeasanceReportBytes)
 	}
-	// legacy: top-level "nonces" with string entries; drafts-12+: object
-	// entries
+	// legacy format uses top-level "nonces" with string entries, drafts-12+ use
+	// object entries
 	var probe struct {
 		Nonces    json.RawMessage   `json:"nonces"`
 		Responses []json.RawMessage `json:"responses"`

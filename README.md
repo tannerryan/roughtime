@@ -3,8 +3,6 @@
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/tannerryan/roughtime)](https://pkg.go.dev/github.com/tannerryan/roughtime)
 [![GitHub
 license](https://img.shields.io/github/license/tannerryan/roughtime.svg?style=flat-square)](https://github.com/tannerryan/roughtime/blob/main/LICENSE)
-[![Go Report
-Card](https://goreportcard.com/badge/github.com/tannerryan/roughtime?style=flat-square)](https://goreportcard.com/report/github.com/tannerryan/roughtime)
 
 A Go implementation of
 [Roughtime](https://datatracker.ietf.org/doc/draft-ietf-ntp-roughtime/) covering
@@ -66,14 +64,14 @@ roughtime -pq-keygen /path/to/pq-root.key
 roughtime -root-key-file /path/to/root.key -pq-root-key-file /path/to/pq-root.key
 ```
 
-| Flag                | Default | Description                                    |
-| ------------------- | ------- | ---------------------------------------------- |
-| `-port`             | 2002    | Listen port (UDP and TCP)                      |
-| `-root-key-file`    |         | Ed25519 root seed (UDP + TCP Ed25519)          |
-| `-pq-root-key-file` |         | ML-DSA-44 root seed (TCP ML-DSA-44)            |
-| `-grease-rate`      | 0.01    | Fraction of responses to grease (0 disables)   |
-| `-log-level`        | info    | `debug`, `info`, `warn`, or `error`            |
-| `-metrics-addr`     |         | `host:port` for Prometheus `/metrics` (no auth)|
+| Flag                | Default | Description                                                      |
+| ------------------- | ------- | ---------------------------------------------------------------- |
+| `-port`             | 2002    | Listen port (UDP and TCP)                                        |
+| `-root-key-file`    |         | Ed25519 root seed (UDP + TCP Ed25519)                            |
+| `-pq-root-key-file` |         | ML-DSA-44 root seed (TCP ML-DSA-44)                              |
+| `-grease-rate`      | 0.01    | Fraction of responses to grease (0 disables)                     |
+| `-log-level`        | info    | `debug`, `info`, `warn`, or `error`                              |
+| `-metrics-addr`     |         | `host:port` for Prometheus `/metrics` (no auth)                  |
 | `-stats-interval`   | 60s     | Cadence of the periodic stats log (e.g. `10s`, `5m`); minimum 1s |
 
 ### Architecture
@@ -134,26 +132,26 @@ bytes for Ed25519, 1312 bytes for ML-DSA-44.
 ### client
 
 Queries one or more servers and prints authenticated timestamps alongside clock
-drift. With `-servers`, it samples 3 entries (or `-all`) and queries each twice
-to surface pairwise inconsistencies. Multi-server queries are chained by
-default.
+drift. With `-servers`, it samples 5 entries from distinct operators (or `-all`)
+and queries each twice to surface pairwise inconsistencies. Multi-server queries
+are chained by default.
 
 ```bash
 go run ./cmd/roughtime-client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
 go run ./cmd/roughtime-client -servers ecosystem.json [-all] [-tcp] [-chain=false]
 ```
 
-| Flag       | Default | Description                                                     |
-| ---------- | ------- | --------------------------------------------------------------- |
-| `-servers` |         | JSON server list (mutually exclusive with `-addr`)              |
-| `-addr`    |         | Single server `host:port` (requires `-pubkey`)                  |
-| `-pubkey`  |         | Root public key (base64 or hex) for `-addr`                     |
-| `-name`    |         | With `-servers`, query only the named server                    |
-| `-tcp`     | false   | Force TCP; ML-DSA-44 keys always use TCP                        |
-| `-all`     | false   | Query every entry in `-servers` (default samples 3)             |
-| `-chain`   | true    | Causally chain queries (sequential; nonce derives from prev)    |
-| `-timeout` | 500ms   | Read/write timeout per attempt                                  |
-| `-retries` | 3       | Maximum attempts per server (1s × 1.5^(n-1) backoff)            |
+| Flag       | Default | Description                                                  |
+| ---------- | ------- | ------------------------------------------------------------ |
+| `-servers` |         | JSON server list (mutually exclusive with `-addr`)           |
+| `-addr`    |         | Single server `host:port` (requires `-pubkey`)               |
+| `-pubkey`  |         | Root public key (base64 or hex) for `-addr`                  |
+| `-name`    |         | With `-servers`, query only the named server                 |
+| `-tcp`     | false   | Force TCP; ML-DSA-44 keys always use TCP                     |
+| `-all`     | false   | Query every entry in `-servers` (default samples 5)          |
+| `-chain`   | true    | Causally chain queries (sequential; nonce derives from prev) |
+| `-timeout` | 500ms   | Read/write timeout per attempt                               |
+| `-retries` | 3       | Maximum attempts per server (1s × 1.5^(n-1) backoff)         |
 
 ### debug
 
@@ -164,14 +162,14 @@ signatures, and delegation certificate.
 go run ./cmd/roughtime-debug -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA= [-tcp] [-ver draft-12]
 ```
 
-| Flag       | Default | Description                                          |
-| ---------- | ------- | ---------------------------------------------------- |
-| `-addr`    |         | Server `host:port`                                   |
-| `-pubkey`  |         | Root public key (base64 or hex)                      |
-| `-tcp`     | false   | Force TCP; ML-DSA-44 keys always use TCP             |
-| `-ver`     |         | Probe only one version (e.g. `draft-12`, `Google`)   |
-| `-timeout` | 500ms   | Per-version probe timeout                            |
-| `-retries` | 3       | Maximum attempts per version                         |
+| Flag       | Default | Description                                        |
+| ---------- | ------- | -------------------------------------------------- |
+| `-addr`    |         | Server `host:port`                                 |
+| `-pubkey`  |         | Root public key (base64 or hex)                    |
+| `-tcp`     | false   | Force TCP; ML-DSA-44 keys always use TCP           |
+| `-ver`     |         | Probe only one version (e.g. `draft-12`, `Google`) |
+| `-timeout` | 500ms   | Per-version probe timeout                          |
+| `-retries` | 3       | Maximum attempts per version                       |
 
 ### bench
 
@@ -299,21 +297,25 @@ Ecosystem (chained, queried twice in opposite halves):
 ```text
 $ go run ./cmd/roughtime-client -servers ecosystem.json -all
 NAME                            ADDRESS                                    VERSION    MIDPOINT              RADIUS    RTT     DRIFT     STATUS
-time.txryan.com                 udp://time.txryan.com:2002                 draft-12   2026-04-28T00:57:28Z  ±3s       49ms    -290ms    in-sync
-time.txryan.com-pq              tcp://time.txryan.com:2002                 ml-dsa-44  2026-04-28T00:57:28Z  ±3s       50ms    -387ms    in-sync
-Cloudflare-Roughtime-2          udp://roughtime.cloudflare.com:2003        draft-11   2026-04-28T00:57:28Z  ±1s       17ms    -423ms    in-sync
-roughtime.se                    udp://roughtime.se:2002                    draft-12   2026-04-28T00:57:28Z  ±1s       146ms   -506ms    in-sync
-sth1.roughtime.netnod.se        udp://sth1.roughtime.netnod.se:2002        draft-07   2026-04-28T00:57:28Z  ±66µs     139ms   12ms      out-of-sync
-sth2.roughtime.netnod.se        udp://sth2.roughtime.netnod.se:2002        draft-07   2026-04-28T00:57:28Z  ±41µs     137ms   10ms      out-of-sync
-time.teax.dev                   udp://time.teax.dev:2002                   draft-12   2026-04-28T00:57:28Z  ±3s       156ms   -943ms    in-sync
-roughtime.sturdystatistics.com  udp://roughtime.sturdystatistics.com:2002  draft-12   2026-04-28T00:57:29Z  ±10s      184ms   -120ms    in-sync
-TimeNL-Roughtime                udp://rough.time.nl:2002                   draft-12   2026-04-28T00:57:29Z  ±3s       148ms   -290ms    in-sync
+time.txryan.com                 udp://time.txryan.com:2002                 draft-12   2026-07-05T14:06:29Z  ±3s       49ms    -461ms    in-sync
+time.txryan.com-pq              tcp://time.txryan.com:2002                 ml-dsa-44  2026-07-05T14:06:29Z  ±3s       49ms    -557ms    in-sync
+Cloudflare-Roughtime-2          udp://roughtime.cloudflare.com:2003        draft-11   2026-07-05T14:06:29Z  ±1s       12ms    -591ms    in-sync
+roughtime.se                    udp://roughtime.se:2002                    draft-12   2026-07-05T14:06:29Z  ±1s       133ms   -667ms    in-sync
+sth1.roughtime.netnod.se        udp://sth1.roughtime.netnod.se:2002        draft-07   2026-07-05T14:06:29Z  ±33µs     132ms   41ms      out-of-sync
+sth2.roughtime.netnod.se        udp://sth2.roughtime.netnod.se:2002        draft-07   2026-07-05T14:06:29Z  ±25µs     131ms   40ms      out-of-sync
+time.teax.dev                   udp://time.teax.dev:2002                   draft-12   2026-07-05T14:06:30Z  ±3s       140ms   -76ms     in-sync
+roughtime.sturdystatistics.com  udp://roughtime.sturdystatistics.com:2002  draft-12   2026-07-05T14:06:30Z  ±10s      164ms   -235ms    in-sync
+TimeNL-Roughtime                udp://rough.time.nl:2002                   draft-12   2026-07-05T14:06:30Z  ±3s       122ms   -381ms    in-sync
+Inutile-Roughtime-FR            udp://fr.ntp.inutile.pro:2002              draft-12   2026-07-05T14:06:30Z  ±3s       142ms   -517ms    in-sync
+Inutile-Roughtime-ES            udp://es.ntp.inutile.pro:2002              draft-12   2026-07-05T14:06:30Z  ±3s       134ms   -657ms    in-sync
+Inutile-Roughtime-UK            udp://uk.ntp.inutile.pro:2002              draft-12   2026-07-05T14:06:30Z  ±3s       120ms   -786ms    in-sync
+Inutile-Roughtime-US            udp://us.ntp.inutile.pro:2002              draft-12   2026-07-05T14:06:30Z  ±3s       22ms    -860ms    in-sync
 
-9/9 servers responded
-Consensus drift:    -290ms (median of 9 samples)
-Corrected local:    2026-04-28T00:57:30Z (now + median drift)
-Drift spread:       955ms (min=-943ms, max=12ms)
-Chain:              ok (18 links verified)
+13/13 servers responded
+Consensus drift:    -517ms (median of 13 samples)
+Corrected local:    2026-07-05T14:06:31Z (now + median drift)
+Drift spread:       901ms (min=-860ms, max=41ms)
+Chain:              ok (26 links verified)
 ```
 
 ### debug

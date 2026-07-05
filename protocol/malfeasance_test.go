@@ -218,7 +218,7 @@ func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 }
 
 // TestMalfeasanceReportLegacyVerifyFails pins that drafts 10-11 chains cannot
-// re-verify after round-trip; the legacy format drops per-link request bytes.
+// re-verify after round-trip. The legacy format drops per-link request bytes.
 func TestMalfeasanceReportLegacyVerifyFails(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft10, 3)
 	data, err := c.MalfeasanceReport()

@@ -25,7 +25,7 @@ func Grease(reply []byte, ver Version) []byte {
 			return out
 		}
 	}
-	// mode 0 or fallback; if no SIG location is found, fall back to
+	// mode 0 or fallback. If no SIG location is found, fall back to
 	// undefined-tag grease so the reply is never returned unchanged
 	if greaseCorruptSig(reply, ver) {
 		return reply
@@ -108,7 +108,7 @@ func greaseDropTag(reply []byte, ver Version) []byte {
 	}
 	scopes := []uint32{0, TagSREP, TagCERT}
 	mrand.Shuffle(len(scopes), func(i, j int) { scopes[i], scopes[j] = scopes[j], scopes[i] })
-	// drop only tags whose absence breaks verification; NONC echo and TYPE are
+	// drop only tags whose absence breaks verification. NONC echo and TYPE are
 	// tolerated, so neither is a valid drop target
 	for _, scope := range scopes {
 		if scope == 0 {

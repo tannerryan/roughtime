@@ -29,6 +29,7 @@ FUZZ_TARGETS = \
     FuzzParseMalfeasanceReport:./protocol/ \
     FuzzChainNonce:./protocol/ \
     FuzzChainVerify:./protocol/ \
+    FuzzVerifyMerkle:./protocol/ \
     FuzzValidateRequest:./cmd/roughtime/ \
     FuzzServeOnce:./cmd/roughtime/ \
     FuzzReadTCPFrame:./cmd/roughtime/ \

@@ -30,7 +30,7 @@ type ChainLink struct {
 	Rand []byte
 	// PublicKey is the server's long-term key.
 	PublicKey []byte
-	// Nonce is the nonce sent in Request; not serialized.
+	// Nonce is the nonce sent in Request. It is not serialized.
 	Nonce []byte
 	// Request is the full request packet.
 	Request []byte
@@ -39,7 +39,7 @@ type ChainLink struct {
 }
 
 // Chain accumulates sequential Roughtime queries for causal ordering and
-// malfeasance reporting; not safe for concurrent use.
+// malfeasance reporting. It is not safe for concurrent use.
 type Chain struct {
 	// Links holds the chain's queries in order.
 	Links []ChainLink
@@ -72,7 +72,7 @@ func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (non
 	return nonce, rand, nil
 }
 
-// chainHasher returns the chain-nonce hasher; SHA-512 is used for every group
+// chainHasher returns the chain-nonce hasher. SHA-512 is used for every group
 // since drafts 01-04 require up to 64 bytes.
 func chainHasher(_ wireGroup) hash.Hash {
 	return sha512.New()
@@ -188,7 +188,7 @@ func (c *Chain) Verify() error {
 		}
 	}
 
-	// require lower[i] <= upper[j] for all i < j; running max of lower keeps
+	// require lower[i] <= upper[j] for all i < j. A running max of lower keeps
 	// this O(n)
 	maxLowerIdx := 0
 	for j := 1; j < len(results); j++ {

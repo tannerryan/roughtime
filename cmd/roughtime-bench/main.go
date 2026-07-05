@@ -24,11 +24,6 @@
 // Key length selects the suite: 32 bytes Ed25519, 1312 bytes ML-DSA-44
 // (experimental, always TCP). -tcp forces TCP for Ed25519.
 //
-// File layout:
-//   - main.go    — flags, dispatch, worker fan-out
-//   - worker.go  — per-worker UDP/TCP send-recv loops + nonce/sample helpers
-//   - report.go  — aggregation and latency-percentile output
-//
 // Example:
 //
 //	go run ./cmd/roughtime-bench -addr server:2002 -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s
@@ -54,11 +49,11 @@ import (
 // addr is the server host:port flag.
 var addr = flag.String("addr", "127.0.0.1:2002", "server host:port")
 
-// pubkey is the root public key flag (base64 or hex; length selects suite).
-var pubkey = flag.String("pubkey", "", "root public key (base64 or hex); 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
+// pubkey is the root public key flag (base64 or hex, length selects suite).
+var pubkey = flag.String("pubkey", "", "root public key (base64 or hex). 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
 
-// useTCP forces TCP transport for Ed25519; ML-DSA-44 always uses TCP.
-var useTCP = flag.Bool("tcp", false, "use TCP transport; ML-DSA-44 keys always use TCP")
+// useTCP forces TCP transport for Ed25519. ML-DSA-44 always uses TCP.
+var useTCP = flag.Bool("tcp", false, "use TCP transport. ML-DSA-44 keys always use TCP")
 
 // workers is the concurrent client socket count flag.
 var workers = flag.Int("workers", 64, "concurrent client sockets")
@@ -116,7 +111,7 @@ func main() {
 
 	fmt.Fprintln(os.Stderr, "WARNING: closed-loop load generator; do not target servers you do not own")
 
-	// under -verify the bench is CPU-bound; cap default workers
+	// under -verify the bench is CPU-bound, so cap default workers
 	if *verify && !flagSet("workers") {
 		if maxW := runtime.NumCPU() * 2; *workers > maxW {
 			fmt.Fprintf(os.Stderr, "bench: -verify is CPU-bound; capping workers %d -> %d (override with -workers)\n", *workers, maxW)

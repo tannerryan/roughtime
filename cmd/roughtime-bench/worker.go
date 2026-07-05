@@ -107,7 +107,11 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
-		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+		// absolute deadline set before timing, so SetDeadline stays out of the
+		// RTT
+		deadline := time.Now().Add(timeout)
+		_ = conn.SetWriteDeadline(deadline)
+		_ = conn.SetReadDeadline(deadline)
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -118,7 +122,6 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			continue
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buf)
 		rtt := time.Since(start)
 		if err != nil {
@@ -169,8 +172,8 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		return false
 	}
 
-	// reconnect closes conn and redials; returns false if the redial fails. No
-	// exponential backoff: this bench is a load generator, not a conformant
+	// reconnect closes conn and redials, returning false if the redial fails.
+	// No exponential backoff: this bench is a load generator, not a conformant
 	// client.
 	reconnect := func() bool {
 		conn.Close()
@@ -188,7 +191,11 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
-		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+		// one absolute deadline covers both reads and stays out of the measured
+		// RTT
+		deadline := time.Now().Add(timeout)
+		_ = conn.SetWriteDeadline(deadline)
+		_ = conn.SetReadDeadline(deadline)
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
@@ -203,7 +210,6 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		}
 
 		hdr := replyBuf[:protocol.PacketHeaderSize]
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
@@ -224,7 +230,6 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			continue
 		}
 		pkt := replyBuf[:protocol.PacketHeaderSize+int(bodyLen)]
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		if _, err := io.ReadFull(conn, pkt[protocol.PacketHeaderSize:]); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)

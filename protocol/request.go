@@ -16,7 +16,7 @@ import (
 	"filippo.io/mldsa"
 )
 
-// Request holds the parsed fields of a client request; sub-slices alias
+// Request holds the parsed fields of a client request. Sub-slices alias
 // RawPacket.
 type Request struct {
 	// Nonce is the request nonce.
@@ -78,7 +78,7 @@ func ParseRequest(raw []byte) (*Request, error) {
 	}
 	maxGroup := wireGroupOf(maxVer, false)
 
-	// drafts 10-11 forbid duplicates; drafts 12+ require strictly ascending
+	// drafts 10-11 forbid duplicates, drafts 12+ require strictly ascending
 	if maxGroup >= groupD12 {
 		for i := 1; i < len(req.Versions); i++ {
 			if req.Versions[i] <= req.Versions[i-1] {
@@ -96,7 +96,7 @@ func ParseRequest(raw []byte) (*Request, error) {
 	}
 
 	// mixed-version VER lists can span both nonce sizes (64 for drafts 01-04,
-	// 32 for 05+); accept if the nonce matches any offered version
+	// 32 for 05+), so accept if the nonce matches any offered version
 	nonceOK := false
 	if len(req.Versions) == 0 {
 		nonceOK = len(req.Nonce) == nonceSize(groupGoogle)
@@ -112,7 +112,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, fmt.Errorf("protocol: nonce length %d matches no offered version", len(req.Nonce))
 	}
 
-	// drafts 10+ require SRV to be exactly 32 bytes; older drafts MUST ignore
+	// drafts 10+ require SRV to be exactly 32 bytes. Older drafts MUST ignore
+	// it
 	if maxGroup >= groupD10 {
 		if req.SRV != nil && len(req.SRV) != 32 {
 			return nil, fmt.Errorf("protocol: SRV length %d invalid for drafts 10+ (want 32)", len(req.SRV))
@@ -121,7 +122,7 @@ func ParseRequest(raw []byte) (*Request, error) {
 		req.SRV = nil
 	}
 
-	// drafts 10+ require ZZZZ to be zero; enforced only on drafts 12+ so
+	// drafts 10+ require ZZZZ to be zero. We enforce it only on drafts 12+ so
 	// non-conformant 10-11 peers still interop
 	if maxGroup >= groupD12 {
 		if pad, ok := msg[TagZZZZ]; ok {
@@ -167,7 +168,7 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 }
 
 // ComputeSRV returns the SRV tag value, the first 32 bytes of SHA-512(0xff ||
-// rootPK).
+// rootPK). rootPK is an Ed25519 key or, for the PQ variant, an ML-DSA-44 key.
 func ComputeSRV(rootPK []byte) []byte {
 	if len(rootPK) != ed25519.PublicKeySize && len(rootPK) != mldsa.MLDSA44PublicKeySize {
 		return nil
@@ -236,7 +237,7 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		}
 	}
 
-	// IETF wire size is 1024 including the 12-byte header; Google has no header
+	// IETF wire size is 1024 including the 12-byte header. Google has no header
 	target := 1024
 	if usesRoughtimHeader(g) {
 		target = 1012
