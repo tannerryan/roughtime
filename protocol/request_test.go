@@ -759,6 +759,19 @@ func TestCreateRequestWithNonceWithSRV(t *testing.T) {
 	}
 }
 
+// TestCreateRequestPadsMixedPQOffer verifies mixed offers still satisfy the PQ
+// no-amplification request size.
+func TestCreateRequestPadsMixedPQOffer(t *testing.T) {
+	versions := []Version{VersionDraft12, VersionMLDSA44}
+	_, req, err := CreateRequest(versions, rand.Reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req) != 8192 {
+		t.Fatalf("mixed PQ request length = %d, want 8192", len(req))
+	}
+}
+
 // TestCreateRequestWithNonceRejectsWrongSize verifies CreateRequestWithNonce
 // rejects nonces of wrong size.
 func TestCreateRequestWithNonceRejectsWrongSize(t *testing.T) {
@@ -845,6 +858,25 @@ func TestPQComputeSRV(t *testing.T) {
 	}
 }
 
+// TestCreateRequestMLDSA44PadsToAmplificationBudget verifies the PQ request is
+// large enough for its much larger certificate and signatures.
+func TestCreateRequestMLDSA44PadsToAmplificationBudget(t *testing.T) {
+	nonce, req, err := CreateRequest([]Version{VersionMLDSA44}, rand.Reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nonce) != 32 || len(req) != 8192 {
+		t.Fatalf("nonce=%d req=%d, want 32/8192", len(nonce), len(req))
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Nonce) != 32 {
+		t.Fatalf("parsed nonce length = %d, want 32", len(parsed.Nonce))
+	}
+}
+
 // FuzzParseRequest fuzzes ParseRequest for panic-safety on arbitrary bytes.
 func FuzzParseRequest(f *testing.F) {
 	_, googleReq, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
@@ -862,4 +894,17 @@ func FuzzParseRequest(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ParseRequest(data) //nolint:errcheck // fuzz target tests for panics
 	})
+}
+
+// TestCreateRequestRejectsTooManyVersions verifies the builder caps the VER
+// list at maxVersionList, symmetric with ParseRequest.
+func TestCreateRequestRejectsTooManyVersions(t *testing.T) {
+	versions := make([]Version, maxVersionList+1)
+	for i := range versions {
+		versions[i] = VersionDraft01 + Version(i)
+	}
+	_, _, err := CreateRequest(versions, rand.Reader, nil)
+	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("max")) {
+		t.Fatalf("want too-many-versions error, got %v", err)
+	}
 }

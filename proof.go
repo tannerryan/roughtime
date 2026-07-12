@@ -6,6 +6,8 @@ package roughtime
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +26,19 @@ var gzipMagic = []byte{0x1f, 0x8b}
 // signed witness queries.
 type Proof struct {
 	chain *protocol.Chain
+}
+
+// proofReport is the modern malfeasance-report JSON shape.
+type proofReport struct {
+	Responses []proofReportLink `json:"responses"`
+}
+
+// proofReportLink is one serialized proof link.
+type proofReportLink struct {
+	Rand      string `json:"rand,omitempty"`
+	PublicKey string `json:"publicKey"`
+	Request   string `json:"request"`
+	Response  string `json:"response"`
 }
 
 // ProofLink is the per-witness attestation data exposed by [(*Proof).Links].
@@ -55,7 +70,7 @@ func ParseProof(data []byte) (*Proof, error) {
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: proof gunzip: %w", err)
 		}
-		defer gr.Close()
+		defer func() { _ = gr.Close() }()
 		inflated, err := io.ReadAll(io.LimitReader(gr, MaxProofBytes+1))
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: proof gunzip: %w", err)
@@ -78,7 +93,7 @@ func (p *Proof) MarshalGzip() ([]byte, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("roughtime: nil proof")
 	}
-	report, err := p.chain.MalfeasanceReport()
+	report, err := p.modernReport()
 	if err != nil {
 		return nil, fmt.Errorf("roughtime: %w", err)
 	}
@@ -96,7 +111,47 @@ func (p *Proof) MarshalJSON() ([]byte, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("roughtime: nil proof")
 	}
-	return p.chain.MalfeasanceReport()
+	return p.modernReport()
+}
+
+// modernReport serializes every link with request and public-key bytes so
+// ParseProof can verify the result offline for every supported version.
+func (p *Proof) modernReport() ([]byte, error) {
+	if p == nil || p.chain == nil {
+		return nil, errors.New("nil proof")
+	}
+	if len(p.chain.Links) == 0 {
+		return nil, errors.New("empty proof")
+	}
+	report := proofReport{Responses: make([]proofReportLink, len(p.chain.Links))}
+	for i, link := range p.chain.Links {
+		if len(link.PublicKey) == 0 {
+			return nil, fmt.Errorf("link %d has no public key", i)
+		}
+		if len(link.Request) == 0 {
+			return nil, fmt.Errorf("link %d has no request", i)
+		}
+		if len(link.Response) == 0 {
+			return nil, fmt.Errorf("link %d has no response", i)
+		}
+		rl := proofReportLink{
+			PublicKey: base64.StdEncoding.EncodeToString(link.PublicKey),
+			Request:   base64.StdEncoding.EncodeToString(link.Request),
+			Response:  base64.StdEncoding.EncodeToString(link.Response),
+		}
+		if link.Rand != nil {
+			rl.Rand = base64.StdEncoding.EncodeToString(link.Rand)
+		}
+		report.Responses[i] = rl
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxProofBytes {
+		return nil, fmt.Errorf("proof is %d bytes (max %d)", len(data), MaxProofBytes)
+	}
+	return data, nil
 }
 
 // Verify checks signatures, nonce linkage, and causal ordering across the
@@ -154,9 +209,15 @@ func (p *Proof) Trust(trusted []Server) error {
 	}
 	known := make(map[string]struct{}, len(trusted))
 	for _, s := range trusted {
+		if len(s.PublicKey) == 0 {
+			continue
+		}
 		known[string(s.PublicKey)] = struct{}{}
 	}
 	for i, link := range p.chain.Links {
+		if len(link.PublicKey) == 0 {
+			return fmt.Errorf("roughtime: link %d has no public key", i)
+		}
 		if _, ok := known[string(link.PublicKey)]; !ok {
 			return fmt.Errorf("roughtime: link %d signed by untrusted key", i)
 		}
@@ -169,6 +230,9 @@ func (p *Proof) Trust(trusted []Server) error {
 func (p *Proof) SeedNonce() ([]byte, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("roughtime: nil proof")
+	}
+	if len(p.chain.Links) == 0 {
+		return nil, errors.New("roughtime: empty proof")
 	}
 	req, err := protocol.ParseRequest(p.chain.Links[0].Request)
 	if err != nil {
@@ -184,45 +248,18 @@ func (p *Proof) AttestationBound() (earliest, latest time.Time, err error) {
 	if p == nil || p.chain == nil {
 		return time.Time{}, time.Time{}, errors.New("roughtime: nil proof")
 	}
-	if err := p.chain.Verify(); err != nil {
-		return time.Time{}, time.Time{}, err
-	}
-	bounds, err := p.linkBounds()
+	bounds, err := p.chain.VerifyBounds()
 	if err != nil {
 		return time.Time{}, time.Time{}, err
 	}
-	earliest = bounds[0].midpoint.Add(-bounds[0].radius)
-	latest = bounds[0].midpoint.Add(bounds[0].radius)
+	earliest = bounds[0].Midpoint.Add(-bounds[0].Radius)
+	latest = bounds[0].Midpoint.Add(bounds[0].Radius)
 	for _, b := range bounds[1:] {
-		if hi := b.midpoint.Add(b.radius); hi.Before(latest) {
+		if hi := b.Midpoint.Add(b.Radius); hi.Before(latest) {
 			latest = hi
 		}
 	}
 	return earliest, latest, nil
-}
-
-// linkBound is the verified (midpoint, radius) for one chain link.
-type linkBound struct {
-	midpoint time.Time
-	radius   time.Duration
-}
-
-// linkBounds verifies each link and returns its midpoint and radius without
-// per-link byte copies.
-func (p *Proof) linkBounds() ([]linkBound, error) {
-	out := make([]linkBound, len(p.chain.Links))
-	for i, link := range p.chain.Links {
-		req, err := protocol.ParseRequest(link.Request)
-		if err != nil {
-			return nil, fmt.Errorf("roughtime: link %d: parse request: %w", i, err)
-		}
-		mid, rad, err := protocol.VerifyReply(linkVersions(req), link.Response, link.PublicKey, req.Nonce, link.Request)
-		if err != nil {
-			return nil, fmt.Errorf("roughtime: link %d: %w", i, err)
-		}
-		out[i] = linkBound{midpoint: mid, radius: rad}
-	}
-	return out, nil
 }
 
 // linkVersions falls back to VersionGoogle for VER-less requests, matching

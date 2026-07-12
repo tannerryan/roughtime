@@ -42,7 +42,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -87,12 +86,16 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx); err != nil {
+	err := run(ctx)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "client: %s\n", err)
-		// follow the 128+signum convention when interrupted by a signal
-		if errors.Is(ctx.Err(), context.Canceled) {
-			os.Exit(130)
-		}
+	}
+	// exit non-zero when interrupted by a signal, even if partial results
+	// printed
+	if errors.Is(ctx.Err(), context.Canceled) {
+		os.Exit(130)
+	}
+	if err != nil {
 		os.Exit(1)
 	}
 }
@@ -101,6 +104,9 @@ func main() {
 func validateFlags() error {
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout %s must be > 0", *timeout)
+	}
+	if flag.NArg() > 0 {
+		return fmt.Errorf("unexpected positional args: %v", flag.Args())
 	}
 	if *retries < 1 {
 		return fmt.Errorf("-retries %d must be >= 1", *retries)
@@ -152,20 +158,14 @@ func run(ctx context.Context) error {
 	var proof *roughtime.Proof
 	var qcErr error
 	if *chainMode {
-		// two passes link every server twice so each appears with both a
-		// preceding and a following neighbour in the chain
 		var cr *roughtime.ChainResult
-		cr, qcErr = c.QueryChain(ctx, slices.Concat(servers, servers))
-		if qcErr != nil {
-			// chain-construction failure aborts mid-run, per-row errors print
-			// below
-			msg := strings.TrimPrefix(qcErr.Error(), "roughtime: ")
-			fmt.Fprintf(os.Stderr, "client: chain aborted: %s\n", roughtime.SanitizeForDisplay(msg))
+		cr, qcErr = c.QueryChain(ctx, servers)
+		if cr != nil {
+			results = cr.Results
+			// ignore the empty-chain error so a fully-failed run still prints
+			// results
+			proof, _ = cr.Proof()
 		}
-		results = cr.Results
-		// ignore the empty-chain error so a fully-failed run still prints
-		// results
-		proof, _ = cr.Proof()
 	} else {
 		results = c.QueryAll(ctx, servers)
 	}
@@ -189,6 +189,9 @@ func loadServers() ([]roughtime.Server, error) {
 					continue
 				}
 				if *useTCP {
+					if strings.EqualFold(s.Version, roughtime.VersionLabelGoogle) {
+						return nil, fmt.Errorf("server %q is Google-Roughtime (UDP-only), incompatible with -tcp", roughtime.SanitizeForDisplay(*nameFilter))
+					}
 					s.Addresses = tcpAddresses(s.Addresses)
 					if len(s.Addresses) == 0 {
 						return nil, fmt.Errorf("server %q in %s has no tcp address", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
@@ -204,7 +207,7 @@ func loadServers() ([]roughtime.Server, error) {
 				return nil, fmt.Errorf("no servers in %s have a tcp address", safeFile)
 			}
 		}
-		if !*all && len(servers) > defaultSampleSize {
+		if !*all {
 			servers = roughtime.SampleByOperator(servers, defaultSampleSize)
 		}
 		return servers, nil
@@ -241,6 +244,10 @@ func loadServers() ([]roughtime.Server, error) {
 func filterTCPOnly(servers []roughtime.Server) []roughtime.Server {
 	out := make([]roughtime.Server, 0, len(servers))
 	for _, s := range servers {
+		// Google-Roughtime is UDP-only, so it can never answer over TCP
+		if strings.EqualFold(s.Version, roughtime.VersionLabelGoogle) {
+			continue
+		}
 		tcp := tcpAddresses(s.Addresses)
 		if len(tcp) == 0 {
 			continue
@@ -269,7 +276,14 @@ func loadServersFile(path string) ([]roughtime.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading server list: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("reading server list: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("server list %s is not a regular file", roughtime.SanitizeForDisplay(path))
+	}
 	// read one past the cap so oversize is reported explicitly, not as JSON
 	// truncation
 	data, err := io.ReadAll(io.LimitReader(f, maxEcosystemFileBytes+1))

@@ -108,8 +108,8 @@ func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	if len(probe.Responses) == 0 {
 		return nil, errors.New("protocol: malfeasance report has no responses")
 	}
-	if len(probe.Responses) > maxChainLinks {
-		return nil, fmt.Errorf("protocol: malfeasance report has %d links (max %d)", len(probe.Responses), maxChainLinks)
+	if len(probe.Responses) > MaxChainLinks {
+		return nil, fmt.Errorf("protocol: malfeasance report has %d links (max %d)", len(probe.Responses), MaxChainLinks)
 	}
 	legacy := len(probe.Nonces) > 0 && len(probe.Responses[0]) > 0 && probe.Responses[0][0] == '"'
 
@@ -145,9 +145,24 @@ func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	for i, ml := range report.Responses {
 		var err error
 
+		if i > 0 && ml.Rand == "" {
+			return nil, fmt.Errorf("protocol: report link %d: missing rand", i)
+		}
+		if ml.PublicKey == "" {
+			return nil, fmt.Errorf("protocol: report link %d: missing publicKey", i)
+		}
+		if ml.Request == "" {
+			return nil, fmt.Errorf("protocol: report link %d: missing request", i)
+		}
+		if ml.Response == "" {
+			return nil, fmt.Errorf("protocol: report link %d: missing response", i)
+		}
 		if ml.Rand != "" {
 			if c.Links[i].Rand, err = base64.StdEncoding.DecodeString(ml.Rand); err != nil {
 				return nil, fmt.Errorf("protocol: report link %d: decode rand: %w", i, err)
+			}
+			if len(c.Links[i].Rand) != 32 && len(c.Links[i].Rand) != 64 {
+				return nil, fmt.Errorf("protocol: report link %d: rand is %d bytes, want 32 or 64", i, len(c.Links[i].Rand))
 			}
 		}
 		if c.Links[i].PublicKey, err = base64.StdEncoding.DecodeString(ml.PublicKey); err != nil {

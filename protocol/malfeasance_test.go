@@ -440,7 +440,7 @@ func TestParseMalfeasanceReportLegacyLengthMismatch(t *testing.T) {
 }
 
 // TestParseMalfeasanceReportRejectsTooManyLinks verifies ParseMalfeasanceReport
-// rejects more than maxChainLinks entries.
+// rejects more than MaxChainLinks entries.
 func TestParseMalfeasanceReportRejectsTooManyLinks(t *testing.T) {
 	const n = 1025
 	entries := make([]string, n)

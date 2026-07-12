@@ -57,9 +57,9 @@ func TestStatsLoopTicks(t *testing.T) {
 	statsLoop(ctx, zap.NewNop(), statePtr, nil)
 }
 
-// TestStatsLoopComputesDeltas verifies the first tick reports the counter
-// deltas from zero and the derived avg_batch_size, and that a non-nil pqState
-// adds the pq_cert_remaining field.
+// TestStatsLoopComputesDeltas verifies a tick reports the counter deltas
+// accrued after the loop seeds its baseline and the derived avg_batch_size, and
+// that a non-nil pqState adds the pq_cert_remaining field.
 func TestStatsLoopComputesDeltas(t *testing.T) {
 	withInterval(t, statsInterval, 5*time.Millisecond)
 	_, st := newUnitCertState(t)
@@ -67,43 +67,45 @@ func TestStatsLoopComputesDeltas(t *testing.T) {
 	edPtr.Store(st)
 	pqPtr := &atomic.Pointer[certState]{}
 	pqPtr.Store(st)
-
-	// 12 requests across 3 batches -> avg_batch_size 4
-	statsBatches.Store(3)
-	statsBatchedReqs.Store(12)
 	t.Cleanup(func() { statsBatches.Store(0); statsBatchedReqs.Store(0) })
 
 	var buf bytes.Buffer
 	enc := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
 	log := zap.New(zapcore.NewCore(enc, zapcore.AddSync(&buf), zapcore.InfoLevel))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
-	defer cancel()
-	statsLoop(ctx, log, edPtr, pqPtr)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { statsLoop(ctx, log, edPtr, pqPtr); close(done) }()
+
+	// let the loop seed its baseline from zero, then apply 12 requests across 3
+	// batches so the next interval reports the deltas with avg_batch_size 4
+	time.Sleep(30 * time.Millisecond)
+	statsBatches.Store(3)
+	statsBatchedReqs.Store(12)
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	<-done
 
 	dec := json.NewDecoder(&buf)
-	var first map[string]any
+	var got map[string]any
 	for dec.More() {
 		var m map[string]any
 		if err := dec.Decode(&m); err != nil {
 			t.Fatalf("decode log line: %v", err)
 		}
-		if m["msg"] == "stats" {
-			first = m
+		// JSON numbers decode as float64
+		if m["msg"] == "stats" && m["batches"] == float64(3) {
+			got = m
 			break
 		}
 	}
-	if first == nil {
-		t.Fatal("no stats line logged")
+	if got == nil {
+		t.Fatal("no stats line reported the batches delta of 3")
 	}
-	// JSON numbers decode as float64
-	if first["batches"] != float64(3) {
-		t.Fatalf("batches=%v want 3", first["batches"])
+	if got["avg_batch_size"] != float64(4) {
+		t.Fatalf("avg_batch_size=%v want 4", got["avg_batch_size"])
 	}
-	if first["avg_batch_size"] != float64(4) {
-		t.Fatalf("avg_batch_size=%v want 4", first["avg_batch_size"])
-	}
-	if _, ok := first["pq_cert_remaining"]; !ok {
+	if _, ok := got["pq_cert_remaining"]; !ok {
 		t.Fatal("pq_cert_remaining field missing, pqState branch not exercised")
 	}
 }

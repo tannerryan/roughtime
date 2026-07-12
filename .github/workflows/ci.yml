@@ -22,10 +22,7 @@ jobs:
         with:
           install-tools: "true"
       - run: make verify
-      - name: Verify go.mod is tidy
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+      - run: make verify-tidy
       - run: make fmt && git diff --exit-code
       - run: make lint
 

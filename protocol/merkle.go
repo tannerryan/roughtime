@@ -73,9 +73,8 @@ type merkleTree struct {
 }
 
 // merkleNodeFirst reports whether the sibling precedes the running hash when
-// the INDX bit is 0. Node-first covers drafts 05-15. Drafts 14-15 are
-// wire-collapsed into groupD14 (16-19, hash-first) as they share version
-// 0x8000000c.
+// the INDX bit is 0. Node-first covers drafts 05-13. Drafts 14-15 spec
+// node-first but collapse into hash-first groupD14 (shared version 0x8000000c).
 func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }

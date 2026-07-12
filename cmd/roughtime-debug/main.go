@@ -17,8 +17,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -75,7 +77,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "debug: %s: %s\n", *addr, err)
+		fmt.Fprintf(os.Stderr, "debug: %s: %s\n", roughtime.SanitizeForDisplay(*addr), err)
+		if errors.Is(err, context.Canceled) {
+			os.Exit(130)
+		}
 		os.Exit(1)
 	}
 }
@@ -84,6 +89,12 @@ func main() {
 func validateFlags() error {
 	if *addr == "" || *pubkey == "" {
 		return fmt.Errorf("usage: roughtime-debug -addr <host:port> -pubkey <base64-or-hex>")
+	}
+	if flag.NArg() > 0 {
+		return fmt.Errorf("unexpected positional args: %v", flag.Args())
+	}
+	if _, _, err := net.SplitHostPort(*addr); err != nil {
+		return fmt.Errorf("invalid -addr %q: %w", roughtime.SanitizeForDisplay(*addr), err)
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout %s must be > 0", *timeout)
@@ -128,6 +139,9 @@ func run(ctx context.Context) error {
 		if pqKey != pqVer {
 			return fmt.Errorf("-ver %s is incompatible with the supplied root key", *forceVer)
 		}
+		if v == protocol.VersionGoogle && transport == "tcp" {
+			return fmt.Errorf("-ver Google is incompatible with -tcp (Google-Roughtime is UDP-only)")
+		}
 		probeVersions = []protocol.Version{v}
 
 		r := probe(ctx, rootPK, probeVersions[0], transport)
@@ -142,12 +156,17 @@ func run(ctx context.Context) error {
 		return nil
 	}
 
-	fmt.Printf("=== Version Probe: %s (%s) ===\n", *addr, transport)
+	fmt.Printf("=== Version Probe: %s (%s) ===\n", roughtime.SanitizeForDisplay(*addr), transport)
 	fmt.Printf("Timeout: %s\n", *timeout)
 	var supported []protocol.Version
 	var best *probeResult
 
 	for _, ver := range probeVersions {
+		// Google-Roughtime is UDP-only, so a TCP probe would misreport it
+		if transport == "tcp" && ver == protocol.VersionGoogle {
+			fmt.Printf("  %-40s %s\n", ver.String(), "skipped (Google-Roughtime is UDP-only)")
+			continue
+		}
 		r := probe(ctx, rootPK, ver, transport)
 		status := "OK"
 		if r.err != nil {
@@ -156,6 +175,9 @@ func run(ctx context.Context) error {
 		fmt.Printf("  %-40s %s\n", ver.String(), status)
 
 		if r.err != nil {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			continue
 		}
 		supported = append(supported, ver)
@@ -223,6 +245,8 @@ func probe(ctx context.Context, rootPK []byte, ver protocol.Version, transport s
 		if attempt == *retries-1 {
 			if !networkErr {
 				err = fmt.Errorf("verify: %w", err)
+			} else {
+				r.reply = nil
 			}
 			r.err = err
 			break

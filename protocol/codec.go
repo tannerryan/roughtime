@@ -224,7 +224,7 @@ func unwrapRequest(raw []byte) ([]byte, error) {
 }
 
 // NonceOffsetInRequest returns the byte offset of a 32- or 64-byte NONC value
-// in a raw request.
+// in a raw request. It does not fully validate the request structure.
 func NonceOffsetInRequest(request []byte) (int, error) {
 	msg, err := unwrapRequest(request)
 	if err != nil {

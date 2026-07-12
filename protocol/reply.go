@@ -4,6 +4,7 @@
 package protocol
 
 import (
+	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -17,6 +18,12 @@ var responseCtx = []byte("RoughTime v1 response signature\x00")
 func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate) ([][]byte, error) {
 	if len(requests) == 0 {
 		return nil, errors.New("protocol: no requests")
+	}
+	if cert == nil {
+		return nil, errors.New("protocol: nil certificate")
+	}
+	if cert.wiped {
+		return nil, errors.New("protocol: certificate signing key wiped")
 	}
 	if uint64(len(requests)) > maxMerkleLeaves {
 		return nil, fmt.Errorf("protocol: batch size %d exceeds Merkle cap 2^32", len(requests))
@@ -69,8 +76,14 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 	var srepSig []byte
 	switch cert.scheme {
 	case schemeEd25519:
+		if len(cert.edOnlineSK) != ed25519.PrivateKeySize {
+			return nil, errors.New("protocol: invalid Ed25519 online signing key")
+		}
 		srepSig = signEd25519(cert.edOnlineSK, srepBytes, responseCtx)
 	case schemeMLDSA44:
+		if cert.pqOnlineSK == nil {
+			return nil, errors.New("protocol: nil ML-DSA-44 online signing key")
+		}
 		srepSig, err = signMLDSA44(cert.pqOnlineSK, srepBytes, responseCtx)
 		if err != nil {
 			return nil, fmt.Errorf("protocol: ML-DSA-44 sign SREP: %w", err)

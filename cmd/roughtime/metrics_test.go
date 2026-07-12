@@ -499,11 +499,10 @@ func TestListenMetricsBindError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hold port: %v", err)
 	}
-	defer holder.Close()
+	defer func() { _ = holder.Close() }()
 
 	addr := holder.Addr().String()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := listenMetrics(ctx, addr); err == nil {
 		t.Fatal("expected bind error, got nil")
 	}

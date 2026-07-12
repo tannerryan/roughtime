@@ -223,6 +223,9 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		}
 		slices.Sort(sorted)
 		sorted = slices.Compact(sorted)
+		if len(sorted) > maxVersionList {
+			return nil, fmt.Errorf("protocol: VER list has %d entries (max %d)", len(sorted), maxVersionList)
+		}
 		vb := make([]byte, 4*len(sorted))
 		for i, v := range sorted {
 			binary.LittleEndian.PutUint32(vb[4*i:], uint32(v))
@@ -237,10 +240,18 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		}
 	}
 
-	// IETF wire size is 1024 including the 12-byte header. Google has no header
+	// IETF wire size is normally 1024 including the 12-byte header. ML-DSA-44
+	// replies are much larger, so any offer containing it is padded to the
+	// TCP/UDP request cap to preserve the no-amplification invariant.
 	target := 1024
+	if pqOffered(versions) {
+		target = 8192
+	}
 	if usesRoughtimHeader(g) {
 		target = 1012
+		if pqOffered(versions) {
+			target = 8180
+		}
 	}
 
 	n := uint32(len(tags))
@@ -274,4 +285,9 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		return nil, fmt.Errorf("protocol: encode request: %w", err)
 	}
 	return msg, nil
+}
+
+// pqOffered reports whether the non-Google offer set includes ML-DSA-44.
+func pqOffered(versions []Version) bool {
+	return slices.Contains(versions, VersionMLDSA44)
 }

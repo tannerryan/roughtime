@@ -33,7 +33,7 @@ func RoundTripUDP(ctx context.Context, address string, request []byte, timeout t
 	if err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("dialing %s: %w", address, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	done := make(chan struct{})
 	defer close(done)
@@ -78,7 +78,7 @@ func RoundTripTCP(ctx context.Context, address string, request []byte, timeout t
 	if err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("dialing %s: %w", address, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}

@@ -21,8 +21,9 @@ var (
 	ErrCausalOrder = errors.New("protocol: causal ordering violation")
 )
 
-// maxChainLinks caps the link count of a parsed malfeasance report.
-const maxChainLinks = 1024
+// MaxChainLinks caps the link count of a parsed malfeasance report or verified
+// chain.
+const MaxChainLinks = 1024
 
 // ChainLink is one server query in a Roughtime measurement chain.
 type ChainLink struct {
@@ -73,7 +74,8 @@ func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (non
 }
 
 // chainHasher returns the chain-nonce hasher. SHA-512 is used for every group
-// since drafts 01-04 require up to 64 bytes.
+// since drafts 01-04 require up to 64 bytes, which drafts 02-03's nominal
+// SHA-512/256 cannot fill.
 func chainHasher(_ wireGroup) hash.Hash {
 	return sha512.New()
 }
@@ -95,7 +97,10 @@ func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader
 	}
 
 	srv := ComputeSRV(rootPK)
-	_, request, err := CreateRequest(versions, bytes.NewReader(nonce), srv)
+	if srv == nil {
+		return ChainLink{}, errors.New("protocol: unsupported root key length")
+	}
+	request, err := CreateRequestWithNonce(versions, nonce, srv)
 	if err != nil {
 		return ChainLink{}, fmt.Errorf("protocol: create chained request: %w", err)
 	}
@@ -115,6 +120,9 @@ func (c *Chain) NextRequestWithNonce(versions []Version, rootPK, nonce []byte) (
 		return ChainLink{}, errors.New("protocol: NextRequestWithNonce only valid for the first chain link")
 	}
 	srv := ComputeSRV(rootPK)
+	if srv == nil {
+		return ChainLink{}, errors.New("protocol: unsupported root key length")
+	}
 	request, err := CreateRequestWithNonce(versions, nonce, srv)
 	if err != nil {
 		return ChainLink{}, fmt.Errorf("protocol: create chained request: %w", err)
@@ -131,27 +139,36 @@ func (c *Chain) Append(link ChainLink) {
 	c.Links = append(c.Links, link)
 }
 
+// Bound is the verified midpoint and radius for one chain link.
+type Bound struct {
+	Midpoint time.Time
+	Radius   time.Duration
+}
+
 // Verify checks nonce linkage, signature validity, and causal ordering across
 // the chain.
 func (c *Chain) Verify() error {
+	_, err := c.VerifyBounds()
+	return err
+}
+
+// VerifyBounds runs the same checks as Verify and returns each link's verified
+// midpoint and radius, letting callers avoid a second verification pass.
+func (c *Chain) VerifyBounds() ([]Bound, error) {
 	if len(c.Links) == 0 {
-		return errors.New("protocol: empty chain")
+		return nil, errors.New("protocol: empty chain")
 	}
-	if len(c.Links) > maxChainLinks {
-		return fmt.Errorf("protocol: chain has %d links (max %d)", len(c.Links), maxChainLinks)
+	if len(c.Links) > MaxChainLinks {
+		return nil, fmt.Errorf("protocol: chain has %d links (max %d)", len(c.Links), MaxChainLinks)
 	}
 
-	type timeResult struct {
-		lower time.Time // MIDP - RADI
-		upper time.Time // MIDP + RADI
-	}
-	results := make([]timeResult, len(c.Links))
+	bounds := make([]Bound, len(c.Links))
 
 	for i := range c.Links {
 		link := &c.Links[i]
 		req, err := ParseRequest(link.Request)
 		if err != nil {
-			return fmt.Errorf("protocol: chain link %d: parse request: %w", i, err)
+			return nil, fmt.Errorf("protocol: chain link %d: parse request: %w", i, err)
 		}
 
 		versions := req.Versions
@@ -162,43 +179,41 @@ func (c *Chain) Verify() error {
 		if i > 0 {
 			_, g, err := clientVersionPreference(versions)
 			if err != nil {
-				return fmt.Errorf("protocol: chain link %d: %w", i, err)
+				return nil, fmt.Errorf("protocol: chain link %d: %w", i, err)
 			}
 			ns := len(req.Nonce)
 			if len(link.Rand) != ns {
-				return fmt.Errorf("protocol: chain link %d: %w: rand is %d bytes, want %d", i, ErrChainNonce, len(link.Rand), ns)
+				return nil, fmt.Errorf("protocol: chain link %d: %w: rand is %d bytes, want %d", i, ErrChainNonce, len(link.Rand), ns)
 			}
 			h := chainHasher(g)
 			h.Write(c.Links[i-1].Response)
 			h.Write(link.Rand)
 			want := h.Sum(nil)[:ns]
 			if !bytes.Equal(req.Nonce, want) {
-				return fmt.Errorf("protocol: chain link %d: %w", i, ErrChainNonce)
+				return nil, fmt.Errorf("protocol: chain link %d: %w", i, ErrChainNonce)
 			}
 		}
 
 		midpoint, radius, err := VerifyReply(versions, link.Response, link.PublicKey, req.Nonce, link.Request)
 		if err != nil {
-			return fmt.Errorf("protocol: chain link %d: verify: %w", i, err)
+			return nil, fmt.Errorf("protocol: chain link %d: verify: %w", i, err)
 		}
 
-		results[i] = timeResult{
-			lower: midpoint.Add(-radius),
-			upper: midpoint.Add(radius),
-		}
+		bounds[i] = Bound{Midpoint: midpoint, Radius: radius}
 	}
 
 	// require lower[i] <= upper[j] for all i < j. A running max of lower keeps
 	// this O(n)
+	lower := func(b Bound) time.Time { return b.Midpoint.Add(-b.Radius) }
 	maxLowerIdx := 0
-	for j := 1; j < len(results); j++ {
-		if results[maxLowerIdx].lower.After(results[j].upper) {
-			return fmt.Errorf("protocol: chain links %d and %d: %w", maxLowerIdx, j, ErrCausalOrder)
+	for j := 1; j < len(bounds); j++ {
+		if lower(bounds[maxLowerIdx]).After(bounds[j].Midpoint.Add(bounds[j].Radius)) {
+			return nil, fmt.Errorf("protocol: chain links %d and %d: %w", maxLowerIdx, j, ErrCausalOrder)
 		}
-		if results[j].lower.After(results[maxLowerIdx].lower) {
+		if lower(bounds[j]).After(lower(bounds[maxLowerIdx])) {
 			maxLowerIdx = j
 		}
 	}
 
-	return nil
+	return bounds, nil
 }

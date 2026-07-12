@@ -23,6 +23,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus
-          path: protocol/testdata/fuzz/
+          path: |
+            testdata/fuzz/
+            protocol/testdata/fuzz/
+            cmd/roughtime/testdata/fuzz/
           if-no-files-found: ignore
           retention-days: 30

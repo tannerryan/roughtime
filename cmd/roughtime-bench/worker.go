@@ -87,7 +87,7 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	if err != nil {
 		return false
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
 	if err != nil {
@@ -127,6 +127,11 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
+				_ = conn.Close()
+				conn, err = net.DialUDP("udp", nil, raddr)
+				if err != nil {
+					return true
+				}
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
 			}
@@ -160,7 +165,7 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	if err != nil {
 		return false
 	}
-	defer func() { conn.Close() }()
+	defer func() { _ = conn.Close() }()
 	setTCPNoDelay(conn)
 
 	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
@@ -176,7 +181,7 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	// No exponential backoff: this bench is a load generator, not a conformant
 	// client.
 	reconnect := func() bool {
-		conn.Close()
+		_ = conn.Close()
 		c, err := dialer.DialContext(ctx, "tcp", cfg.addr)
 		if err != nil {
 			return false

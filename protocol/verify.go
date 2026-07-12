@@ -18,16 +18,19 @@ import (
 // outside MINT..MAXT.
 var ErrDelegationWindow = errors.New("protocol: midpoint outside delegation window")
 
+// plausible midpoint bounds. A misdecoded epoch lands far outside them, unlike
+// any real current time.
+var (
+	minPlausibleMidpoint = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxPlausibleMidpoint = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
 // VerifyReply authenticates a server response and returns the midpoint and
 // radius.
 func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) (midpoint time.Time, radius time.Duration, err error) {
 	bestVer, bestG, err := clientVersionPreference(versions)
 	if err != nil {
 		return time.Time{}, 0, err
-	}
-	if want := publicKeySize(schemeOfGroup(bestG)); len(rootPK) != want {
-		return time.Time{}, 0, fmt.Errorf("protocol: root key is %d bytes, want %d for %s",
-			len(rootPK), want, schemeOfGroup(bestG))
 	}
 
 	// unwrap with the client's best version, refine once server VER is known
@@ -257,8 +260,8 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 		return time.Time{}, 0, errors.New("protocol: missing or invalid ROOT")
 	}
 
-	// drafts 01-02 bind nonce only via SREP.NONC. 03+ echo at top-level but the
-	// Merkle proof already binds it
+	// drafts 01-02 bind nonce only via SREP.NONC. 03+ servers may echo NONC at
+	// top level; when present, it must match. The Merkle proof binds the nonce.
 	if noncInSREP(g) {
 		srepNonce, ok := srep[TagNONC]
 		if !ok {
@@ -267,8 +270,8 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 		if !bytes.Equal(srepNonce, nonce) {
 			return time.Time{}, 0, errors.New("protocol: NONC in SREP does not match request nonce")
 		}
-	} else if echoed, ok := resp[TagNONC]; ok {
-		if !bytes.Equal(echoed, nonce) {
+	} else if hasResponseNONC(g) {
+		if echoed, ok := resp[TagNONC]; ok && !bytes.Equal(echoed, nonce) {
 			return time.Time{}, 0, errors.New("protocol: response NONC does not match request nonce")
 		}
 	}
@@ -287,6 +290,10 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	midpoint, err := decodeTimestamp(midpBytes, g)
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("protocol: decode MIDP: %w", err)
+	}
+	// an absurd date means the epoch was misdecoded from a forged pre-12 VER
+	if midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint) {
+		return time.Time{}, 0, errors.New("protocol: midpoint outside plausible calendar range")
 	}
 	radius, err := decodeRadius(radiBytes, g)
 	if err != nil {

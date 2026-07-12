@@ -9,8 +9,8 @@
 // Latencies feed a per-worker Algorithm R reservoir capped at 100k samples, so
 // p99.9 is approximate once a worker exceeds that count. Warmup samples are
 // dropped but sockets stay open across the boundary so the measurement window
-// inherits warm kernel state. Per-iteration SetReadDeadline sits inside the
-// timing window, inflating measured RTT on sub-millisecond servers.
+// inherits warm kernel state. Deadlines are set before the timer starts, so the
+// SetReadDeadline cost stays out of the measured RTT.
 //
 // The bench is a closed-loop load generator: it deliberately omits exponential
 // backoff on TCP redial and has no rate limit, so it is not a conformant client
@@ -75,6 +75,9 @@ var showVersion = flag.Bool("version", false, "print version and exit")
 
 // reservoirSize is the per-worker Algorithm R latency-sample cap.
 const reservoirSize = 100_000
+
+// maxWorkers caps -workers so a typo can't exhaust local fds and memory.
+const maxWorkers = 65_536
 
 // workerResult represents the per-goroutine stats accumulator.
 type workerResult struct {
@@ -160,7 +163,11 @@ func main() {
 	defer totalCancel()
 	start := time.Now()
 	collectAfter := start.Add(*warmup)
-	results := runWorkers(totalCtx, cfg, *workers, collectAfter)
+	results, err := runWorkers(totalCtx, cfg, *workers, collectAfter)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bench: %s\n", err)
+		os.Exit(1)
+	}
 	// clamp at zero in case a SIGINT cancels before collectAfter elapses
 	elapsed := max(time.Since(collectAfter), 0)
 
@@ -183,6 +190,12 @@ func validateFlags() error {
 	if *workers < 1 {
 		return fmt.Errorf("-workers %d must be >= 1", *workers)
 	}
+	if flag.NArg() > 0 {
+		return fmt.Errorf("unexpected positional args: %v", flag.Args())
+	}
+	if *workers > maxWorkers {
+		return fmt.Errorf("-workers %d exceeds max %d", *workers, maxWorkers)
+	}
 	if *duration <= 0 {
 		return fmt.Errorf("-duration %s must be > 0", *duration)
 	}
@@ -199,7 +212,7 @@ func validateFlags() error {
 }
 
 // runWorkers spins up n workers and returns their results when ctx ends.
-func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) []workerResult {
+func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) ([]workerResult, error) {
 	results := make([]workerResult, n)
 	var wg sync.WaitGroup
 	var dialed atomic.Int32
@@ -212,7 +225,7 @@ func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.T
 	}
 	wg.Wait()
 	if dialed.Load() == 0 {
-		fmt.Fprintln(os.Stderr, "bench: all workers failed to start")
+		return nil, fmt.Errorf("all workers failed to start")
 	}
-	return results
+	return results, nil
 }

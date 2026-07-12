@@ -8,10 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/tannerryan/roughtime/protocol"
 )
+
+// maxEncodedPublicKeyLen caps text public-key encodings before decoding.
+const maxEncodedPublicKeyLen = 2 * protocol.MLDSA44PublicKeySize
 
 // Scheme identifies the signature suite of a server's root key.
 type Scheme int
@@ -49,6 +53,9 @@ func VersionsForScheme(sch Scheme) []protocol.Version {
 		if v == protocol.VersionGoogle || v == protocol.VersionMLDSA44 {
 			continue
 		}
+		if v < protocol.VersionDraft05 {
+			continue
+		}
 		out = append(out, v)
 	}
 	return out
@@ -57,6 +64,10 @@ func VersionsForScheme(sch Scheme) []protocol.Version {
 // DecodePublicKey decodes a 32-byte Ed25519 or 1312-byte ML-DSA-44 root public
 // key from base64 or hex.
 func DecodePublicKey(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if len(s) > maxEncodedPublicKeyLen {
+		return nil, fmt.Errorf("roughtime: public key encoding is %d bytes (max %d)", len(s), maxEncodedPublicKeyLen)
+	}
 	for _, dec := range []func(string) ([]byte, error){
 		base64.StdEncoding.DecodeString,
 		base64.RawStdEncoding.DecodeString,

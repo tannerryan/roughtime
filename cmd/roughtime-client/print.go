@@ -6,7 +6,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/tannerryan/roughtime"
@@ -24,7 +23,7 @@ func printSingle(r *roughtime.Response) {
 		status = "in-sync"
 	}
 	// in -addr mode Name duplicates Address, so skip the redundant line
-	if !strings.HasSuffix(displayAddr, safeName) {
+	if r.Server.Name != r.Address.Address {
 		fmt.Printf("Server:    %s\n", safeName)
 	}
 	fmt.Printf("Address:   %s\n", displayAddr)
@@ -57,17 +56,20 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof, servers []ro
 	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
 	errFmt := fmt.Sprintf("%%-%ds  %%-%ds  error: %%s\n", nameW, addrW)
 
-	// Dedupe rows on PublicKey (operator-supplied Name can collide across
-	// distinct servers). Each server is queried twice (the chain covers both
-	// halves), so a later success replaces an earlier failure for the same key.
+	// Dedupe rows on PublicKey plus resolved address, while distinct endpoints
+	// sharing a root key stay separate.
 	var rows []roughtime.Result
-	idxByKey := make(map[string]int)
+	type rowKey struct {
+		publicKey string
+		address   string
+	}
+	idxByKey := make(map[rowKey]int)
 	for _, r := range results {
-		key := string(r.Server.PublicKey)
-		if key == "" {
+		if len(r.Server.PublicKey) == 0 {
 			rows = append(rows, r)
 			continue
 		}
+		key := rowKey{publicKey: string(r.Server.PublicKey), address: r.Address.String()}
 		if i, ok := idxByKey[key]; ok {
 			if rows[i].Err != nil && r.Err == nil {
 				rows[i] = r
@@ -109,7 +111,9 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof, servers []ro
 	fmt.Printf("\n%d/%d servers responded\n", len(deduped), len(servers))
 	printConsensus(deduped)
 	if proof != nil {
-		printChainStatus(proof)
+		if err := printChainStatus(proof); err != nil {
+			return err
+		}
 	}
 	if len(deduped) == 0 {
 		return errors.New("no servers responded")
@@ -135,10 +139,11 @@ func printConsensus(results []roughtime.Result) {
 }
 
 // printChainStatus prints the chain proof verification result and link count.
-func printChainStatus(p *roughtime.Proof) {
+func printChainStatus(p *roughtime.Proof) error {
 	if err := p.Verify(); err != nil {
-		fmt.Printf("Chain:              FAILED: %s\n", err)
-		return
+		fmt.Printf("Chain:              FAILED: %s\n", roughtime.SanitizeForDisplay(err.Error()))
+		return fmt.Errorf("chain verify: %w", err)
 	}
 	fmt.Printf("Chain:              ok (%d links verified)\n", p.Len())
+	return nil
 }

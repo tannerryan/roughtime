@@ -87,15 +87,20 @@ func TestDecodePublicKey(t *testing.T) {
 }
 
 // TestDecodePublicKeyMLDSA44 verifies DecodePublicKey accepts a 1312-byte
-// ML-DSA-44 key.
+// ML-DSA-44 key in base64 and hex.
 func TestDecodePublicKeyMLDSA44(t *testing.T) {
 	want := bytes.Repeat([]byte{0x42}, 1312)
-	got, err := roughtime.DecodePublicKey(base64.StdEncoding.EncodeToString(want))
-	if err != nil {
-		t.Fatalf("DecodePublicKey: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("ML-DSA-44 key round-trip mismatch")
+	for _, in := range []string{
+		base64.StdEncoding.EncodeToString(want),
+		fmt.Sprintf("%x", want),
+	} {
+		got, err := roughtime.DecodePublicKey(in)
+		if err != nil {
+			t.Fatalf("DecodePublicKey: %v", err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatal("ML-DSA-44 key round-trip mismatch")
+		}
 	}
 }
 

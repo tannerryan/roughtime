@@ -6,9 +6,13 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"time"
 
 	"github.com/tannerryan/roughtime"
 )
+
+// tsFormat is the display-only timestamp layout.
+const tsFormat = time.RFC3339Nano
 
 // printCheck prints one OK-prefixed line in the verification stanza.
 func printCheck(label, detail string) {

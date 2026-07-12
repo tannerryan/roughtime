@@ -39,7 +39,7 @@ FUZZ_TARGETS = \
 FUZZ_TIME   ?= 30s
 
 .PHONY: all deps build test test-verbose test-race test-cover test-race-cover \
-        test-all fuzz lint vet fmt verify verify-tidy coverage-report check clean
+        test-all fuzz lint vet modernize fmt verify verify-tidy coverage-report check clean
 
 # Default: fmt, vet, build, race tests
 all: fmt vet build test-race
@@ -48,8 +48,9 @@ all: fmt vet build test-race
 deps:
 	go install golang.org/x/tools/cmd/goimports@latest
 	go install honnef.co/go/tools/cmd/staticcheck@latest
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 	go install golang.org/x/tools/gopls@latest
+	go install golang.org/x/tools/go/analysis/passes/modernize/cmd/modernize@latest
 	go install github.com/gojp/goreportcard/cmd/goreportcard-cli@latest
 
 # Inject commit + build date into binaries via -ldflags. Empty when git is
@@ -103,8 +104,16 @@ verify:
 
 # Verify go.mod and go.sum are tidy (CI guard)
 verify-tidy:
-	go mod tidy
-	git diff --exit-code go.mod go.sum
+	@tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	cp go.mod go.sum "$$tmp"/; \
+	go mod tidy; \
+	cmp -s go.mod "$$tmp/go.mod" && cmp -s go.sum "$$tmp/go.sum" || { \
+		echo "go.mod or go.sum changed after go mod tidy" >&2; \
+		diff -u "$$tmp/go.mod" go.mod || true; \
+		diff -u "$$tmp/go.sum" go.sum || true; \
+		exit 1; \
+	}
 
 # Per-function summary + HTML coverage report
 coverage-report: test-race-cover
@@ -136,8 +145,12 @@ fmt:
 vet:
 	go vet ./...
 
-# All linters (staticcheck, golangci-lint, gopls, vet)
-lint: vet
+# Modernization suggestions
+modernize:
+	modernize ./...
+
+# All linters (staticcheck, golangci-lint, gopls, modernize, vet)
+lint: vet modernize
 	staticcheck ./...
 	golangci-lint run ./...
 	@files=$$(find . -maxdepth 4 -name '*.go' ! -name '*_test.go' ! -path './vendor/*'); \

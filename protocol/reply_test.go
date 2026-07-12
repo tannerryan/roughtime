@@ -477,9 +477,33 @@ func TestPQBatch(t *testing.T) {
 		t.Fatalf("CreateReplies: %v", err)
 	}
 	for i := range replies {
+		if len(replies[i]) > len(rawReqs[i]) {
+			t.Fatalf("reply %d length %d exceeds request length %d", i, len(replies[i]), len(rawReqs[i]))
+		}
 		if _, _, err := VerifyReply(versions, replies[i], rootPK, nonces[i], rawReqs[i]); err != nil {
 			t.Fatalf("VerifyReply %d: %v", i, err)
 		}
+	}
+}
+
+// TestCreateRepliesRejectsNilAndWipedCertificate verifies signing fails cleanly
+// when no usable online key remains.
+func TestCreateRepliesRejectsNilAndWipedCertificate(t *testing.T) {
+	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, nil); err == nil {
+		t.Fatal("CreateReplies accepted nil certificate")
+	}
+	cert, _ := testCert(t)
+	cert.Wipe()
+	if _, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert); err == nil {
+		t.Fatal("CreateReplies accepted wiped certificate")
 	}
 }
 

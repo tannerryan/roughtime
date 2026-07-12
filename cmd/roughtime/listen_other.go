@@ -54,13 +54,11 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 
 	var batcherWg sync.WaitGroup
 	batcherLog := logger.Named("batcher")
-	batcherWg.Add(1)
 	// per-iteration recovery lives inside batcher so batches persist and
 	// close(batchCh) on shutdown isn't raced by a restart
-	go func() {
-		defer batcherWg.Done()
+	batcherWg.Go(func() {
 		batcher(batcherLog, conn, state, batchCh, maxSize, maxLatency)
-	}()
+	})
 
 	listenLog.Info("listening",
 		zap.String("addr", conn.LocalAddr().String()),
@@ -119,11 +117,11 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		default:
 			bufPool.Put(bufPtr)
 			incDropped(transportUDP, dropQueue)
-			listenLog.Warn("dropped request: batcher queue full",
-				zap.Stringer("peer", peer),
-				zap.Int("size", reqLen),
-				zap.Int("queue_size", batchQueueSize),
-			)
+			// hot path under overload, so gate the per-drop log. The dropQueue
+			// metric is the source of truth
+			if ce := listenLog.Check(zap.DebugLevel, "dropped request: batcher queue full"); ce != nil {
+				ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen), zap.Int("queue_size", batchQueueSize))
+			}
 		}
 		return false
 	}

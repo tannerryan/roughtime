@@ -27,6 +27,7 @@ type Certificate struct {
 	pqOnlinePK *mldsa.PublicKey
 
 	cache map[certCacheKey][]byte
+	wiped bool
 }
 
 // certCacheKey identifies a unique CERT encoding shared across wire groups.
@@ -104,6 +105,7 @@ func (c *Certificate) Wipe() {
 	case schemeMLDSA44:
 		c.pqOnlineSK = nil
 	}
+	c.wiped = true
 }
 
 // cacheKeyFor returns the cache key for g's CERT encoding.

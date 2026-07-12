@@ -50,9 +50,6 @@ var (
 	// refreshRetryCooldown is the minimum gap between successive refresh
 	// attempts after a failure.
 	refreshRetryCooldown = 5 * time.Minute
-	// certWipeGrace delays zeroing a rotated-out online signing key so
-	// in-flight signers can finish.
-	certWipeGrace = 5 * time.Second
 )
 
 // certState holds the current online certificate, its expiry, and the
@@ -69,7 +66,11 @@ type certState struct {
 // writeSeedFile writes header plus hex-encoded seed to path at mode 0600,
 // refusing existing files and symlink races.
 func writeSeedFile(path, header string, seed []byte) error {
-	encoded := []byte(header + "\n" + hex.EncodeToString(seed) + "\n")
+	encoded := make([]byte, len(header)+2+hex.EncodedLen(len(seed)))
+	copy(encoded, header)
+	encoded[len(header)] = '\n'
+	hex.Encode(encoded[len(header)+1:], seed)
+	encoded[len(encoded)-1] = '\n'
 	defer clear(encoded)
 
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
@@ -188,12 +189,19 @@ func deriveMLDSA44PublicKey(path string) error {
 // readPrivateKeyFile reads a 0600-or-stricter seed file under O_NOFOLLOW, using
 // role to label error messages.
 func readPrivateKeyFile(path, role string) ([]byte, error) {
-	info, err := os.Lstat(path)
+	// O_NOFOLLOW refuses a symlink, then validate the opened descriptor so the
+	// checks can't race a swap between stat and open
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("%s key file %s is a symlink (refusing to follow)", role, path)
+		}
 		return nil, fmt.Errorf("stat %s key file: %w", role, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s key file %s is a symlink (refusing to follow)", role, path)
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat %s key file: %w", role, err)
 	}
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s key file %s is not a regular file", role, path)
@@ -201,12 +209,7 @@ func readPrivateKeyFile(path, role string) ([]byte, error) {
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return nil, fmt.Errorf("%s key file %s has insecure mode %#o (must be 0600 or stricter)", role, path, mode)
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, fmt.Errorf("opening %s signing key file: %w", role, err)
-	}
 	raw, err := io.ReadAll(f)
-	_ = f.Close()
 	if err != nil {
 		return nil, fmt.Errorf("reading %s signing key file: %w", role, err)
 	}
@@ -240,8 +243,12 @@ func parseSeed(raw []byte, path, header, label string, wantLen int, acceptBareHe
 	default:
 		return nil, fmt.Errorf("%s file %s missing %q header", noun, path, header)
 	}
-	seed, err := hex.DecodeString(string(hexPart))
-	if err != nil {
+	if len(hexPart)%2 != 0 {
+		return nil, fmt.Errorf("decoding %s in %s: odd length hex string", noun, path)
+	}
+	seed := make([]byte, hex.DecodedLen(len(hexPart)))
+	if _, err := hex.Decode(seed, hexPart); err != nil {
+		clear(seed)
 		return nil, fmt.Errorf("decoding %s in %s: %w", noun, path, err)
 	}
 	if len(seed) != wantLen {
@@ -402,8 +409,6 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetr
 		state.Store(newState)
 		noteCertProvisioned(schemeMetric, newOnlinePK, rootPK, newState.expiry, time.Now())
 		noteCertRotation(schemeMetric)
-		oldCert := cur.cert
-		time.AfterFunc(certWipeGrace, oldCert.Wipe)
 		log.Info("certificate refreshed",
 			zap.String("scheme", schemeName),
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),

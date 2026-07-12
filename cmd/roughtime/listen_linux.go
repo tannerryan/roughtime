@@ -93,16 +93,9 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		wg.Go(func() {
 			wlog := listenLog.With(zap.Int("worker", i))
 			// restart on panic so the SO_REUSEPORT pool doesn't shrink
-			for ctx.Err() == nil {
-				func() {
-					defer recoverGoroutine(wlog, "worker")
-					worker(ctx, wlog, state, c, maxSize, maxLatency)
-				}()
-				if ctx.Err() != nil {
-					return
-				}
-				wlog.Warn("worker exited before shutdown, restarting")
-			}
+			superviseLoop(ctx, wlog, "udp worker", func() {
+				worker(ctx, wlog, state, c, maxSize, maxLatency)
+			})
 		})
 	}
 	wg.Wait()

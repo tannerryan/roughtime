@@ -25,6 +25,15 @@ import (
 // maxTCPRequestSize bounds the declared body length on a TCP request.
 const maxTCPRequestSize uint32 = 8192
 
+// tcpReqBufPool pools read buffers sized to hold the ROUGHTIM header plus the
+// max allowed body.
+var tcpReqBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, protocol.PacketHeaderSize+int(maxTCPRequestSize))
+		return &b
+	},
+}
+
 // TCP tunables. A var so tests can shrink them.
 var (
 	// maxTCPConnections caps concurrent accepted connections.
@@ -256,6 +265,7 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 		zap.Uint64("responded_total", requestsResponded.total()),
 		zap.Uint64("dropped_total", requestsDropped.total()),
 		zap.Uint64("drop_framing_total", droppedFor(transportTCP, dropFraming)),
+		zap.Uint64("drop_oversize_total", droppedFor(transportTCP, dropOversize)),
 		zap.Uint64("drop_read_total", droppedFor(transportTCP, dropRead)),
 		zap.Uint64("drop_parse_total", droppedFor(transportTCP, dropParse)),
 		zap.Uint64("drop_version_total", droppedFor(transportTCP, dropVersion)),
@@ -272,20 +282,18 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 	return nil
 }
 
-// tcpReqBufPool pools read buffers sized to hold the ROUGHTIM header plus the
-// max allowed body.
-var tcpReqBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, protocol.PacketHeaderSize+int(maxTCPRequestSize))
-		return &b
-	},
-}
-
 // handleTCPConn reads framed Roughtime packets until idle timeout or peer
 // close, batching each via the per-scheme batcher.
 func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) {
 	reqBufPtr := tcpReqBufPool.Get().(*[]byte)
-	defer tcpReqBufPool.Put(reqBufPtr)
+	// a submitted-but-unanswered item still aliases reqBuf inside the batcher,
+	// so skip recycling the buffer if we return before the reply arrives
+	outstanding := false
+	defer func() {
+		if !outstanding {
+			tcpReqBufPool.Put(reqBufPtr)
+		}
+	}()
 	reqBuf := *reqBufPtr
 	// reused across requests. The handler is sequential (read, submit, wait,
 	// write, then next read) so the channel is always drained before next
@@ -364,6 +372,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 				return
 			}
 		}
+		outstanding = true
 
 		// wait for batcher to sign. ctx.Done() unblocks on shutdown. Peek
 		// replyCh first so a reply already produced by the batcher isn't
@@ -378,6 +387,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 				return
 			}
 		}
+		outstanding = false
 		if br.err != nil {
 			// batch-level failure already logged by flushTCPBatch
 			incDropped(transportTCP, dropBatchErr)
@@ -408,7 +418,17 @@ func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pq
 		}
 		return tcpBatchItem{}, nil, dropParse, err
 	}
-	ver, err := protocol.SelectVersion(req.Versions, len(req.Nonce), prefs)
+	routePrefs := prefs
+	if req.SRV != nil {
+		routePrefs = filterTCPPrefsBySRV(prefs, req.SRV, edState, pqState)
+		if len(routePrefs) == 0 {
+			if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
+				ce.Write(zap.Stringer("peer", peer))
+			}
+			return tcpBatchItem{}, nil, dropSRV, errors.New("SRV mismatch")
+		}
+	}
+	ver, err := protocol.SelectVersion(req.Versions, len(req.Nonce), routePrefs)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "version negotiation failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
@@ -422,14 +442,32 @@ func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pq
 		}
 		return tcpBatchItem{}, nil, dropConfig, err
 	}
-	// drafts 10+: reject SRV not addressing a key we control
-	if req.SRV != nil && !bytes.Equal(req.SRV, st.srvHash) {
+	if req.SRV != nil && (st == nil || !bytes.Equal(req.SRV, st.srvHash)) {
 		if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer))
 		}
 		return tcpBatchItem{}, nil, dropSRV, errors.New("SRV mismatch")
 	}
 	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, "", nil
+}
+
+// filterTCPPrefsBySRV keeps only versions whose configured key matches srv.
+func filterTCPPrefsBySRV(prefs []protocol.Version, srv []byte, edState, pqState *atomic.Pointer[certState]) []protocol.Version {
+	out := make([]protocol.Version, 0, len(prefs))
+	for _, v := range prefs {
+		var st *certState
+		if v == protocol.VersionMLDSA44 {
+			if pqState != nil {
+				st = pqState.Load()
+			}
+		} else if edState != nil {
+			st = edState.Load()
+		}
+		if st != nil && bytes.Equal(srv, st.srvHash) {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // tcpRouteForVersion picks the certState snapshot and batcher channel for ver's
@@ -654,8 +692,17 @@ func writeTCPReply(w io.Writer, reply []byte) error {
 	if len(reply) > maxTCPReplyBytes {
 		return fmt.Errorf("reply size %d exceeds sanity bound %d", len(reply), maxTCPReplyBytes)
 	}
-	_, err := w.Write(reply)
-	return err
+	for len(reply) > 0 {
+		n, err := w.Write(reply)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		reply = reply[n:]
+	}
+	return nil
 }
 
 // versionNames renders a preference list as readable names for structured logs.

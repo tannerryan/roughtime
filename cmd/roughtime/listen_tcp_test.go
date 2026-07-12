@@ -125,7 +125,7 @@ func TestListenTCPEndToEndEd25519(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	conn := dialTCP(t, p)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reply := tcpRoundTrip(t, conn, req)
 	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req); err != nil {
@@ -152,7 +152,7 @@ func TestListenTCPEndToEndPQ(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	conn := dialTCP(t, p)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reply := tcpRoundTrip(t, conn, req)
 	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionMLDSA44}, reply, rootPK, nonce, req); err != nil {
@@ -164,6 +164,43 @@ func TestListenTCPEndToEndPQ(t *testing.T) {
 	case <-done:
 	case <-time.After(6 * time.Second):
 		t.Fatal("listenTCP did not exit after cancel")
+	}
+}
+
+// TestPrepareTCPItemFiltersVersionBySRV verifies SRV chooses the matching key
+// before version negotiation in a dual-stack server.
+func TestPrepareTCPItemFiltersVersionBySRV(t *testing.T) {
+	edPK, edState := newCertState(t)
+	_, pqState := newPQCertState(t)
+	srv := protocol.ComputeSRV(edPK)
+	nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12, protocol.VersionMLDSA44}, rand.Reader, srv)
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	if len(nonce) != 32 {
+		t.Fatalf("nonce length = %d, want 32", len(nonce))
+	}
+
+	edCh := make(chan tcpBatchItem, 1)
+	pqCh := make(chan tcpBatchItem, 1)
+	item, ch, reason, err := prepareTCPItem(
+		zap.NewNop(),
+		&net.TCPAddr{IP: net.IPv6loopback, Port: 1},
+		req,
+		edState,
+		pqState,
+		edCh,
+		pqCh,
+		[]protocol.Version{protocol.VersionMLDSA44, protocol.VersionDraft12},
+	)
+	if err != nil {
+		t.Fatalf("prepareTCPItem: reason=%s err=%v", reason, err)
+	}
+	if ch != edCh {
+		t.Fatal("mixed SRV request routed away from Ed25519 channel")
+	}
+	if item.version != protocol.VersionDraft12 {
+		t.Fatalf("version = %s, want draft-12", item.version)
 	}
 }
 
@@ -204,7 +241,7 @@ func TestListenTCPBatchedPQRoundTrip(t *testing.T) {
 				results <- result{err: err}
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			if _, err := conn.Write(req); err != nil {
 				results <- result{err: err}
@@ -254,7 +291,7 @@ func TestListenTCPDualStackPQPreferred(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	conn := dialTCP(t, p)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reply := tcpRoundTrip(t, conn, req)
 	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionMLDSA44}, reply, pqRootPK, nonce, req); err != nil {
@@ -282,7 +319,7 @@ func TestListenTCPDualStackEd25519OnlyClient(t *testing.T) {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	conn := dialTCP(t, p)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	reply := tcpRoundTrip(t, conn, req)
 	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, reply, edRootPK, nonce, req); err != nil {
@@ -302,7 +339,7 @@ func TestListenTCPSequentialRequests(t *testing.T) {
 
 	srv := protocol.ComputeSRV(rootPK)
 	conn := dialTCP(t, p)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for i := range 4 {
 		nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
@@ -531,7 +568,7 @@ func TestListenTCPShutdownForceClose(t *testing.T) {
 	p, done, cancel := startListenTCP(t, edState, nil)
 
 	conn := dialTCP(t, p)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// poll until accept counter advances. The brief grace below covers the gap
 	// before live.add(c) lands
 	deadline := time.Now().Add(time.Second)
@@ -558,8 +595,7 @@ func TestListenTCPShutdownForceClose(t *testing.T) {
 // TestListenTCPRejectsNoStateConfigured verifies listenTCP returns an error
 // when no scheme state is configured.
 func TestListenTCPRejectsNoStateConfigured(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := listenTCP(ctx, nil, nil); err == nil {
 		t.Fatal("listenTCP with no state configured must error")
 	}
@@ -583,7 +619,7 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 
 	// First conn occupies the only slot, so hold it idle so it stays counted
 	hold := dialTCP(t, p)
-	defer hold.Close()
+	defer func() { _ = hold.Close() }()
 	deadline := time.Now().Add(time.Second)
 	for statsTCPAccepted.Load() <= startAccepted && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -596,7 +632,7 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial second: %v", err)
 	}
-	defer rej.Close()
+	defer func() { _ = rej.Close() }()
 	_ = rej.SetDeadline(time.Now().Add(2 * time.Second))
 	var scratch [1]byte
 	if _, err := rej.Read(scratch[:]); err == nil {
@@ -645,7 +681,7 @@ func TestGreasedPQReplyFitsMaxFrame(t *testing.T) {
 	}
 
 	// 1024 iterations cover all four grease modes with overwhelming probability
-	for i := 0; i < 1024; i++ {
+	for i := range 1024 {
 		reply := append([]byte(nil), replies[i%len(replies)]...)
 		if out := protocol.Grease(reply, protocol.VersionMLDSA44); out != nil {
 			reply = out
@@ -667,6 +703,44 @@ func TestWriteTCPReplyRejectsOversize(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Fatalf("writeTCPReply wrote %d bytes on reject; expected 0", buf.Len())
 	}
+}
+
+type shortWriter struct {
+	n int
+}
+
+func (w shortWriter) Write(p []byte) (int, error) {
+	if len(p) < w.n {
+		return len(p), nil
+	}
+	return w.n, nil
+}
+
+func TestWriteTCPReplyRejectsZeroProgress(t *testing.T) {
+	if err := writeTCPReply(shortWriter{}, []byte("reply")); err != io.ErrShortWrite {
+		t.Fatalf("writeTCPReply error = %v, want %v", err, io.ErrShortWrite)
+	}
+}
+
+func TestWriteTCPReplyContinuesAfterPartialWrite(t *testing.T) {
+	var buf strings.Builder
+	if err := writeTCPReply(shortWriterToBuilder{n: 2, b: &buf}, []byte("reply")); err != nil {
+		t.Fatalf("writeTCPReply: %v", err)
+	}
+	if got := buf.String(); got != "reply" {
+		t.Fatalf("written %q, want reply", got)
+	}
+}
+
+type shortWriterToBuilder struct {
+	n int
+	b *strings.Builder
+}
+
+func (w shortWriterToBuilder) Write(p []byte) (int, error) {
+	n := min(w.n, len(p))
+	_, _ = w.b.Write(p[:n])
+	return n, nil
 }
 
 // TestFlushTCPBatchOversizeDeliversError verifies flushTCPBatch delivers an

@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"time"
 )
@@ -81,7 +82,7 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	if len(sorted) == 0 {
 		return 0
 	}
-	idx := min(max(int(p*float64(len(sorted)-1)), 0), len(sorted)-1)
+	idx := min(max(int(math.Ceil(p*float64(len(sorted))))-1, 0), len(sorted)-1)
 	return sorted[idx]
 }
 

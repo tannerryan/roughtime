@@ -6,9 +6,10 @@ license](https://img.shields.io/github/license/tannerryan/roughtime.svg?style=fl
 
 A Go implementation of
 [Roughtime](https://datatracker.ietf.org/doc/draft-ietf-ntp-roughtime/) covering
-Google-Roughtime and IETF drafts 01–19. Ships a server, four CLIs (client,
-debug, bench, stamp), and two Go packages: a high-level client in the [roughtime
-package](roughtime.go) and wire primitives in the [protocol
+Google-Roughtime and IETF drafts 01–19 at the protocol layer. The high-level
+client advertises drafts 05+ for Ed25519 servers. Ships a server, four CLIs
+(client, debug, bench, stamp), and two Go packages: a high-level client in the
+[roughtime package](roughtime.go) and wire primitives in the [protocol
 package](protocol/protocol.go). Interop-tested with
 [ietf-wg-ntp/Roughtime-interop-code](https://github.com/ietf-wg-ntp/Roughtime-interop-code).
 Drafts 12-19 share wire version `0x8000000c`; peers advertise this single tag
@@ -47,7 +48,7 @@ Produces five binaries at the repo root:
 - `roughtime-stamp` — document timestamp proofs
 
 To build one directly: `go build ./cmd/roughtime` (or any other `./cmd/<name>`).
-See [Development](#development) for the full make targets.
+See [Development](#development) for the make targets.
 
 ## Server
 
@@ -127,14 +128,15 @@ can read the seeds.
 ## CLIs
 
 All four auto-detect the signature suite from the root public key length: 32
-bytes for Ed25519, 1312 bytes for ML-DSA-44.
+bytes for Ed25519, 1312 bytes for ML-DSA-44. Every binary also accepts
+`-version` to print its version and exit.
 
 ### client
 
 Queries one or more servers and prints authenticated timestamps alongside clock
-drift. With `-servers`, it samples 5 entries from distinct operators (or `-all`)
-and queries each twice to surface pairwise inconsistencies. Multi-server queries
-are chained by default.
+drift. With `-servers`, it samples 5 entries from distinct operators (or
+`-all`). Multi-server queries are chained by default. Pass `-chain=false` for
+independent single-server queries.
 
 ```bash
 go run ./cmd/roughtime-client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
@@ -247,12 +249,14 @@ Full API on
 [pkg.go.dev](https://pkg.go.dev/github.com/tannerryan/roughtime/protocol).
 
 ```go
+srv := protocol.ComputeSRV(rootPublicKey)
 nonce, request, err := protocol.CreateRequest(versions, rand.Reader, srv)
 midpoint, radius, err := protocol.VerifyReply(versions, reply, rootPublicKey, nonce, request)
 ```
 
-`srv` is the server's public key, used for SRV-tag binding from drafts 10+. A
-chain primitive supports multi-server measurement and malfeasance detection:
+`srv` is the SRV binding value, `protocol.ComputeSRV(serverPublicKey)`, sent
+from drafts 10+. A chain primitive supports multi-server measurement and
+malfeasance detection:
 
 ```go
 var chain protocol.Chain
@@ -270,6 +274,7 @@ Server side — parse and sign a batch:
 ```go
 cert, err := protocol.NewCertificate(mint, maxt, onlineSK, rootSK)
 req, err := protocol.ParseRequest(raw)
+requests := []protocol.Request{*req}
 replies, err := protocol.CreateReplies(version, requests, midpoint, radius, cert)
 ```
 

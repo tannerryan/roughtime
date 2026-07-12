@@ -57,7 +57,7 @@ func tcpEchoFramed(t *testing.T, ctx context.Context, handler func(req []byte) [
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
 				var hdr [PacketHeaderSize]byte
 				if _, err := io.ReadFull(c, hdr[:]); err != nil {
@@ -155,7 +155,7 @@ func TestRoundTripTCPRejectsBadMagic(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var scratch [64]byte
 		_, _ = conn.Read(scratch[:])
 		_, _ = conn.Write([]byte("NOTMAGIC\x00\x00\x00\x00"))
@@ -236,7 +236,7 @@ func TestRoundTripTCPRejectsZeroBodyLen(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var scratch [64]byte
 		_, _ = conn.Read(scratch[:])
 		var hdr [PacketHeaderSize]byte
@@ -263,7 +263,7 @@ func TestRoundTripTCPRejectsOversizeBodyLen(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var scratch [64]byte
 		_, _ = conn.Read(scratch[:])
 		var hdr [PacketHeaderSize]byte
@@ -291,7 +291,7 @@ func TestRoundTripTCPPartialBody(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var scratch [64]byte
 		_, _ = conn.Read(scratch[:])
 		var hdr [PacketHeaderSize]byte

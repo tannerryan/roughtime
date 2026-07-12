@@ -86,7 +86,7 @@ var (
 // validateFlags checks the CLI flag globals and returns the first violation.
 func validateFlags() error {
 	if *rootKeySeedHexFile == "" && *pqRootKeySeedHexFile == "" {
-		return fmt.Errorf("usage: roughtime -root-key-file <path> [-pq-root-key-file <path>] [-port <port>] [-log-level <level>]")
+		return fmt.Errorf("usage: roughtime (-root-key-file <path> | -pq-root-key-file <path>) [-port <port>] [-log-level <level>]")
 	}
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("-port %d out of range (must be 1-65535)", *port)

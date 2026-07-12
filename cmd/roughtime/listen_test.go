@@ -125,7 +125,7 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 // waitForServerReady polls until the server answers, avoiding startup races.
 func waitForServerReady(t *testing.T, p int, rootPK ed25519.PublicKey) {
 	t.Helper()
-	versions := protocol.Supported()
+	versions := protocol.ServerPreferenceEd25519
 	srv := protocol.ComputeSRV(rootPK)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
 	buf := make([]byte, 1500)
@@ -191,7 +191,7 @@ func TestListenMixedVersionBatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		nonce, req, err := protocol.CreateRequest(vers, rand.Reader, srv)
 		if err != nil {
 			t.Fatalf("CreateRequest: %v", err)
@@ -212,7 +212,7 @@ func TestListenMixedVersionBatch(t *testing.T) {
 	}
 
 	// alternate versions to force separate wire-group batches
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if i%2 == 0 {
 			sendAndExpect([]protocol.Version{protocol.VersionGoogle})
 		} else {
@@ -242,7 +242,7 @@ func TestListenSRVMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	versions := []protocol.Version{protocol.VersionDraft12}
 	_, req, err := protocol.CreateRequest(versions, rand.Reader, badSRV)
@@ -270,7 +270,7 @@ func TestListenAmplificationDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	versions := []protocol.Version{protocol.VersionDraft12}
 	_, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
@@ -300,13 +300,11 @@ func TestListenConcurrentBatches(t *testing.T) {
 	const senders = 8
 	const perSender = 16
 	var wg sync.WaitGroup
-	for i := 0; i < senders; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range senders {
+		wg.Go(func() {
 			sendAndVerify(t, p, rootPK, perSender)
 			_ = addr
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -343,9 +341,7 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 			const perSender = 8
 			var wg sync.WaitGroup
 			for range senders {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
+				wg.Go(func() {
 					for range perSender {
 						conn, err := net.DialUDP("udp", nil, addr)
 						if err != nil {
@@ -375,7 +371,7 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 							t.Errorf("verify %s: %v", v, err)
 						}
 					}
-				}()
+				})
 			}
 			wg.Wait()
 		})
@@ -392,7 +388,7 @@ func TestListenUndersizeRequestDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// well-formed but tiny: NONC with 32 zero bytes
 	nonce := make([]byte, 32)
@@ -435,7 +431,7 @@ func TestListenAllVersions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			nonce, req, err := protocol.CreateRequest([]protocol.Version{v}, rand.Reader, srv)
 			if err != nil {
@@ -473,7 +469,7 @@ func TestListenGreaseAlwaysFails(t *testing.T) {
 	versions := []protocol.Version{protocol.VersionDraft12}
 
 	var failed, passed int
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		conn, err := net.DialUDP("udp", nil, addr)
 		if err != nil {
 			t.Fatalf("dial: %v", err)
@@ -524,7 +520,7 @@ func TestListenMalformedPackets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			_ = conn.SetDeadline(time.Now().Add(300 * time.Millisecond))
 			if _, err := conn.Write(pkt); err != nil {
 				t.Fatalf("write: %v", err)
@@ -556,7 +552,7 @@ func TestListenBatchLatencyFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	nonce, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
@@ -610,7 +606,7 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	// enlarge rcvbuf so queued replies are not dropped
 	_ = c.SetReadBuffer(1 * 1024 * 1024)
 
@@ -660,7 +656,7 @@ func TestListenBatchMaxSizeFlush(t *testing.T) {
 // under default grease.
 func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 	t.Helper()
-	versions := protocol.Supported()
+	versions := protocol.ServerPreferenceEd25519
 	srv := protocol.ComputeSRV(rootPK)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
 
@@ -668,10 +664,10 @@ func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	buf := make([]byte, 1500)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		nonce, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
 		if err != nil {
 			t.Fatalf("CreateRequest: %v", err)

@@ -35,8 +35,11 @@ func statsLoop(ctx context.Context, log *zap.Logger, edState, pqState *atomic.Po
 	defer ticker.Stop()
 	log.Info("stats loop started", zap.Duration("interval", interval))
 
-	var lastReceived, lastResponded, lastDropped, lastPanics, lastBatchCount, lastBatchTotal, lastBatchErrs uint64
-	var lastTCPAccepted, lastTCPRejected, lastTCPCompleted, lastAmp uint64
+	// seed baselines from current totals so the first interval after a restart
+	// reports deltas, not lifetime counts
+	lastReceived, lastResponded, lastDropped := requestsReceived.total(), requestsResponded.total(), requestsDropped.total()
+	lastPanics, lastBatchCount, lastBatchTotal, lastBatchErrs := statsPanics.Load(), statsBatches.Load(), statsBatchedReqs.Load(), statsBatchErrs.Load()
+	lastTCPAccepted, lastTCPRejected, lastTCPCompleted, lastAmp := statsTCPAccepted.Load(), statsTCPRejected.Load(), statsTCPCompleted.Load(), statsAmpDropped.Load()
 	for {
 		select {
 		case <-ctx.Done():

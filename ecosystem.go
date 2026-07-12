@@ -18,6 +18,9 @@ import (
 // MaxEcosystemServers caps the size of a parsed ecosystem file.
 const MaxEcosystemServers = 1024
 
+// MaxEcosystemBytes caps ecosystem JSON accepted by ParseEcosystem.
+const MaxEcosystemBytes = 4 * 1024 * 1024
+
 // ecosystemFile is the top-level JSON shape of a Roughtime ecosystem document.
 type ecosystemFile struct {
 	Servers []ecosystemServer `json:"servers"`
@@ -54,12 +57,15 @@ func (v *flexString) UnmarshalJSON(b []byte) error {
 		*v = flexString(fmt.Sprintf("%d", n))
 		return nil
 	}
-	return fmt.Errorf("version must be a string or integer, got %s", string(b))
+	return fmt.Errorf("version must be a string or integer, got %s", SanitizeForDisplay(truncateForErr(string(b))))
 }
 
 // ParseEcosystem decodes a JSON server list into [Server] values with decoded
 // keys and sanitized strings.
 func ParseEcosystem(data []byte) ([]Server, error) {
+	if len(data) > MaxEcosystemBytes {
+		return nil, fmt.Errorf("roughtime: ecosystem is %d bytes (max %d)", len(data), MaxEcosystemBytes)
+	}
 	var f ecosystemFile
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("roughtime: parsing ecosystem: %w", err)
@@ -93,11 +99,15 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 			if t != "udp" && t != "tcp" {
 				return nil, fmt.Errorf("roughtime: server %d (%s): unsupported transport %q", i, SanitizeForDisplay(es.Name), SanitizeForDisplay(a.Protocol))
 			}
-			addrs = append(addrs, Address{Transport: t, Address: SanitizeForDisplay(a.Address)})
+			addr := SanitizeForDisplay(a.Address)
+			if _, _, err := net.SplitHostPort(addr); err != nil {
+				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(es.Name), addr, err)
+			}
+			addrs = append(addrs, Address{Transport: t, Address: addr})
 		}
 		out = append(out, Server{
 			Name:      SanitizeForDisplay(es.Name),
-			Version:   string(es.Version),
+			Version:   SanitizeForDisplay(string(es.Version)),
 			PublicKey: pk,
 			Addresses: addrs,
 		})
@@ -152,9 +162,11 @@ func OperatorKey(s Server) string {
 	return host
 }
 
-// MarshalEcosystem serializes servers as ecosystem JSON. Empty input produces a
-// doc [ParseEcosystem] rejects.
+// MarshalEcosystem serializes servers as ecosystem JSON.
 func MarshalEcosystem(servers []Server) ([]byte, error) {
+	if len(servers) == 0 {
+		return nil, errors.New("roughtime: ecosystem has no servers")
+	}
 	if len(servers) > MaxEcosystemServers {
 		return nil, fmt.Errorf("roughtime: %d servers exceeds max %d", len(servers), MaxEcosystemServers)
 	}
@@ -164,13 +176,24 @@ func MarshalEcosystem(servers []Server) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(s.Name), err)
 		}
+		if len(s.Addresses) == 0 {
+			return nil, fmt.Errorf("roughtime: server %d (%s): no addresses", i, SanitizeForDisplay(s.Name))
+		}
 		addrs := make([]ecosystemAddress, 0, len(s.Addresses))
 		for _, a := range s.Addresses {
-			addrs = append(addrs, ecosystemAddress{Protocol: a.Transport, Address: SanitizeForDisplay(a.Address)})
+			t := strings.ToLower(a.Transport)
+			if t != "udp" && t != "tcp" {
+				return nil, fmt.Errorf("roughtime: server %d (%s): unsupported transport %q", i, SanitizeForDisplay(s.Name), SanitizeForDisplay(a.Transport))
+			}
+			addr := SanitizeForDisplay(a.Address)
+			if _, _, err := net.SplitHostPort(addr); err != nil {
+				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(s.Name), addr, err)
+			}
+			addrs = append(addrs, ecosystemAddress{Protocol: t, Address: addr})
 		}
 		out.Servers = append(out.Servers, ecosystemServer{
 			Name:          SanitizeForDisplay(s.Name),
-			Version:       flexString(s.Version),
+			Version:       flexString(SanitizeForDisplay(s.Version)),
 			PublicKeyType: publicKeyTypeFor(sch),
 			PublicKey:     base64.StdEncoding.EncodeToString(s.PublicKey),
 			Addresses:     addrs,
@@ -195,6 +218,10 @@ func SanitizeForDisplay(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch {
 		case r < 0x20 || r == 0x7f:
+			return -1
+		case r >= 0x80 && r <= 0x9f:
+			return -1
+		case r == 0x061C:
 			return -1
 		case r >= 0x200B && r <= 0x200F:
 			return -1

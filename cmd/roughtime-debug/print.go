@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -37,9 +38,15 @@ func midpointUnit(v protocol.Version) string {
 // printDiagnostic prints a full diagnostic dump of the probe result.
 func printDiagnostic(r probeResult) {
 	reqTags := decode(msgBody(r.request))
-	respTags := decode(msgBody(r.reply))
 
 	printRequest(r, reqTags)
+	if len(r.reply) == 0 {
+		fmt.Printf("=== Response ===\n")
+		fmt.Printf("Size: 0 bytes\n")
+		fmt.Println("No response captured.")
+		return
+	}
+	respTags := decode(msgBody(r.reply))
 	printResponse(r, respTags)
 	if r.err == nil {
 		printVerified(r)
@@ -129,7 +136,28 @@ func printResponse(r probeResult, tags map[uint32][]byte) {
 			fmt.Printf("  %s: %s\n", e.name, hex.EncodeToString(val))
 		}
 	}
+	printUnknownTags(tags, protocol.TagSIG, protocol.TagVER, protocol.TagNONC, protocol.TagPATH,
+		protocol.TagSREP, protocol.TagCERT, protocol.TagINDX, protocol.TagTYPE)
 	fmt.Println()
+}
+
+// printUnknownTags surfaces any tag not in known, so grease and undefined tags
+// stay visible. Only the numeric id and hex value are shown, never decoded.
+func printUnknownTags(tags map[uint32][]byte, known ...uint32) {
+	set := make(map[uint32]bool, len(known))
+	for _, t := range known {
+		set[t] = true
+	}
+	extra := make([]uint32, 0)
+	for t := range tags {
+		if !set[t] {
+			extra = append(extra, t)
+		}
+	}
+	slices.Sort(extra)
+	for _, t := range extra {
+		fmt.Printf("  0x%08x: %s\n", t, hex.EncodeToString(tags[t]))
+	}
 }
 
 // printVerified prints the verified midpoint, radius, and amplification status.
@@ -238,6 +266,8 @@ func printSREP(r probeResult, tags map[uint32][]byte) {
 		}
 		fmt.Println()
 	}
+	printUnknownTags(srep, protocol.TagROOT, protocol.TagNONC, protocol.TagMIDP,
+		protocol.TagRADI, protocol.TagVER, protocol.TagVERS)
 	fmt.Println()
 }
 
@@ -335,6 +365,8 @@ func printCert(r probeResult, tags map[uint32][]byte) {
 			fmt.Printf("Cert validity:   INVALID (midpoint outside [mint, maxt])\n")
 		}
 	}
+	printUnknownTags(certMsg, protocol.TagSIG, protocol.TagDELE)
+	printUnknownTags(dele, protocol.TagPUBK, protocol.TagMINT, protocol.TagMAXT)
 }
 
 // printHex prints a tag's value as hex, or "(empty)" if zero length.

@@ -38,6 +38,10 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
+// errChainAborted marks chain links never attempted after an earlier link
+// failed.
+var errChainAborted = errors.New("roughtime: chained request aborted")
+
 // Server describes one Roughtime server with a trust root and one or more
 // transport endpoints.
 type Server struct {
@@ -293,6 +297,9 @@ func (c *Client) QueryChainWithNonce(ctx context.Context, servers []Server, seed
 // queryChain is the shared implementation of QueryChain and
 // QueryChainWithNonce.
 func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []byte) (*ChainResult, error) {
+	if len(servers) > protocol.MaxChainLinks {
+		return nil, fmt.Errorf("roughtime: %d servers exceeds max chain length %d", len(servers), protocol.MaxChainLinks)
+	}
 	chain := &protocol.Chain{}
 	results := make([]Result, len(servers))
 	for i, s := range servers {
@@ -316,6 +323,11 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 		}
 		if err != nil {
 			results[i].Err = fmt.Errorf("chained request: %w", err)
+			// preserve the per-slot invariant for links never attempted
+			for j := i + 1; j < len(servers); j++ {
+				results[j].Server = servers[j]
+				results[j].Err = errChainAborted
+			}
 			return &ChainResult{Results: results, chain: chain}, err
 		}
 

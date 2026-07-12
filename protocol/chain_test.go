@@ -715,15 +715,40 @@ func TestVerifyCausalOrderFiveLinks(t *testing.T) {
 }
 
 // TestVerifyRejectsTooManyLinks verifies Chain.Verify rejects chains exceeding
-// maxChainLinks.
+// MaxChainLinks.
 func TestVerifyRejectsTooManyLinks(t *testing.T) {
-	c := &Chain{Links: make([]ChainLink, maxChainLinks+1)}
+	c := &Chain{Links: make([]ChainLink, MaxChainLinks+1)}
 	err := c.Verify()
 	if err == nil {
-		t.Fatal("expected error for chain length > maxChainLinks")
+		t.Fatal("expected error for chain length > MaxChainLinks")
 	}
 	if !bytes.Contains([]byte(err.Error()), []byte("max")) {
 		t.Fatalf("error should mention max link count, got: %v", err)
+	}
+}
+
+// TestVerifyBoundsReturnsPerLinkBounds verifies VerifyBounds returns one
+// verified midpoint and radius per link and rejects the same chains as Verify.
+func TestVerifyBoundsReturnsPerLinkBounds(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft12, 3)
+	bounds, err := c.VerifyBounds()
+	if err != nil {
+		t.Fatalf("VerifyBounds: %v", err)
+	}
+	if len(bounds) != len(c.Links) {
+		t.Fatalf("got %d bounds, want %d", len(bounds), len(c.Links))
+	}
+	for i, b := range bounds {
+		if b.Midpoint.IsZero() {
+			t.Errorf("link %d: zero midpoint", i)
+		}
+		if b.Radius <= 0 {
+			t.Errorf("link %d: non-positive radius %v", i, b.Radius)
+		}
+	}
+	over := &Chain{Links: make([]ChainLink, MaxChainLinks+1)}
+	if _, err := over.VerifyBounds(); err == nil {
+		t.Fatal("expected error for chain length > MaxChainLinks")
 	}
 }
 

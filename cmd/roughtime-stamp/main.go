@@ -3,7 +3,8 @@
 
 // Command roughtime-stamp produces and verifies Roughtime document timestamps.
 // Stamp mode hashes a file with SHA-256, binds the digest into a chained query
-// across multiple witnesses, and writes the proof to disk. Verify mode
+// across multiple witnesses, and writes the proof to disk as gzipped
+// malfeasance-report JSON readable by roughtime.ParseProof. Verify mode
 // re-validates a stored proof offline.
 //
 // Stamp:
@@ -20,9 +21,9 @@
 // SHA-256 seed requires a 32-byte nonce, so Google-Roughtime entries are
 // skipped.
 //
-// Stamping requires >=2 witnesses by design. The spec recommends >=3 for
-// malfeasance detection, but two are sufficient to bind a document to a
-// corroborated time window.
+// Stamping requires >=2 distinct witness keys by design. The spec recommends
+// >=3 for malfeasance detection, but two distinct witnesses are sufficient to
+// bind a document to a corroborated time window.
 package main
 
 import (
@@ -58,17 +59,13 @@ var (
 	// timeout is the per-server timeout flag.
 	timeout = flag.Duration("timeout", 2*time.Second, "per-server timeout")
 	// retries is the per-server max retry attempts flag.
-	retries = flag.Int("retries", 3, "max retry attempts per server")
+	retries = flag.Int("retries", 3, "max attempts per server (1 = no retry)")
 	// showVersion is the version-print flag.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
 // maxFileBytes caps ecosystem and proof file reads.
 const maxFileBytes = 4 * 1024 * 1024
-
-// tsFormat is the display-only timestamp layout with truncated sub-millisecond
-// digits.
-const tsFormat = "2006-01-02T15:04:05.000Z"
 
 // main is the CLI entry point.
 func main() {
@@ -78,13 +75,13 @@ func main() {
 		return
 	}
 	if err := validateFlags(); err != nil {
-		fmt.Fprintf(os.Stderr, "stamp: %s\n", err)
+		fmt.Fprintf(os.Stderr, "roughtime-stamp: %s\n", err)
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "stamp: %s\n", err)
+		fmt.Fprintf(os.Stderr, "roughtime-stamp: %s\n", err)
 		os.Exit(1)
 	}
 }
@@ -107,6 +104,12 @@ func validateFlags() error {
 	case "stamp":
 		if *outPath == "" {
 			return errors.New("-out is required for -mode stamp")
+		}
+		if err := rejectSamePath("-out", *outPath, "-doc", *docPath); err != nil {
+			return err
+		}
+		if err := rejectSamePath("-out", *outPath, "-servers", *serversFile); err != nil {
+			return err
 		}
 	case "verify":
 		if *inPath == "" {
@@ -147,6 +150,10 @@ func stamp(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("query chain: %w", err)
 	}
+	// a truncated chain from an interrupt must not be written as a success
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("interrupted before completing stamp: %w", err)
+	}
 	proof, err := cr.Proof()
 	if err != nil {
 		printFailures(cr.Results)
@@ -173,12 +180,31 @@ func stamp(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("inspecting proof: %w", err)
 	}
-	if err := rejectLegacyWitnesses(links); err != nil {
-		return err
+	// count distinct keys, not links: one key signing every link is not
+	// independent corroboration
+	witnesses := distinctKeys(links)
+	if witnesses < 2 {
+		printFailures(cr.Results)
+		return fmt.Errorf("only %d distinct witness(es) responded; need >=2 for a multi-witness stamp", witnesses)
 	}
 	data, err := proof.MarshalGzip()
 	if err != nil {
 		return fmt.Errorf("serializing proof: %w", err)
+	}
+	parsed, err := roughtime.ParseProof(data)
+	if err != nil {
+		return fmt.Errorf("serialized proof does not parse: %w", err)
+	}
+	if err := parsed.Verify(); err != nil {
+		return fmt.Errorf("serialized proof verify: %w", err)
+	}
+	if err := parsed.Trust(servers); err != nil {
+		return fmt.Errorf("serialized proof trust: %w", err)
+	}
+	if parsedSeed, err := parsed.SeedNonce(); err != nil {
+		return fmt.Errorf("serialized proof seed: %w", err)
+	} else if !bytes.Equal(parsedSeed, digest) {
+		return fmt.Errorf("serialized proof seed %x != SHA-256(document) %x", parsedSeed, digest)
 	}
 	if err := writeProofAtomic(*outPath, data); err != nil {
 		return err
@@ -197,7 +223,7 @@ func stamp(ctx context.Context) error {
 	fmt.Printf("  Saved to:         %s (%d bytes)\n", *outPath, len(data))
 	fmt.Printf("  Verify offline:   roughtime-stamp -mode verify -doc %s -servers %s -in %s\n", *docPath, *serversFile, *outPath)
 	fmt.Println()
-	fmt.Printf("STAMPED: %s is attested by %d independent Roughtime witnesses to have\n", *docPath, len(links))
+	fmt.Printf("STAMPED: %s is attested by %d distinct witness keys to have\n", *docPath, witnesses)
 	fmt.Println("existed no later than the upper bound above. Any modification to the")
 	fmt.Println("document or receipt invalidates this attestation.")
 	return nil
@@ -241,6 +267,11 @@ func verify(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// distinct keys, not links: repeated keys are not independent witnesses
+	witnesses := distinctKeys(links)
+	if witnesses < 2 {
+		return fmt.Errorf("proof has %d distinct witness(es); a multi-witness stamp requires >=2", witnesses)
+	}
 
 	names := lookup(servers)
 	fmt.Println("=== Roughtime Timestamp Verification ===")
@@ -250,7 +281,7 @@ func verify(ctx context.Context) error {
 	fmt.Println("Receipt")
 	fmt.Printf("  Path:             %s\n", *inPath)
 	fmt.Printf("  On disk:          %d bytes\n", len(raw))
-	fmt.Printf("  Witnesses:        %d\n", proof.Len())
+	fmt.Printf("  Witnesses:        %d\n", witnesses)
 	fmt.Println()
 
 	printSeedLink(links[0], digest, names)
@@ -266,8 +297,8 @@ func verify(ctx context.Context) error {
 
 	printAttestationWindow(links)
 
-	fmt.Printf("VALID: %s is attested by %d independent Roughtime witnesses to have\n", *docPath, proof.Len())
-	fmt.Println("existed at a time within the verified window above.")
+	fmt.Printf("VALID: %s is attested by %d distinct witness keys to have\n", *docPath, witnesses)
+	fmt.Println("existed no later than the upper bound above.")
 	return nil
 }
 
@@ -278,7 +309,7 @@ func hashDocument(ctx context.Context, path string) ([]byte, int64, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("opening document: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, 0, fmt.Errorf("stat document: %w", err)
@@ -305,7 +336,47 @@ func hashDocument(ctx context.Context, path string) ([]byte, int64, error) {
 			return nil, 0, fmt.Errorf("hashing document: %w", err)
 		}
 	}
+	after, err := f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat document after hashing: %w", err)
+	}
+	if after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) || after.Mode() != info.Mode() {
+		return nil, 0, fmt.Errorf("%s changed while hashing", path)
+	}
+	pathInfo, err := os.Stat(filepath.Clean(path))
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat document path after hashing: %w", err)
+	}
+	if !os.SameFile(after, pathInfo) {
+		return nil, 0, fmt.Errorf("%s changed while hashing", path)
+	}
 	return h.Sum(nil), info.Size(), nil
+}
+
+// rejectSamePath rejects path pairs that name the same existing file.
+func rejectSamePath(aName, aPath, bName, bPath string) error {
+	aClean := filepath.Clean(aPath)
+	bClean := filepath.Clean(bPath)
+	aAbs, aErr := filepath.Abs(aClean)
+	bAbs, bErr := filepath.Abs(bClean)
+	if aErr == nil && bErr == nil && aAbs == bAbs {
+		return fmt.Errorf("%s must not be the same path as %s", aName, bName)
+	}
+	aInfo, aStatErr := os.Stat(aClean)
+	bInfo, bStatErr := os.Stat(bClean)
+	if aStatErr == nil && bStatErr == nil && os.SameFile(aInfo, bInfo) {
+		return fmt.Errorf("%s must not refer to the same file as %s", aName, bName)
+	}
+	return nil
+}
+
+// distinctKeys counts the unique witness public keys across links.
+func distinctKeys(links []roughtime.ProofLink) int {
+	seen := make(map[string]struct{}, len(links))
+	for _, l := range links {
+		seen[string(l.PublicKey)] = struct{}{}
+	}
+	return len(seen)
 }
 
 // loadServers reads and parses an ecosystem JSON file.
@@ -324,7 +395,7 @@ func readBoundedFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -355,11 +426,6 @@ func writeProofAtomic(path string, data []byte) error {
 		cleanup()
 		return fmt.Errorf("writing proof: %w", err)
 	}
-	// CreateTemp uses 0600, so bump to 0644 to make proofs world-readable
-	if err := os.Chmod(tmp, 0o644); err != nil {
-		cleanup()
-		return fmt.Errorf("chmod proof: %w", err)
-	}
 	if err := f.Sync(); err != nil {
 		cleanup()
 		return fmt.Errorf("fsync proof: %w", err)
@@ -376,18 +442,6 @@ func writeProofAtomic(path string, data []byte) error {
 	if dir, err := os.Open(filepath.Dir(path)); err == nil {
 		_ = dir.Sync()
 		_ = dir.Close()
-	}
-	return nil
-}
-
-// rejectLegacyWitnesses errors on drafts 10-11 links, whose legacy malfeasance
-// format omits the per-link request bytes required for offline verify.
-func rejectLegacyWitnesses(links []roughtime.ProofLink) error {
-	for i, l := range links {
-		switch l.Version.ShortString() {
-		case "draft-10", "draft-11":
-			return fmt.Errorf("witness %d uses %s; legacy format omits request bytes required for offline verify", i, l.Version.ShortString())
-		}
 	}
 	return nil
 }

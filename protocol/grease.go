@@ -8,7 +8,8 @@ import (
 	mrand "math/rand/v2"
 )
 
-// Grease applies a random grease transformation to a signed reply.
+// Grease applies a random grease transformation to a signed reply. It may
+// modify reply in place, so callers must pass a buffer they own.
 func Grease(reply []byte, ver Version) []byte {
 	mode := mrand.IntN(4)
 	switch mode {

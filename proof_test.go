@@ -271,6 +271,36 @@ func TestProofMarshalGzipRoundTrip(t *testing.T) {
 	}
 }
 
+// TestProofMarshalGzipDraft10RoundTrip verifies legacy-version chains still
+// marshal to an offline-verifiable proof.
+func TestProofMarshalGzipDraft10RoundTrip(t *testing.T) {
+	f := newFakeServer(t)
+	t.Cleanup(f.Close)
+	s := f.server()
+	s.Version = "draft-ietf-ntp-roughtime-10"
+
+	var c roughtime.Client
+	cr, err := c.QueryChain(context.Background(), []roughtime.Server{s, s})
+	if err != nil {
+		t.Fatalf("QueryChain: %v", err)
+	}
+	proof, err := cr.Proof()
+	if err != nil {
+		t.Fatalf("Proof: %v", err)
+	}
+	data, err := proof.MarshalGzip()
+	if err != nil {
+		t.Fatalf("MarshalGzip: %v", err)
+	}
+	parsed, err := roughtime.ParseProof(data)
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if err := parsed.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+}
+
 // TestProofMarshalGzipNil verifies Proof.MarshalGzip errors on a nil receiver.
 func TestProofMarshalGzipNil(t *testing.T) {
 	var p *roughtime.Proof
@@ -447,6 +477,14 @@ func TestProofTrust(t *testing.T) {
 func TestProofTrustUnknown(t *testing.T) {
 	if err := makeProof(t, 2).Trust(nil); err == nil {
 		t.Fatal("Trust(nil) accepted untrusted keys")
+	}
+}
+
+// TestProofTrustIgnoresEmptyTrustedKey verifies a zero-valued trusted entry
+// does not vacuously trust a real-keyed chain.
+func TestProofTrustIgnoresEmptyTrustedKey(t *testing.T) {
+	if err := makeProof(t, 2).Trust([]roughtime.Server{{}}); err == nil {
+		t.Fatal("zero-valued trusted entry should not trust the chain")
 	}
 }
 

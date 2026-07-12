@@ -1,5 +1,8 @@
 // Package mldsa implements the post-quantum ML-DSA signature scheme specified
 // in FIPS 204.
+//
+// The filippo.io/mldsa/x509 subpackage implements PKIX and PKCS #8 parsing and
+// marshaling for ML-DSA keys.
 package mldsa
 
 import (

@@ -170,7 +170,7 @@ func (f *fakeServer) serveTCP() {
 // serveTCPConn reads one framed request from conn, generates a reply, and
 // writes it back.
 func (f *fakeServer) serveTCPConn(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	var hdr [protocol.PacketHeaderSize]byte
 	if _, err := readFull(conn, hdr[:]); err != nil {

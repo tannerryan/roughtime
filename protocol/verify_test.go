@@ -1046,8 +1046,8 @@ func TestVerifyReplyRejectsMismatchedNONCInSREP(t *testing.T) {
 	}
 }
 
-// TestVerifyReplyToleratesMissingNONC verifies VerifyReply tolerates missing
-// top-level NONC for drafts 03+.
+// TestVerifyReplyToleratesMissingNONC verifies VerifyReply accepts missing
+// top-level NONC for drafts 03+ because the Merkle proof binds the nonce.
 func TestVerifyReplyToleratesMissingNONC(t *testing.T) {
 	for _, ver := range []Version{VersionDraft03, VersionDraft05, VersionDraft08, VersionDraft10, VersionDraft12} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
@@ -1056,7 +1056,7 @@ func TestVerifyReplyToleratesMissingNONC(t *testing.T) {
 				delete(tags, TagNONC)
 			})
 			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err != nil {
-				t.Fatalf("missing NONC should be tolerated (Merkle proof binds nonce): %v", err)
+				t.Fatalf("VerifyReply rejected missing NONC: %v", err)
 			}
 		})
 	}
@@ -1568,4 +1568,34 @@ func FuzzExtractVersion(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ExtractVersion(data)
 	})
+}
+
+// TestVerifyReplyRejectsEpochMisdecode verifies an honest low-version reply
+// verifies, while a forged epoch-crossing VER lands at an absurd date.
+func TestVerifyReplyRejectsEpochMisdecode(t *testing.T) {
+	cert, _ := testCert(t)
+	rootPK := cert.edRootPK
+	offered := []Version{VersionDraft05, VersionDraft08}
+
+	// honest draft-05 (MJD) reply with the current time verifies
+	nonce, req, _ := CreateRequest(offered, rand.Reader, nil)
+	parsed, _ := ParseRequest(req)
+	honest, _ := CreateReplies(VersionDraft05, []Request{*parsed}, time.Now(), time.Second, cert)
+	if _, _, err := VerifyReply(offered, honest[0], rootPK, nonce, req); err != nil {
+		t.Fatalf("honest draft-05 reply should verify: %v", err)
+	}
+
+	// forge a draft-08 (Unix) reply down to draft-05 so its timestamp decodes
+	// as MJD, giving the year 1858
+	forged, _ := CreateReplies(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert)
+	reply := forged[0]
+	body, _ := unwrapPacket(reply)
+	lo, _, ok := findTagRange(body, TagVER)
+	if !ok {
+		t.Fatal("no top-level VER in draft-08 reply")
+	}
+	binary.LittleEndian.PutUint32(reply[PacketHeaderSize+lo:], uint32(VersionDraft05))
+	if _, _, err := VerifyReply(offered, reply, rootPK, nonce, req); err == nil {
+		t.Fatal("forged epoch-crossing VER should be rejected")
+	}
 }
