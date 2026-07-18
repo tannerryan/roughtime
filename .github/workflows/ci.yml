@@ -21,31 +21,26 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           install-tools: "true"
-      - run: make verify
-      - run: make verify-tidy
+      - run: make verify verify-tidy verify-vendor
       - run: make fmt && git diff --exit-code
       - run: make lint
+      - run: make vuln
+      - run: make test-race
 
-  test:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - { goos: linux, goarch: amd64 }
+          - { goos: freebsd, goarch: amd64 }
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: make coverage-report
-      - name: Coverage summary
-        run: |
-          total=$(tail -1 coverage.txt | awk '{print $3}')
-          {
-            echo "## Coverage: $total"
-            echo '```'
-            cat coverage.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: coverage
-          path: |
-            coverage.out
-            coverage.txt
-            coverage.html
-          retention-days: 30
+      - run: make build GOOS=${{ matrix.target.goos }} GOARCH=${{ matrix.target.goarch }}
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build --tag roughtime:ci .

@@ -5,10 +5,8 @@
 /roughtime-bench
 /roughtime-stamp
 
-# Coverage artifacts
-/coverage.out
-/coverage.txt
-/coverage.html
+# Locally generated private root keys
+/keys/
 
 # Editor / OS cruft
 .idea

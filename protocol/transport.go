@@ -68,7 +68,7 @@ func RoundTripUDP(ctx context.Context, address string, request []byte, timeout t
 }
 
 // RoundTripTCP sends one ROUGHTIM-framed request over TCP and returns the
-// reply, RTT, and receipt time.
+// reply, RTT, and receipt time. timeout bounds dialing and I/O together.
 func RoundTripTCP(ctx context.Context, address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
 	deadline := time.Now().Add(timeout)
 	dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
@@ -83,22 +83,19 @@ func RoundTripTCP(ctx context.Context, address string, request []byte, timeout t
 		_ = tcp.SetNoDelay(true)
 	}
 
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
 	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("set deadline: %w", err)
 	}
 
 	start := time.Now()
-	if _, err := conn.Write(request); err != nil {
+	n, err := conn.Write(request)
+	if err == nil && n != len(request) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr
 		}

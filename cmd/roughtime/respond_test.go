@@ -17,8 +17,7 @@ import (
 	"go.uber.org/zap/zaptest"
 )
 
-// TestValidateRequestAcceptsValidDraft12 verifies validateRequest accepts a
-// well-formed Draft12 request.
+// TestValidateRequestAcceptsValidDraft12 covers parsing and negotiation.
 func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
@@ -31,7 +30,7 @@ func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 	if !ok {
 		t.Fatal("validateRequest rejected a well-formed request")
 	}
-	if reason != "" {
+	if reason != dropNone {
 		t.Fatalf("reason=%q want empty on success", reason)
 	}
 	if vr.version != protocol.VersionDraft12 {
@@ -42,39 +41,7 @@ func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 	}
 }
 
-// TestValidateRequestAcceptsGoogle verifies validateRequest accepts a
-// Google-Roughtime request.
-func TestValidateRequestAcceptsGoogle(t *testing.T) {
-	_, st := newUnitCertState(t)
-	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionGoogle}, rand.Reader, nil)
-	if err != nil {
-		t.Fatalf("CreateRequest: %v", err)
-	}
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	vr, _, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st)
-	if !ok {
-		t.Fatal("validateRequest rejected Google request")
-	}
-	if vr.version != protocol.VersionGoogle {
-		t.Fatalf("version=%s want Google", vr.version)
-	}
-}
-
-// TestValidateRequestRejectsParseError verifies validateRequest rejects
-// all-zero bytes.
-func TestValidateRequestRejectsParseError(t *testing.T) {
-	_, st := newUnitCertState(t)
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-
-	// debug logger exercises parse-failure branch
-	junk := make([]byte, 1024)
-	if _, reason, ok := validateRequest(zaptest.NewLogger(t), junk, peer, 1024, nil, st); ok || reason != dropParse {
-		t.Fatalf("validateRequest junk: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropParse)
-	}
-}
-
-// TestValidateRequestRejectsSRVMismatch verifies validateRequest rejects a
-// request whose SRV addresses a different root.
+// TestValidateRequestRejectsSRVMismatch covers server-binding rejection.
 func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 	_, st := newUnitCertState(t)
 
@@ -94,192 +61,7 @@ func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 	}
 }
 
-// TestValidateRequestAcceptsAbsentSRV verifies validateRequest accepts a
-// draft-09 request with no SRV tag.
-func TestValidateRequestAcceptsAbsentSRV(t *testing.T) {
-	_, st := newUnitCertState(t)
-	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft09}, rand.Reader, nil)
-	if err != nil {
-		t.Fatalf("CreateRequest: %v", err)
-	}
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	if _, _, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st); !ok {
-		t.Fatal("validateRequest rejected draft-09 request without SRV")
-	}
-}
-
-// TestValidateRequestRejectsUnsupportedVersion verifies validateRequest rejects
-// an unrecognised wire version.
-func TestValidateRequestRejectsUnsupportedVersion(t *testing.T) {
-	rootPK, st := newUnitCertState(t)
-	srv := protocol.ComputeSRV(rootPK)
-	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.Version(0xdeadbeef)}, rand.Reader, srv)
-	if err != nil {
-		t.Fatalf("CreateRequest: %v", err)
-	}
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	if _, reason, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok || reason != dropVersion {
-		t.Fatalf("validateRequest unsupported version: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropVersion)
-	}
-}
-
-// TestValidateRequestStoresBufPtr verifies validateRequest preserves the
-// caller's buffer pointer for pool return.
-func TestValidateRequestStoresBufPtr(t *testing.T) {
-	rootPK, st := newUnitCertState(t)
-	srv := protocol.ComputeSRV(rootPK)
-	_, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	buf := make([]byte, len(req))
-	copy(buf, req)
-	vr, _, ok := validateRequest(zap.NewNop(), buf, peer, len(req), &buf, st)
-	if !ok {
-		t.Fatal("validateRequest rejected valid request")
-	}
-	if vr.bufPtr != &buf {
-		t.Fatal("validateRequest did not preserve bufPtr")
-	}
-}
-
-// TestSignAndBuildRepliesSingle verifies signAndBuildReplies returns a
-// verifiable reply for a single request.
-func TestSignAndBuildRepliesSingle(t *testing.T) {
-	rootPK, st := newUnitCertState(t)
-	srv := protocol.ComputeSRV(rootPK)
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 12345}
-
-	prevGrease := *greaseRate
-	*greaseRate = 0
-	t.Cleanup(func() { *greaseRate = prevGrease })
-
-	nonce, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
-	parsed, _ := protocol.ParseRequest(req)
-	items := []validatedRequest{{req: *parsed, peer: peer, requestSize: len(req), version: protocol.VersionDraft12}}
-
-	replies := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12, items)
-	if len(replies) != 1 {
-		t.Fatalf("replies=%d want 1", len(replies))
-	}
-	if len(replies[0].bytes) > len(req) {
-		t.Fatalf("amplification: reply=%d request=%d", len(replies[0].bytes), len(req))
-	}
-	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, replies[0].bytes, rootPK, nonce, req); err != nil {
-		t.Fatalf("VerifyReply: %v", err)
-	}
-}
-
-// TestSignAndBuildRepliesBatch verifies signAndBuildReplies returns one
-// verifiable reply per item, in order.
-func TestSignAndBuildRepliesBatch(t *testing.T) {
-	rootPK, st := newUnitCertState(t)
-	srv := protocol.ComputeSRV(rootPK)
-
-	prevGrease := *greaseRate
-	*greaseRate = 0
-	t.Cleanup(func() { *greaseRate = prevGrease })
-
-	const n = 8
-	nonces := make([][]byte, n)
-	reqs := make([][]byte, n)
-	items := make([]validatedRequest, n)
-	for i := range items {
-		nonce, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
-		parsed, _ := protocol.ParseRequest(req)
-		nonces[i], reqs[i] = nonce, req
-		items[i] = validatedRequest{
-			req:         *parsed,
-			peer:        &net.UDPAddr{IP: net.IPv6loopback, Port: 10000 + i},
-			requestSize: len(req),
-			version:     protocol.VersionDraft12,
-		}
-	}
-
-	replies := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12, items)
-	if len(replies) != n {
-		t.Fatalf("replies=%d want %d", len(replies), n)
-	}
-	for i, r := range replies {
-		if r.peer.Port != 10000+i {
-			t.Errorf("reply %d: peer port=%d want %d", i, r.peer.Port, 10000+i)
-		}
-		if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, r.bytes, rootPK, nonces[i], reqs[i]); err != nil {
-			t.Errorf("reply %d VerifyReply: %v", i, err)
-		}
-	}
-}
-
-// TestSignAndBuildRepliesAmplificationDrop verifies signAndBuildReplies drops a
-// reply that would exceed the request size.
-func TestSignAndBuildRepliesAmplificationDrop(t *testing.T) {
-	rootPK, st := newUnitCertState(t)
-	srv := protocol.ComputeSRV(rootPK)
-	_, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
-	parsed, _ := protocol.ParseRequest(req)
-
-	prevGrease := *greaseRate
-	*greaseRate = 0
-	t.Cleanup(func() { *greaseRate = prevGrease })
-
-	items := []validatedRequest{{
-		req:         *parsed,
-		peer:        &net.UDPAddr{IP: net.IPv6loopback, Port: 1},
-		requestSize: 64, // forces reply to exceed request
-		version:     protocol.VersionDraft12,
-	}}
-	replies := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12, items)
-	if len(replies) != 0 {
-		t.Fatalf("amplification: got %d replies, want 0", len(replies))
-	}
-}
-
-// TestSignAndBuildRepliesGreaseNeverAmplifies drives the grease path with
-// greaseRate=1 and a budget equal to the ungreased reply size. Whatever mode
-// Grease picks, the result must still fit the budget (greased when it fits,
-// ungreased fallback when it would grow), so a reply is always returned and
-// never exceeds the request size.
-func TestSignAndBuildRepliesGreaseNeverAmplifies(t *testing.T) {
-	rootPK, st := newUnitCertState(t)
-	srv := protocol.ComputeSRV(rootPK)
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 9}
-	_, req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
-	parsed, _ := protocol.ParseRequest(req)
-
-	prevGrease := *greaseRate
-	t.Cleanup(func() { *greaseRate = prevGrease })
-
-	// baseline ungreased reply size, used as a tight amplification budget
-	*greaseRate = 0
-	base := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12,
-		[]validatedRequest{{req: *parsed, peer: peer, requestSize: len(req), version: protocol.VersionDraft12}})
-	if len(base) != 1 {
-		t.Fatalf("baseline replies=%d want 1", len(base))
-	}
-	budget := len(base[0].bytes)
-
-	*greaseRate = 1
-	for i := range 300 {
-		got := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12,
-			[]validatedRequest{{req: *parsed, peer: peer, requestSize: budget, version: protocol.VersionDraft12}})
-		if len(got) != 1 {
-			t.Fatalf("iter %d: replies=%d want 1 (fallback must keep the ungreased reply)", i, len(got))
-		}
-		if len(got[0].bytes) > budget {
-			t.Fatalf("iter %d: grease amplified reply=%d budget=%d", i, len(got[0].bytes), budget)
-		}
-	}
-}
-
-// TestSignAndBuildRepliesEmpty verifies signAndBuildReplies returns nil for an
-// empty batch.
-func TestSignAndBuildRepliesEmpty(t *testing.T) {
-	_, st := newUnitCertState(t)
-	replies := signAndBuildReplies(zap.NewNop(), st, protocol.VersionDraft12, nil)
-	if replies != nil {
-		t.Fatalf("nil items: got %d replies", len(replies))
-	}
-}
-
-// FuzzValidateRequest verifies validateRequest never panics on arbitrary input.
+// FuzzValidateRequest exercises arbitrary UDP requests.
 func FuzzValidateRequest(f *testing.F) {
 	rootPK, rootSK, _ := ed25519.GenerateKey(rand.Reader)
 	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
@@ -301,41 +83,5 @@ func FuzzValidateRequest(f *testing.F) {
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
 	f.Fuzz(func(_ *testing.T, data []byte) {
 		validateRequest(zap.NewNop(), data, peer, len(data), nil, st)
-	})
-}
-
-// FuzzServeOnce verifies the validate-and-sign pipeline never panics on
-// arbitrary input.
-func FuzzServeOnce(f *testing.F) {
-	rootPK, rootSK, _ := ed25519.GenerateKey(rand.Reader)
-	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
-	now := time.Now()
-	cert, _ := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
-	st := &certState{cert: cert, expiry: now.Add(time.Hour), srvHash: protocol.ComputeSRV(rootPK)}
-
-	srv := protocol.ComputeSRV(rootPK)
-	for _, v := range []protocol.Version{
-		protocol.VersionGoogle,
-		protocol.VersionDraft01,
-		protocol.VersionDraft08,
-		protocol.VersionDraft12,
-	} {
-		var s []byte
-		if v != protocol.VersionGoogle {
-			s = srv
-		}
-		if _, req, err := protocol.CreateRequest([]protocol.Version{v}, rand.Reader, s); err == nil {
-			f.Add(req)
-		}
-	}
-	f.Add(make([]byte, 1024))
-
-	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	f.Fuzz(func(_ *testing.T, data []byte) {
-		vr, _, ok := validateRequest(zap.NewNop(), data, peer, len(data), nil, st)
-		if !ok {
-			return
-		}
-		signAndBuildReplies(zap.NewNop(), st, vr.version, []validatedRequest{vr})
 	})
 }

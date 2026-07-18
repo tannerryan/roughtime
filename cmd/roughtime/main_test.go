@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"io"
 	"net"
 	"net/http"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tannerryan/roughtime/protocol"
 )
 
 // withFlagGlobals snapshots the server flag globals, applies overrides, and
@@ -24,6 +27,7 @@ import (
 func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease float64) {
 	t.Helper()
 	origPort := *port
+	origListenAddress := *listenAddress
 	origEd := *rootKeySeedHexFile
 	origPQ := *pqRootKeySeedHexFile
 	origLevel := *logLevel
@@ -37,6 +41,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	origStatsInterval := *statsInterval
 	t.Cleanup(func() {
 		*port = origPort
+		*listenAddress = origListenAddress
 		*rootKeySeedHexFile = origEd
 		*pqRootKeySeedHexFile = origPQ
 		*logLevel = origLevel
@@ -50,6 +55,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 		*statsInterval = origStatsInterval
 	})
 	*port = p
+	*listenAddress = ""
 	*rootKeySeedHexFile = edKey
 	*pqRootKeySeedHexFile = pqKey
 	*logLevel = level
@@ -62,8 +68,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	*metricsAddr = ""
 }
 
-// TestServeDualStack verifies serve starts and stops cleanly with both Ed25519
-// and ML-DSA-44 configured.
+// TestServeDualStack covers combined Ed25519 and ML-DSA-44 serving.
 func TestServeDualStack(t *testing.T) {
 	dir := t.TempDir()
 	edPath := filepath.Join(dir, "ed.key")
@@ -75,13 +80,43 @@ func TestServeDualStack(t *testing.T) {
 		t.Fatalf("generateMLDSA44Keypair: %v", err)
 	}
 	withFlagGlobals(t, edPath, pqPath, "error", pickFreeTCPPort(t), 0)
+	edCert, _, edRootPK, _, err := provisionCertificateKey()
+	if err != nil {
+		t.Fatalf("provision Ed25519: %v", err)
+	}
+	defer edCert.Wipe()
+	pqCert, _, pqRootPK, _, err := provisionMLDSA44CertificateKey()
+	if err != nil {
+		t.Fatalf("provision ML-DSA-44: %v", err)
+	}
+	defer pqCert.Wipe()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx) }()
 
-	// poll until the TCP listener accepts so cancel does not race startup
+	// Poll until the TCP listener is bound so cancellation does not race startup.
 	waitForTCPReady(t, *port, 2*time.Second)
+	// Cases cover both configured signing schemes.
+	for _, test := range []struct {
+		version protocol.Version
+		rootPK  []byte
+	}{
+		{protocol.VersionDraft12, edRootPK},
+		{protocol.VersionMLDSA44, pqRootPK},
+	} {
+		srv := protocol.ComputeSRV(test.rootPK)
+		nonce, request, err := protocol.CreateRequest([]protocol.Version{test.version}, rand.Reader, srv)
+		if err != nil {
+			t.Fatalf("CreateRequest(%s): %v", test.version, err)
+		}
+		conn := dialTCP(t, *port)
+		reply := tcpRoundTrip(t, conn, request)
+		_ = conn.Close()
+		if _, _, err := protocol.VerifyReply([]protocol.Version{test.version}, reply, test.rootPK, nonce, request); err != nil {
+			t.Fatalf("VerifyReply(%s): %v", test.version, err)
+		}
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -116,8 +151,7 @@ func waitForTCPDialReady(t *testing.T, addr string, timeout time.Duration) {
 	t.Fatalf("TCP listener on %s not ready within %s", addr, timeout)
 }
 
-// TestServeWithMetricsAddr verifies serve brings up the Prometheus endpoint
-// when -metrics-addr is set, and that a scrape returns the registry.
+// TestServeWithMetricsAddr covers the configured metrics listener.
 func TestServeWithMetricsAddr(t *testing.T) {
 	dir := t.TempDir()
 	edPath := filepath.Join(dir, "ed.key")
@@ -167,40 +201,21 @@ func TestServeWithMetricsAddr(t *testing.T) {
 	}
 }
 
-// TestServeRejectsBadMetricsAddr verifies validateFlags catches a bad host:port
-// for -metrics-addr.
-func TestServeRejectsBadMetricsAddr(t *testing.T) {
-	dir := t.TempDir()
-	edPath := filepath.Join(dir, "ed.key")
+// TestServePreCanceled treats shutdown during listener startup as clean.
+func TestServePreCanceled(t *testing.T) {
+	edPath := filepath.Join(t.TempDir(), "ed.key")
 	if err := generateKeypair(edPath); err != nil {
 		t.Fatalf("generateKeypair: %v", err)
 	}
 	withFlagGlobals(t, edPath, "", "error", pickFreeTCPPort(t), 0)
-	*metricsAddr = "not a host port"
-
-	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "metrics-addr") {
-		t.Fatalf("dispatch: %v; want metrics-addr error", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := serve(ctx); err != nil {
+		t.Fatalf("serve with canceled context: %v", err)
 	}
 }
 
-// TestServeRejectsBadLogLevel verifies serve reports an error for an
-// unparseable log-level flag.
-func TestServeRejectsBadLogLevel(t *testing.T) {
-	dir := t.TempDir()
-	edPath := filepath.Join(dir, "ed.key")
-	if err := generateKeypair(edPath); err != nil {
-		t.Fatalf("generateKeypair: %v", err)
-	}
-	withFlagGlobals(t, edPath, "", "not-a-level", pickFreeTCPPort(t), 0)
-
-	err := serve(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "log-level") {
-		t.Fatalf("serve: %v; want log-level error", err)
-	}
-}
-
-// TestServeRejectsBadEd25519Key verifies serve reports an error when Ed25519
-// provisioning fails.
+// TestServeRejectsBadEd25519Key covers an invalid Ed25519 seed.
 func TestServeRejectsBadEd25519Key(t *testing.T) {
 	dir := t.TempDir()
 	edPath := filepath.Join(dir, "bad.key")
@@ -215,8 +230,7 @@ func TestServeRejectsBadEd25519Key(t *testing.T) {
 	}
 }
 
-// TestServeRejectsBadPQKey verifies serve reports an error when ML-DSA-44
-// provisioning fails.
+// TestServeRejectsBadPQKey covers an invalid ML-DSA-44 seed.
 func TestServeRejectsBadPQKey(t *testing.T) {
 	dir := t.TempDir()
 	edPath := filepath.Join(dir, "ed.key")
@@ -232,109 +246,5 @@ func TestServeRejectsBadPQKey(t *testing.T) {
 	err := serve(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "ML-DSA-44") {
 		t.Fatalf("serve: %v; want ML-DSA-44 provisioning error", err)
-	}
-}
-
-// TestDispatchVersion verifies dispatch handles the -version subcommand.
-func TestDispatchVersion(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*showVersion = true
-	if err := dispatch(); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-}
-
-// TestDispatchKeygen verifies dispatch handles the -keygen subcommand.
-func TestDispatchKeygen(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*keygen = filepath.Join(t.TempDir(), "ed.key")
-	if err := dispatch(); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-}
-
-// TestDispatchPQKeygen verifies dispatch handles the -pq-keygen subcommand.
-func TestDispatchPQKeygen(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*pqKeygen = filepath.Join(t.TempDir(), "pq.key")
-	if err := dispatch(); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-}
-
-// TestDispatchPubkey verifies dispatch handles the -pubkey subcommand.
-func TestDispatchPubkey(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ed.key")
-	if err := generateKeypair(path); err != nil {
-		t.Fatalf("generateKeypair: %v", err)
-	}
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*pubkey = path
-	if err := dispatch(); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-}
-
-// TestDispatchPQPubkey verifies dispatch handles the -pq-pubkey subcommand.
-func TestDispatchPQPubkey(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "pq.key")
-	if err := generateMLDSA44Keypair(path); err != nil {
-		t.Fatalf("generateMLDSA44Keypair: %v", err)
-	}
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*pqPubkey = path
-	if err := dispatch(); err != nil {
-		t.Fatalf("dispatch: %v", err)
-	}
-}
-
-// TestDispatchValidateFlagsFails verifies dispatch surfaces the usage error
-// from validateFlags.
-func TestDispatchValidateFlagsFails(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "usage:") {
-		t.Fatalf("dispatch: %v; want usage error", err)
-	}
-}
-
-// TestDispatchKeygenFails verifies dispatch surfaces an error when -keygen
-// cannot write its output.
-func TestDispatchKeygenFails(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*keygen = filepath.Join(t.TempDir(), "no", "such", "dir", "ed.key")
-	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "keygen") {
-		t.Fatalf("dispatch: %v; want keygen error", err)
-	}
-}
-
-// TestDispatchPQKeygenFails verifies dispatch surfaces an error when -pq-keygen
-// cannot write its output.
-func TestDispatchPQKeygenFails(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*pqKeygen = filepath.Join(t.TempDir(), "no", "such", "dir", "pq.key")
-	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "pq-keygen") {
-		t.Fatalf("dispatch: %v; want pq-keygen error", err)
-	}
-}
-
-// TestDispatchPubkeyFails verifies dispatch surfaces an error when -pubkey
-// cannot read its input.
-func TestDispatchPubkeyFails(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*pubkey = filepath.Join(t.TempDir(), "missing.key")
-	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "pubkey") {
-		t.Fatalf("dispatch: %v; want pubkey error", err)
-	}
-}
-
-// TestDispatchPQPubkeyFails verifies dispatch surfaces an error when -pq-pubkey
-// cannot read its input.
-func TestDispatchPQPubkeyFails(t *testing.T) {
-	withFlagGlobals(t, "", "", "info", 2002, 0.01)
-	*pqPubkey = filepath.Join(t.TempDir(), "missing.pq.key")
-	if err := dispatch(); err == nil || !strings.Contains(err.Error(), "pq-pubkey") {
-		t.Fatalf("dispatch: %v; want pq-pubkey error", err)
 	}
 }

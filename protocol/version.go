@@ -4,7 +4,6 @@
 package protocol
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
@@ -46,8 +45,7 @@ const (
 	VersionMLDSA44 Version = 0x90000001
 )
 
-// String returns the IETF draft name or a hex representation for unknown
-// values.
+// String returns a recognized version name or a hexadecimal unknown value.
 func (v Version) String() string {
 	switch v {
 	case VersionGoogle:
@@ -93,7 +91,7 @@ func (v Version) ShortString() string {
 	case VersionMLDSA44:
 		return "ml-dsa-44"
 	default:
-		if v > VersionGoogle && v <= VersionDraft12 {
+		if v >= VersionDraft01 && v <= VersionDraft12 {
 			return fmt.Sprintf("draft-%02d", uint32(v)-0x80000000)
 		}
 		return fmt.Sprintf("0x%08x", uint32(v))
@@ -137,27 +135,6 @@ var supportedVersionsEd25519 = []Version{
 // supportedVersionsMLDSA44 is the scheme-scoped VERS list for ML-DSA-44.
 var supportedVersionsMLDSA44 = []Version{VersionMLDSA44}
 
-var (
-	// supportedVersionsEd25519Bytes is the pre-encoded VERS bytes for Ed25519.
-	supportedVersionsEd25519Bytes []byte
-	// supportedVersionsMLDSA44Bytes is the pre-encoded VERS bytes for
-	// ML-DSA-44.
-	supportedVersionsMLDSA44Bytes []byte
-)
-
-// init populates the pre-encoded VERS byte slices.
-func init() {
-	encVers := func(vs []Version) []byte {
-		out := make([]byte, 4*len(vs))
-		for i, v := range vs {
-			binary.LittleEndian.PutUint32(out[4*i:4*i+4], uint32(v))
-		}
-		return out
-	}
-	supportedVersionsEd25519Bytes = encVers(supportedVersionsEd25519)
-	supportedVersionsMLDSA44Bytes = encVers(supportedVersionsMLDSA44)
-}
-
 // Supported returns all recognized protocol versions: newest IETF first,
 // Google, then post-quantum.
 func Supported() []Version {
@@ -168,8 +145,8 @@ func Supported() []Version {
 	return out
 }
 
-// SelectVersion picks the best mutually supported version whose nonce size
-// matches nonceLen.
+// SelectVersion returns the first server-preferred version offered by the
+// client whose nonce size matches nonceLen.
 func SelectVersion(clientVersions []Version, nonceLen int, serverVersions []Version) (Version, error) {
 	if len(clientVersions) == 0 {
 		if nonceLen == nonceSize(groupGoogle) && slices.Contains(serverVersions, VersionGoogle) {
@@ -178,6 +155,9 @@ func SelectVersion(clientVersions []Version, nonceLen int, serverVersions []Vers
 		return 0, errors.New("protocol: no supported version")
 	}
 	for _, sv := range serverVersions {
+		if !isRecognizedVersion(sv) {
+			continue
+		}
 		if nonceSize(wireGroupOf(sv, false)) != nonceLen {
 			continue
 		}
@@ -193,8 +173,22 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 	if len(versions) == 0 {
 		return 0, 0, errors.New("protocol: empty version list")
 	}
+	for _, v := range versions {
+		if !isRecognizedVersion(v) {
+			return 0, 0, fmt.Errorf("protocol: unsupported version %s", v)
+		}
+	}
 	best := slices.Max(versions)
 	return best, wireGroupOf(best, true), nil
+}
+
+// isRecognizedVersion reports whether v has wire semantics implemented by
+// this package. Unknown versions can still be parsed from peer offers, but
+// builders and verifiers must not guess their wire format.
+func isRecognizedVersion(v Version) bool {
+	return v == VersionGoogle ||
+		(v >= VersionDraft01 && v <= VersionDraft12) ||
+		v == VersionMLDSA44
 }
 
 // versionOffered reports whether ver appears in the client's version list.

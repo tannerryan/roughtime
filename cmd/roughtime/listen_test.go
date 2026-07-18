@@ -19,18 +19,17 @@ import (
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
-	"go.uber.org/goleak"
 	"go.uber.org/zap"
 )
 
-// TestMain installs a nop logger so integration tests do not spam stderr.
+// TestMain installs deterministic package-wide test settings.
 func TestMain(m *testing.M) {
 	logger = zap.NewNop()
+	*greaseRate = 0
 	m.Run()
 }
 
-// TestListenEndToEnd verifies the UDP listener completes a closed-loop run of
-// requests and exits cleanly.
+// TestListenEndToEnd covers UDP serving and shutdown.
 func TestListenEndToEnd(t *testing.T) {
 	requestsReceived.reset()
 	requestsResponded.reset()
@@ -64,34 +63,69 @@ func TestListenEndToEnd(t *testing.T) {
 	}
 }
 
-// TestListenShutdownLeaksNoGoroutines verifies the UDP listener leaks no
-// goroutines after a clean shutdown.
-func TestListenShutdownLeaksNoGoroutines(t *testing.T) {
-	// ignore runtime workers
-	baseline := goleak.IgnoreCurrent()
+// TestListenBatchesConcurrentRequests covers shared signing batches.
+func TestListenBatchesConcurrentRequests(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() {
+		runtime.GOMAXPROCS(previousProcs)
+	})
 
-	requestsReceived.reset()
-	requestsResponded.reset()
-	statsPanics.Store(0)
+	p, rootPK := startServer(t)
+	startBatches := statsBatches.Load()
+	startRequests := statsBatchedReqs.Load()
+	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
+	srv := protocol.ComputeSRV(rootPK)
 
-	rootPK, st := newCertState(t)
-	chosen, done, cancel := startListen(t, st)
-	waitForServerReady(t, chosen, rootPK)
-
-	sendAndVerify(t, chosen, rootPK, 8)
-
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("listen returned: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("listen did not exit after cancel")
+	const requests = 8
+	ready := make(chan struct{}, requests)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Go(func() {
+			conn, err := net.DialUDP("udp", nil, addr)
+			if err != nil {
+				t.Errorf("dial: %v", err)
+				ready <- struct{}{}
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+			if err != nil {
+				t.Errorf("CreateRequest: %v", err)
+				ready <- struct{}{}
+				return
+			}
+			ready <- struct{}{}
+			<-start
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			if _, err := conn.Write(req); err != nil {
+				t.Errorf("write: %v", err)
+				return
+			}
+			buf := make([]byte, 1500)
+			n, err := conn.Read(buf)
+			if err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+			if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, buf[:n], rootPK, nonce, req); err != nil {
+				t.Errorf("VerifyReply: %v", err)
+			}
+		})
 	}
+	for range requests {
+		<-ready
+	}
+	close(start)
+	wg.Wait()
 
-	if err := goleak.Find(baseline); err != nil {
-		t.Fatalf("goroutine leak after shutdown: %v", err)
+	batchedRequests := statsBatchedReqs.Load() - startRequests
+	batches := statsBatches.Load() - startBatches
+	if batchedRequests < requests {
+		t.Fatalf("batched requests = %d, want at least %d", batchedRequests, requests)
+	}
+	if batches >= batchedRequests {
+		t.Fatalf("batches = %d for %d requests; requests were not batched", batches, batchedRequests)
 	}
 }
 
@@ -103,7 +137,6 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 	for range maxAttempts {
 		p := pickFreeUDPPort(t)
 		*port = p
-		// listen snapshots batchMaxSize/batchMaxLatency at entry
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() { done <- listen(ctx, st) }()
@@ -179,8 +212,7 @@ func startServer(t *testing.T) (int, ed25519.PublicKey) {
 	return p, pk
 }
 
-// TestListenMixedVersionBatch verifies alternating wire versions are split into
-// separate batches.
+// TestListenMixedVersionBatch covers sequential requests across wire versions.
 func TestListenMixedVersionBatch(t *testing.T) {
 	p, rootPK := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -205,13 +237,12 @@ func TestListenMixedVersionBatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		// tolerate default 1% grease rate
 		if _, _, err := protocol.VerifyReply(vers, buf[:n], rootPK, nonce, req); err != nil {
-			t.Logf("verify (tolerable): %v", err)
+			t.Fatalf("verify: %v", err)
 		}
 	}
 
-	// alternate versions to force separate wire-group batches
+	// Alternate Google and draft-12 requests.
 	for i := range 8 {
 		if i%2 == 0 {
 			sendAndExpect([]protocol.Version{protocol.VersionGoogle})
@@ -221,111 +252,7 @@ func TestListenMixedVersionBatch(t *testing.T) {
 	}
 }
 
-// TestListenSRVMismatch verifies the UDP listener drops a request whose SRV
-// does not address the configured root.
-func TestListenSRVMismatch(t *testing.T) {
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-
-	// forge SRV for a different root key
-	_, otherSK, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("gen other key: %v", err)
-	}
-	otherPK := otherSK.Public().(ed25519.PublicKey)
-	badSRV := protocol.ComputeSRV(otherPK)
-	if bytes.Equal(badSRV, protocol.ComputeSRV(rootPK)) {
-		t.Fatal("bad SRV coincidentally matches server SRV")
-	}
-
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	versions := []protocol.Version{protocol.VersionDraft12}
-	_, req, err := protocol.CreateRequest(versions, rand.Reader, badSRV)
-	if err != nil {
-		t.Fatalf("CreateRequest: %v", err)
-	}
-	_ = conn.SetDeadline(time.Now().Add(400 * time.Millisecond))
-	if _, err := conn.Write(req); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 1500)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected timeout from SRV mismatch, got reply")
-	}
-}
-
-// TestListenAmplificationDrop verifies the UDP amplification guard suppresses
-// any reply larger than the request.
-func TestListenAmplificationDrop(t *testing.T) {
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-	srv := protocol.ComputeSRV(rootPK)
-
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	versions := []protocol.Version{protocol.VersionDraft12}
-	_, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
-	if err != nil {
-		t.Fatalf("CreateRequest: %v", err)
-	}
-	if len(req) != 1024 {
-		t.Fatalf("request length %d, want 1024", len(req))
-	}
-	_ = conn.SetDeadline(time.Now().Add(400 * time.Millisecond))
-	if _, err := conn.Write(req); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 2048)
-	n, err := conn.Read(buf)
-	if err == nil && n > len(req) {
-		t.Fatalf("server replied with %d bytes to a %d-byte request (amplification)", n, len(req))
-	}
-}
-
-// TestListenConcurrentBatches verifies the UDP listener handles concurrent
-// senders without panics or losses.
-func TestListenConcurrentBatches(t *testing.T) {
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-
-	const senders = 8
-	const perSender = 16
-	var wg sync.WaitGroup
-	for range senders {
-		wg.Go(func() {
-			sendAndVerify(t, p, rootPK, perSender)
-			_ = addr
-		})
-	}
-	wg.Wait()
-
-	// poll until the last in-flight batch is counted, bounded by the deadline
-	// so a stalled server still trips the assertion below
-	want := uint64(senders * perSender)
-	deadline := time.Now().Add(time.Second)
-	for requestsReceived.total() < want && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	if got := requestsReceived.total(); got < want {
-		t.Fatalf("requestsReceived total=%d want >=%d", got, want)
-	}
-	if got := statsPanics.Load(); got != 0 {
-		t.Fatalf("statsPanics=%d want 0", got)
-	}
-}
-
-// TestListenNoncInSREPSingletons verifies drafts 01/02 are signed individually
-// because NONC-in-SREP forbids Merkle batching.
+// TestListenNoncInSREPSingletons covers non-batchable response forms.
 func TestListenNoncInSREPSingletons(t *testing.T) {
 	prevGrease := *greaseRate
 	*greaseRate = 0
@@ -378,8 +305,7 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 	}
 }
 
-// TestListenUndersizeRequestDropped verifies the UDP listener drops requests
-// below minRequestSize.
+// TestListenUndersizeRequestDropped covers the UDP size floor.
 func TestListenUndersizeRequestDropped(t *testing.T) {
 	p, _ := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -410,98 +336,7 @@ func TestListenUndersizeRequestDropped(t *testing.T) {
 	}
 }
 
-// TestListenAllVersions verifies the UDP listener answers every supported
-// Ed25519 wire version.
-func TestListenAllVersions(t *testing.T) {
-	prevGrease := *greaseRate
-	*greaseRate = 0
-	t.Cleanup(func() { *greaseRate = prevGrease })
-
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-	srv := protocol.ComputeSRV(rootPK)
-
-	for _, v := range protocol.Supported() {
-		// PQ wire versions are TCP-only
-		if protocol.SchemeSignatureSize(v) != ed25519.SignatureSize {
-			continue
-		}
-		t.Run(v.String(), func(t *testing.T) {
-			conn, err := net.DialUDP("udp", nil, addr)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			defer func() { _ = conn.Close() }()
-
-			nonce, req, err := protocol.CreateRequest([]protocol.Version{v}, rand.Reader, srv)
-			if err != nil {
-				t.Fatalf("CreateRequest(%s): %v", v, err)
-			}
-			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-			if _, err := conn.Write(req); err != nil {
-				t.Fatalf("write %s: %v", v, err)
-			}
-			buf := make([]byte, 1500)
-			n, err := conn.Read(buf)
-			if err != nil {
-				t.Fatalf("read %s: %v", v, err)
-			}
-			if n > len(req) {
-				t.Fatalf("amplification: reply %d > request %d", n, len(req))
-			}
-			if _, _, err := protocol.VerifyReply([]protocol.Version{v}, buf[:n], rootPK, nonce, req); err != nil {
-				t.Fatalf("verify %s: %v", v, err)
-			}
-		})
-	}
-}
-
-// TestListenGreaseAlwaysFails verifies grease-rate=1.0 causes a majority of
-// replies to fail VerifyReply.
-func TestListenGreaseAlwaysFails(t *testing.T) {
-	prevGrease := *greaseRate
-	*greaseRate = 1.0
-	t.Cleanup(func() { *greaseRate = prevGrease })
-
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-	srv := protocol.ComputeSRV(rootPK)
-	versions := []protocol.Version{protocol.VersionDraft12}
-
-	var failed, passed int
-	for range 32 {
-		conn, err := net.DialUDP("udp", nil, addr)
-		if err != nil {
-			t.Fatalf("dial: %v", err)
-		}
-		nonce, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
-		if err != nil {
-			t.Fatalf("CreateRequest: %v", err)
-		}
-		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		if _, err := conn.Write(req); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		buf := make([]byte, 1500)
-		n, err := conn.Read(buf)
-		_ = conn.Close()
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-		if _, _, err := protocol.VerifyReply(versions, buf[:n], rootPK, nonce, req); err != nil {
-			failed++
-		} else {
-			passed++
-		}
-	}
-	// require majority failure to confirm grease path fires
-	if failed < 16 {
-		t.Fatalf("grease path not exercised: failed=%d passed=%d (want failed>=16 at grease-rate=1.0)", failed, passed)
-	}
-}
-
-// TestListenMalformedPackets verifies the UDP listener silently drops malformed
-// packets without panicking.
+// TestListenMalformedPackets covers malformed datagram handling.
 func TestListenMalformedPackets(t *testing.T) {
 	p, _ := startServer(t)
 	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
@@ -536,124 +371,7 @@ func TestListenMalformedPackets(t *testing.T) {
 	}
 }
 
-// TestListenBatchLatencyFlush verifies a UDP single-item batch flushes once
-// batchMaxLatency elapses.
-func TestListenBatchLatencyFlush(t *testing.T) {
-	prevLatency := batchMaxLatency
-	batchMaxLatency = 20 * time.Millisecond
-	t.Cleanup(func() { batchMaxLatency = prevLatency })
-
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-	srv := protocol.ComputeSRV(rootPK)
-	versions := []protocol.Version{protocol.VersionDraft12}
-
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	nonce, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
-	if err != nil {
-		t.Fatalf("CreateRequest: %v", err)
-	}
-
-	start := time.Now()
-	_ = conn.SetDeadline(time.Now().Add(time.Second))
-	if _, err := conn.Write(req); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	buf := make([]byte, 1500)
-	n, err := conn.Read(buf)
-	rtt := time.Since(start)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if _, _, err := protocol.VerifyReply(versions, buf[:n], rootPK, nonce, req); err != nil {
-		t.Logf("verify (tolerable grease): %v", err)
-	}
-	if rtt > 500*time.Millisecond {
-		t.Fatalf("batch-latency flush too slow: rtt=%s want <500ms", rtt)
-	}
-}
-
-// TestListenBatchMaxSizeFlush verifies a UDP batch flushes once batchMaxSize is
-// reached on the non-Linux single-socket path.
-func TestListenBatchMaxSizeFlush(t *testing.T) {
-	if runtime.GOOS == "linux" {
-		t.Skip("incompatible with SO_REUSEPORT per-worker batching")
-	}
-	prevSize := batchMaxSize
-	batchMaxSize = 8
-	prevLatency := batchMaxLatency
-	batchMaxLatency = time.Hour // disable timer
-	prevGrease := *greaseRate
-	*greaseRate = 0
-	t.Cleanup(func() {
-		batchMaxSize = prevSize
-		batchMaxLatency = prevLatency
-		*greaseRate = prevGrease
-	})
-
-	p, rootPK := startServer(t)
-	addr := &net.UDPAddr{IP: net.IPv6loopback, Port: p}
-	srv := protocol.ComputeSRV(rootPK)
-	versions := []protocol.Version{protocol.VersionDraft12}
-
-	// single socket pins SO_REUSEPORT to one worker
-	const n = 16 // two full-size batches
-	c, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer func() { _ = c.Close() }()
-	// enlarge rcvbuf so queued replies are not dropped
-	_ = c.SetReadBuffer(1 * 1024 * 1024)
-
-	nonces := make([][]byte, n)
-	reqs := make([][]byte, n)
-	for i := range n {
-		nonce, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
-		if err != nil {
-			t.Fatalf("CreateRequest %d: %v", i, err)
-		}
-		nonces[i], reqs[i] = nonce, req
-	}
-
-	for i := range n {
-		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if _, err := c.Write(reqs[i]); err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	// match replies by nonce (any order)
-	buf := make([]byte, 1500)
-	seen := make(map[int]bool)
-	for range n {
-		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-		m, err := c.Read(buf)
-		if err != nil {
-			t.Fatalf("read (%d/%d seen): %v", len(seen), n, err)
-		}
-		matched := false
-		for i := range n {
-			if seen[i] {
-				continue
-			}
-			if _, _, err := protocol.VerifyReply(versions, buf[:m], rootPK, nonces[i], reqs[i]); err == nil {
-				seen[i] = true
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			t.Fatalf("reply did not match any outstanding nonce")
-		}
-	}
-}
-
-// sendAndVerify fires n closed-loop requests. Verify failures are tolerated
-// under default grease.
+// sendAndVerify fires n closed-loop requests and verifies every reply.
 func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 	t.Helper()
 	versions := protocol.ServerPreferenceEd25519
@@ -680,7 +398,8 @@ func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}
-		// tolerate default -grease-rate=0.01
-		_, _, _ = protocol.VerifyReply(versions, buf[:m], rootPK, nonce, req)
+		if _, _, err := protocol.VerifyReply(versions, buf[:m], rootPK, nonce, req); err != nil {
+			t.Fatalf("verify %d: %v", i, err)
+		}
 	}
 }

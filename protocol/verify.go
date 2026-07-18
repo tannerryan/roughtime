@@ -18,19 +18,53 @@ import (
 // outside MINT..MAXT.
 var ErrDelegationWindow = errors.New("protocol: midpoint outside delegation window")
 
-// plausible midpoint bounds. A misdecoded epoch lands far outside them, unlike
-// any real current time.
 var (
+	// minPlausibleMidpoint rejects a misdecoded wire epoch.
 	minPlausibleMidpoint = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	// maxPlausibleMidpoint rejects a misdecoded wire epoch.
 	maxPlausibleMidpoint = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
 )
 
-// VerifyReply authenticates a server response and returns the midpoint and
-// radius.
+// VerifyReply authenticates a server response using the contract documented by
+// [VerifyReplyWithOptions].
 func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) (midpoint time.Time, radius time.Duration, err error) {
+	return VerifyReplyWithOptions(versions, reply, rootPK, nonce, requestBytes, VerifyOptions{})
+}
+
+// VerifyOptions controls strict checks for wire behavior that the shared
+// version number cannot disambiguate.
+type VerifyOptions struct {
+	// RequireTYPE requires TYPE=0 in a VersionDraft12 request and TYPE=1 in its
+	// response. Leave it false when draft-12/13 peers must remain acceptable.
+	// ML-DSA-44 always requires both tags.
+	RequireTYPE bool
+}
+
+// VerifyReplyWithOptions authenticates a response and returns its midpoint and
+// radius. versions must be nonempty and recognized, and nonce must have the
+// selected version's length and match the request. Drafts 12+ and ML-DSA-44
+// require requestBytes. Midpoints outside years 2000–3000 are rejected to
+// prevent unsigned legacy VER changes from relabeling the timestamp epoch.
+func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestBytes []byte, opts VerifyOptions) (midpoint time.Time, radius time.Duration, err error) {
 	bestVer, bestG, err := clientVersionPreference(versions)
 	if err != nil {
 		return time.Time{}, 0, err
+	}
+	offeredVersions := versions
+	var parsedRequest *Request
+	if len(requestBytes) != 0 {
+		parsedRequest, err = ParseRequest(requestBytes)
+		if err != nil {
+			return time.Time{}, 0, fmt.Errorf("protocol: parse request: %w", err)
+		}
+		if !bytes.Equal(parsedRequest.Nonce, nonce) {
+			return time.Time{}, 0, errors.New("protocol: request NONC does not match supplied nonce")
+		}
+		if len(parsedRequest.Versions) == 0 {
+			offeredVersions = []Version{VersionGoogle}
+		} else {
+			offeredVersions = parsedRequest.Versions
+		}
 	}
 
 	// unwrap with the client's best version, refine once server VER is known
@@ -56,22 +90,47 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 	g := bestG
 	if bestVer != VersionGoogle {
 		if respVer, ok := extractResponseVER(resp, srep); ok {
-			if !versionOffered(respVer, versions) {
+			if !versionOffered(respVer, versions) || !versionOffered(respVer, offeredVersions) {
 				return time.Time{}, 0, errors.New("protocol: server chose version not offered by client")
 			}
-			respTypeBytes, hasRespType := resp[TagTYPE]
-			if hasRespType {
-				if len(respTypeBytes) != 4 || binary.LittleEndian.Uint32(respTypeBytes) != 1 {
-					return time.Time{}, 0, errors.New("protocol: response TYPE must be 1")
+			if !isRecognizedVersion(respVer) {
+				return time.Time{}, 0, fmt.Errorf("protocol: unsupported response version %s", respVer)
+			}
+
+			hasRespType := false
+			if respVer == VersionDraft12 || respVer == VersionMLDSA44 {
+				respTypeBytes, ok := resp[TagTYPE]
+				if ok {
+					if len(respTypeBytes) != 4 || binary.LittleEndian.Uint32(respTypeBytes) != 1 {
+						return time.Time{}, 0, errors.New("protocol: response TYPE must be 1")
+					}
+					hasRespType = true
+				}
+				requestHasType := parsedRequest != nil && parsedRequest.HasType
+				if respVer == VersionMLDSA44 {
+					if !requestHasType {
+						return time.Time{}, 0, errors.New("protocol: missing TYPE in ML-DSA-44 request")
+					}
+					if !hasRespType {
+						return time.Time{}, 0, errors.New("protocol: missing TYPE in ML-DSA-44 response")
+					}
+				}
+				if opts.RequireTYPE && !requestHasType {
+					return time.Time{}, 0, errors.New("protocol: missing TYPE in request")
+				}
+				if opts.RequireTYPE && !hasRespType {
+					return time.Time{}, 0, errors.New("protocol: missing TYPE in response")
 				}
 			}
 			g = wireGroupOf(respVer, hasRespType)
 		}
 	}
+	if len(nonce) != nonceSize(g) {
+		return time.Time{}, 0, fmt.Errorf("protocol: nonce length %d, want %d", len(nonce), nonceSize(g))
+	}
 
-	// drafts 01-11 require top-level VER (4 bytes). 12+ moved it into SREP.
-	// Pre-12 VER is unsigned, so forging it just produces a signature mismatch
-	// downstream. This is a structural presence and length check only.
+	// Drafts 01-11 require top-level VER; 12+ moved it into SREP. This check is
+	// structural; later cryptographic and semantic checks reject false claims.
 	if hasResponseVER(g) {
 		vb, ok := resp[TagVER]
 		if !ok {
@@ -79,6 +138,11 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 		}
 		if len(vb) != 4 {
 			return time.Time{}, 0, fmt.Errorf("protocol: top-level VER must be 4 bytes, got %d", len(vb))
+		}
+	}
+	if g >= groupD10 && parsedRequest != nil {
+		if len(parsedRequest.SRV) != 0 && !bytes.Equal(parsedRequest.SRV, ComputeSRV(rootPK)) {
+			return time.Time{}, 0, errors.New("protocol: request SRV does not identify supplied root key")
 		}
 	}
 
@@ -91,9 +155,8 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 	if err != nil {
 		return time.Time{}, 0, err
 	}
-
 	if g >= groupD12 {
-		if err := verifyNoVersionDowngrade(srep, versions); err != nil {
+		if err := verifySREPVersions(srep, offeredVersions); err != nil {
 			return time.Time{}, 0, err
 		}
 	}
@@ -101,9 +164,9 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 	return validateDelegationWindow(midpoint, radius, mintBuf, maxtBuf, g)
 }
 
-// verifyNoVersionDowngrade confirms SREP.VER is the highest mutually-supported
-// version (drafts 12+).
-func verifyNoVersionDowngrade(srep map[uint32][]byte, clientVersions []Version) error {
+// verifySREPVersions validates the signed version declaration used by drafts
+// 12+ and ML-DSA-44. Selection need not use the highest numeric version.
+func verifySREPVersions(srep map[uint32][]byte, clientVersions []Version) error {
 	if srep == nil {
 		return errors.New("protocol: missing SREP for downgrade check")
 	}
@@ -112,6 +175,9 @@ func verifyNoVersionDowngrade(srep map[uint32][]byte, clientVersions []Version) 
 		return errors.New("protocol: missing VER in SREP")
 	}
 	chosen := Version(binary.LittleEndian.Uint32(verBytes))
+	if !versionOffered(chosen, clientVersions) {
+		return fmt.Errorf("protocol: server chose version %s not offered by client", chosen)
+	}
 	versBytes, ok := srep[TagVERS]
 	if !ok || len(versBytes) == 0 || len(versBytes)%4 != 0 {
 		return errors.New("protocol: missing or malformed VERS in SREP")
@@ -129,28 +195,17 @@ func verifyNoVersionDowngrade(srep map[uint32][]byte, clientVersions []Version) 
 		}
 		prev = v
 		serverSupports[v] = true
+		if isRecognizedVersion(v) && (v == VersionMLDSA44) != (chosen == VersionMLDSA44) {
+			return errors.New("protocol: VERS mixes incompatible signature schemes")
+		}
 	}
 	if !serverSupports[chosen] {
 		return fmt.Errorf("protocol: server chose version %s not present in signed VERS list", chosen)
 	}
-	var best Version
-	var found bool
-	for _, v := range clientVersions {
-		if serverSupports[v] && (!found || v > best) {
-			best, found = v, true
-		}
-	}
-	if !found {
-		return errors.New("protocol: no mutually supported version (VERS check)")
-	}
-	if chosen != best {
-		return fmt.Errorf("protocol: version downgrade detected: server chose %s, expected %s", chosen, best)
-	}
 	return nil
 }
 
-// extractResponseVER returns the negotiated version, preferring signed SREP.VER
-// over top-level VER.
+// extractResponseVER returns the claimed version, preferring signed SREP.VER.
 func extractResponseVER(resp, srep map[uint32][]byte) (Version, bool) {
 	if srep != nil {
 		if vb, ok := srep[TagVER]; ok && len(vb) == 4 {
@@ -163,7 +218,8 @@ func extractResponseVER(resp, srep map[uint32][]byte) (Version, bool) {
 	return 0, false
 }
 
-// ExtractVersion returns the negotiated version from a raw server reply.
+// ExtractVersion returns the version claimed by a raw server reply. It does not
+// authenticate the reply; call [VerifyReply] before trusting the result.
 func ExtractVersion(reply []byte) (Version, bool) {
 	msg := reply
 	if len(reply) >= 12 {
@@ -184,8 +240,8 @@ func ExtractVersion(reply []byte) (Version, bool) {
 	return extractResponseVER(resp, srep)
 }
 
-// unwrapReply strips the ROUGHTIM header for IETF replies and rejects it for
-// Google.
+// unwrapReply strips the ROUGHTIM header from framed replies and rejects it
+// for Google.
 func unwrapReply(reply []byte, g wireGroup) ([]byte, error) {
 	if usesRoughtimHeader(g) {
 		return unwrapPacket(reply)
@@ -260,8 +316,9 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 		return time.Time{}, 0, errors.New("protocol: missing or invalid ROOT")
 	}
 
-	// drafts 01-02 bind nonce only via SREP.NONC. 03+ servers may echo NONC at
-	// top level; when present, it must match. The Merkle proof binds the nonce.
+	// Drafts 01-02 bind NONC through SREP. Later responses commonly echo NONC
+	// at top level; validate it when present. Some deployed historical servers
+	// omit that redundant echo, so absence remains accepted for compatibility.
 	if noncInSREP(g) {
 		srepNonce, ok := srep[TagNONC]
 		if !ok {
@@ -291,7 +348,7 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("protocol: decode MIDP: %w", err)
 	}
-	// an absurd date means the epoch was misdecoded from a forged pre-12 VER
+	// Reject implausible dates, including epoch misdecodes.
 	if midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint) {
 		return time.Time{}, 0, errors.New("protocol: midpoint outside plausible calendar range")
 	}
@@ -299,6 +356,8 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("protocol: decode RADI: %w", err)
 	}
+	// Deployed draft-11 servers advertise sub-three-second radii despite the
+	// draft's lower bound, so compatibility requires rejecting only zero.
 	if g >= groupD10 && radius == 0 {
 		return time.Time{}, 0, errors.New("protocol: RADI must not be zero")
 	}

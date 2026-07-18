@@ -70,9 +70,11 @@ func signatureSize(s sigScheme) int {
 }
 
 // SchemePublicKeySize returns the on-wire public key length for v's scheme.
+// Unknown versions use the Ed25519 size.
 func SchemePublicKeySize(v Version) int { return publicKeySize(schemeOf(v)) }
 
 // SchemeSignatureSize returns the on-wire signature length for v's scheme.
+// Unknown versions use the Ed25519 size.
 func SchemeSignatureSize(v Version) int { return signatureSize(schemeOf(v)) }
 
 // signEd25519 signs ctx || msg with sk.
@@ -105,14 +107,6 @@ func verifyMLDSA44(pk *mldsa.PublicKey, msg, ctx, sig []byte) bool {
 		return false
 	}
 	return mldsa.Verify(pk, msg, sig, &mldsa.Options{Context: string(ctx)}) == nil
-}
-
-// suiteSupportedVersionsBytes returns the pre-encoded VERS bytes for scheme s.
-func suiteSupportedVersionsBytes(s sigScheme) []byte {
-	if s == schemeMLDSA44 {
-		return supportedVersionsMLDSA44Bytes
-	}
-	return supportedVersionsEd25519Bytes
 }
 
 // errSchemeNotSupported is returned for an unimplemented scheme.

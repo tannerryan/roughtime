@@ -73,8 +73,9 @@ type merkleTree struct {
 }
 
 // merkleNodeFirst reports whether the sibling precedes the running hash when
-// the INDX bit is 0. Node-first covers drafts 05-13. Drafts 14-15 spec
-// node-first but collapse into hash-first groupD14 (shared version 0x8000000c).
+// the INDX bit is 0. Drafts 05-15 specify node-first, but drafts 16-19 changed
+// back to hash-first without changing the shared version or TYPE value. The
+// ambiguous groupD14 defaults to the current hash-first convention.
 func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }
@@ -82,13 +83,12 @@ func merkleNodeFirst(g wireGroup) bool {
 // maxMerkleLeaves caps batch size at 2^32, the maximum 32-deep tree.
 const maxMerkleLeaves = 1 << 32
 
-// newMerkleTree builds the tree and per-leaf paths and panics on out-of-range
-// leaf counts.
-func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
+// newMerkleTreeWithOrder builds a tree with an explicit inner-node ordering.
+func newMerkleTreeWithOrder(g wireGroup, leafInputs [][]byte, nodeFirst bool) *merkleTree {
 	n := len(leafInputs)
 
 	if n == 0 {
-		panic("protocol: newMerkleTree called with zero leaves")
+		panic("protocol: Merkle tree requires at least one leaf")
 	}
 	if uint64(n) > maxMerkleLeaves {
 		panic(fmt.Sprintf("protocol: Merkle tree with %d leaves exceeds 2^32 (PATH > 32 hash values)", n))
@@ -128,7 +128,7 @@ func newMerkleTree(g wireGroup, leafInputs [][]byte) *merkleTree {
 		}
 		next := make([][]byte, len(level)/2)
 		for j := 0; j < len(level); j += 2 {
-			if merkleNodeFirst(g) {
+			if nodeFirst {
 				next[j/2] = nodeHash(g, level[j+1], level[j])
 			} else {
 				next[j/2] = nodeHash(g, level[j], level[j+1])
@@ -161,19 +161,31 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 		return errors.New("protocol: PATH exceeds 32 hash values")
 	}
 
+	err := verifyMerkleOrder(index, pathBytes, leafInput, rootHash, g, merkleNodeFirst(g))
+	if errors.Is(err, ErrMerkleMismatch) && g == groupD14 {
+		// Drafts 14-15 and 16-19 use opposite orders under the same wire
+		// identifiers, so a verifier must try the other convention.
+		return verifyMerkleOrder(index, pathBytes, leafInput, rootHash, g, !merkleNodeFirst(g))
+	}
+	return err
+}
+
+// verifyMerkleOrder verifies a structurally validated path with one child
+// ordering convention.
+func verifyMerkleOrder(index uint32, pathBytes, leafInput, rootHash []byte, g wireGroup, nodeFirst bool) error {
 	acc := leafHash(g, leafInput)
+	hs := hashSize(g)
 	steps := len(pathBytes) / hs
-	nf := merkleNodeFirst(g)
 	for i := range steps {
 		sibling := pathBytes[i*hs : (i+1)*hs]
 		if index&1 == 0 {
-			if nf {
+			if nodeFirst {
 				acc = nodeHash(g, sibling, acc)
 			} else {
 				acc = nodeHash(g, acc, sibling)
 			}
 		} else {
-			if nf {
+			if nodeFirst {
 				acc = nodeHash(g, acc, sibling)
 			} else {
 				acc = nodeHash(g, sibling, acc)

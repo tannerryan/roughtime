@@ -22,8 +22,10 @@ const MaxProofBytes = 4 * 1024 * 1024
 // gzipMagic is the gzip header (RFC 1952 §2.3).
 var gzipMagic = []byte{0x1f, 0x8b}
 
-// Proof is a verifiable Roughtime timestamp proof formed by a causal chain of
-// signed witness queries.
+// Proof is a Roughtime timestamp proof formed by a causal chain of witness
+// queries. Parsed proofs are untrusted until [Proof.Verify] validates their
+// signatures, nonce linkage, and causal ordering, and [Proof.Trust] confirms
+// every witness key against a caller-supplied trust store.
 type Proof struct {
 	chain *protocol.Chain
 }
@@ -41,7 +43,7 @@ type proofReportLink struct {
 	Response  string `json:"response"`
 }
 
-// ProofLink is the per-witness attestation data exposed by [(*Proof).Links].
+// ProofLink is the per-witness attestation data exposed by [Proof.Links].
 type ProofLink struct {
 	// PublicKey is the witness's Ed25519 or experimental ML-DSA-44 root key.
 	PublicKey []byte
@@ -61,6 +63,8 @@ func (l ProofLink) Window() (lower, upper time.Time) {
 }
 
 // ParseProof loads a stored proof from gzipped or raw malfeasance-report JSON.
+// It validates bounds and syntax only; callers must use [Proof.Verify] and
+// [Proof.Trust] before relying on its contents.
 func ParseProof(data []byte) (*Proof, error) {
 	if len(data) > MaxProofBytes {
 		return nil, fmt.Errorf("roughtime: proof is %d bytes (max %d)", len(data), MaxProofBytes)
@@ -171,7 +175,8 @@ func (p *Proof) Len() int {
 	return len(p.chain.Links)
 }
 
-// Links returns per-link attestation data with verified midpoint and radius.
+// Links returns per-link attestation data after verifying each response. Call
+// [Proof.Verify] first when nonce linkage and causal ordering are required.
 func (p *Proof) Links() ([]ProofLink, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("roughtime: nil proof")
@@ -201,7 +206,7 @@ func (p *Proof) Links() ([]ProofLink, error) {
 }
 
 // Trust errors if any link's claimed witness key is absent from trusted. It
-// checks the key field only, so pair it with [(*Proof).Verify] to bind each
+// checks the key field only, so pair it with [Proof.Verify] to bind each
 // response to its key.
 func (p *Proof) Trust(trusted []Server) error {
 	if p == nil || p.chain == nil {
@@ -225,8 +230,9 @@ func (p *Proof) Trust(trusted []Server) error {
 	return nil
 }
 
-// SeedNonce returns the first link's nonce, the value bound to the timestamped
-// payload.
+// SeedNonce parses and returns the first request's nonce. It does not
+// authenticate the request or proof; call [Proof.Verify] first when the value
+// will be trusted as a timestamp binding.
 func (p *Proof) SeedNonce() ([]byte, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("roughtime: nil proof")

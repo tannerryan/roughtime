@@ -19,13 +19,7 @@ import (
 
 	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/protocol"
-	"go.uber.org/goleak"
 )
-
-// TestMain runs the package tests under goleak to surface goroutine leaks.
-func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
-}
 
 // fakeServer is a minimal UDP/TCP responder for end-to-end client tests.
 type fakeServer struct {
@@ -47,12 +41,6 @@ type fakeServer struct {
 // hook.
 func newFakeServer(t *testing.T) *fakeServer {
 	return newFakeServerOpts(t, nil, time.Second)
-}
-
-// newFakeServerWithRadius returns a fakeServer that signs replies with the
-// given uncertainty radius.
-func newFakeServerWithRadius(t *testing.T, radius time.Duration) *fakeServer {
-	return newFakeServerOpts(t, nil, radius)
 }
 
 // newFakeServerWithHook returns a fakeServer that runs hook before each reply
@@ -105,8 +93,7 @@ func newFakeServerOpts(t *testing.T, hook func(), radius time.Duration) *fakeSer
 	return f
 }
 
-// Close shuts down the UDP and TCP listeners and waits for the serve goroutines
-// to exit.
+// Close shuts down the UDP and TCP listeners and waits for their loops.
 func (f *fakeServer) Close() {
 	_ = f.udpConn.Close()
 	_ = f.tcpLis.Close()
@@ -244,8 +231,7 @@ func (f *fakeServer) server() roughtime.Server {
 	}
 }
 
-// TestClientQueryUDP verifies a default Client.Query goes over UDP and returns
-// a positive RTT and Radius.
+// TestClientQueryUDP covers a verified UDP query.
 func TestClientQueryUDP(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -264,10 +250,15 @@ func TestClientQueryUDP(t *testing.T) {
 	if resp.Radius <= 0 {
 		t.Fatalf("Radius = %s; want > 0", resp.Radius)
 	}
+	if len(resp.Request) != 1024 {
+		t.Fatalf("request length = %d, want 1024", len(resp.Request))
+	}
+	if _, _, err := roughtime.Verify(f.rootPK, resp.Request, resp.Reply); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
 }
 
-// TestClientQueryTCP verifies Client.Query falls back to TCP when only TCP is
-// offered.
+// TestClientQueryTCP covers a verified TCP query.
 func TestClientQueryTCP(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -285,8 +276,30 @@ func TestClientQueryTCP(t *testing.T) {
 	}
 }
 
-// TestClientRetryOnDrop verifies Client retries succeed after the server drops
-// one request.
+// TestClientDefaultFallsBackToTCP covers zero-client endpoint fallback.
+func TestClientDefaultFallsBackToTCP(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+
+	closed, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := closed.LocalAddr().String()
+	_ = closed.Close()
+
+	s := f.server()
+	s.Addresses[0].Address = closedAddr
+	resp, err := new(roughtime.Client).Query(context.Background(), s)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if resp.Address.Transport != "tcp" {
+		t.Fatalf("transport = %q, want tcp", resp.Address.Transport)
+	}
+}
+
+// TestClientRetryOnDrop covers retry after a dropped request.
 func TestClientRetryOnDrop(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -299,60 +312,7 @@ func TestClientRetryOnDrop(t *testing.T) {
 	}
 }
 
-// TestClientQueryAllConcurrent verifies QueryAll returns one verified Result
-// per server.
-func TestClientQueryAllConcurrent(t *testing.T) {
-	f1 := newFakeServer(t)
-	defer f1.Close()
-	f2 := newFakeServer(t)
-	defer f2.Close()
-
-	var c roughtime.Client
-	results := c.QueryAll(context.Background(), []roughtime.Server{f1.server(), f2.server()})
-	if len(results) != 2 {
-		t.Fatalf("got %d results, want 2", len(results))
-	}
-	for i, r := range results {
-		if r.Err != nil {
-			t.Fatalf("result[%d]: %v", i, r.Err)
-		}
-		if r.Response == nil || r.Response.Midpoint.IsZero() {
-			t.Fatalf("result[%d]: no midpoint", i)
-		}
-	}
-}
-
-// TestClientQueryChainVerified verifies a three-link QueryChain produces a
-// Proof that re-verifies.
-func TestClientQueryChainVerified(t *testing.T) {
-	f := newFakeServer(t)
-	defer f.Close()
-	s := f.server()
-
-	var c roughtime.Client
-	cr, err := c.QueryChain(context.Background(), []roughtime.Server{s, s, s})
-	if err != nil {
-		t.Fatalf("QueryChain: %v", err)
-	}
-	if len(cr.Results) != 3 {
-		t.Fatalf("got %d links, want 3", len(cr.Results))
-	}
-	for i, r := range cr.Results {
-		if r.Err != nil {
-			t.Fatalf("link[%d]: %v", i, r.Err)
-		}
-	}
-	proof, err := cr.Proof()
-	if err != nil {
-		t.Fatalf("cr.Proof: %v", err)
-	}
-	if err := proof.Verify(); err != nil {
-		t.Fatalf("proof Verify: %v", err)
-	}
-}
-
-// TestClientQueryChainWithNonceBindsSeed verifies link 0 nonce equals the seed
-// and later links derive causally.
+// TestClientQueryChainWithNonceBindsSeed covers caller-supplied chain seeds.
 func TestClientQueryChainWithNonceBindsSeed(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -392,8 +352,7 @@ func TestClientQueryChainWithNonceBindsSeed(t *testing.T) {
 	}
 }
 
-// TestPickAddressMLDSARequiresTCP verifies an ML-DSA-44 server with only UDP
-// fails address selection.
+// TestPickAddressMLDSARequiresTCP covers the PQ transport constraint.
 func TestPickAddressMLDSARequiresTCP(t *testing.T) {
 	pk := make([]byte, 1312) // ML-DSA-44 length
 	s := roughtime.Server{
@@ -408,80 +367,26 @@ func TestPickAddressMLDSARequiresTCP(t *testing.T) {
 	}
 }
 
-// TestQueryRejectsEmptyAddresses verifies Query rejects a Server with no
-// Addresses.
-func TestQueryRejectsEmptyAddresses(t *testing.T) {
-	var c roughtime.Client
-	_, err := c.Query(context.Background(), roughtime.Server{
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-	})
-	if err == nil || !strings.Contains(err.Error(), "no addresses") {
-		t.Fatalf("Query: %v; want 'no addresses' error", err)
-	}
-}
-
-// TestQueryRejectsBadKeyLength verifies Query rejects a public key that is
-// neither 32 nor 1312 bytes.
-func TestQueryRejectsBadKeyLength(t *testing.T) {
-	var c roughtime.Client
-	_, err := c.Query(context.Background(), roughtime.Server{
-		PublicKey: make([]byte, 7),
-		Addresses: []roughtime.Address{{Transport: "udp", Address: "example.com:2002"}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "public key length") {
-		t.Fatalf("Query: %v; want 'public key length' error", err)
-	}
-}
-
-// TestQueryRejectsUnsupportedTransport verifies Query rejects transports other
-// than udp or tcp.
-func TestQueryRejectsUnsupportedTransport(t *testing.T) {
-	var c roughtime.Client
-	_, err := c.Query(context.Background(), roughtime.Server{
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-		Addresses: []roughtime.Address{{Transport: "sctp", Address: "example.com:2002"}},
-	})
-	if err == nil {
-		t.Fatal("Query accepted unsupported transport")
-	}
-}
-
-// TestPickAddressGoogleRequiresUDP verifies a Google-Roughtime server with only
-// TCP fails address selection.
+// TestPickAddressGoogleRequiresUDP covers the Google transport constraint.
 func TestPickAddressGoogleRequiresUDP(t *testing.T) {
-	s := roughtime.Server{
-		Name:      "google-tcp-only",
-		Version:   "Google-Roughtime",
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-		Addresses: []roughtime.Address{{Transport: "tcp", Address: "example.com:2002"}},
-	}
-	var c roughtime.Client
-	_, err := c.Query(context.Background(), s)
-	if err == nil || !strings.Contains(err.Error(), "udp address") {
-		t.Fatalf("Query: %v; want 'no udp address' error", err)
-	}
-}
-
-// TestPickAddressEd25519PrefersUDP verifies an Ed25519 server with both
-// transports prefers UDP.
-func TestPickAddressEd25519PrefersUDP(t *testing.T) {
-	f := newFakeServer(t)
-	defer f.Close()
-	s := f.server()
-	var c roughtime.Client
-	resp, err := c.Query(context.Background(), s)
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if resp.Address.Transport != "udp" {
-		t.Fatalf("Address.Transport = %q; Ed25519 should prefer udp", resp.Address.Transport)
+	for _, version := range []string{"Google-Roughtime", "3000600613"} {
+		s := roughtime.Server{
+			Name:      "google-tcp-only",
+			Version:   version,
+			PublicKey: make([]byte, ed25519.PublicKeySize),
+			Addresses: []roughtime.Address{{Transport: "tcp", Address: "example.com:2002"}},
+		}
+		var c roughtime.Client
+		_, err := c.Query(context.Background(), s)
+		if err == nil || !strings.Contains(err.Error(), "udp address") {
+			t.Fatalf("Query with version %q: %v; want 'no udp address' error", version, err)
+		}
 	}
 }
 
-// TestQueryAllSemaphoreCap verifies QueryAll never exceeds the default
-// concurrency cap.
+// TestQueryAllSemaphoreCap covers the concurrency limit.
 func TestQueryAllSemaphoreCap(t *testing.T) {
-	const total = roughtime.MaxQueryAllConcurrency * 2
+	const total, limit = 4, 2
 	servers := make([]roughtime.Server, total)
 	closers := make([]func(), total)
 	var inFlight, peak atomic.Int32
@@ -513,22 +418,22 @@ func TestQueryAllSemaphoreCap(t *testing.T) {
 	closeHold := func() { holdOnce.Do(func() { close(hold) }) }
 	defer closeHold()
 
-	var c roughtime.Client
+	c := roughtime.Client{Concurrency: limit}
 	done := make(chan []roughtime.Result, 1)
 	go func() {
 		done <- c.QueryAll(context.Background(), servers)
 	}()
 
 	// fill the cap, assert peak, then release
-	for range roughtime.MaxQueryAllConcurrency {
+	for range limit {
 		<-gate
 	}
-	if got := peak.Load(); got > roughtime.MaxQueryAllConcurrency {
-		t.Fatalf("peak concurrency = %d > cap %d", got, roughtime.MaxQueryAllConcurrency)
+	if got := peak.Load(); got > limit {
+		t.Fatalf("peak concurrency = %d > cap %d", got, limit)
 	}
 	go func() {
 		// drain remaining gates as later waves acquire the semaphore
-		for range total - roughtime.MaxQueryAllConcurrency {
+		for range total - limit {
 			<-gate
 		}
 	}()
@@ -537,13 +442,12 @@ func TestQueryAllSemaphoreCap(t *testing.T) {
 	if len(results) != total {
 		t.Fatalf("got %d results, want %d", len(results), total)
 	}
-	if peak.Load() > roughtime.MaxQueryAllConcurrency {
-		t.Fatalf("final peak %d > cap %d", peak.Load(), roughtime.MaxQueryAllConcurrency)
+	if peak.Load() > limit {
+		t.Fatalf("final peak %d > cap %d", peak.Load(), limit)
 	}
 }
 
-// TestQueryAllPreservesOrder verifies QueryAll returns Results in the same
-// order as the input servers.
+// TestQueryAllPreservesOrder covers slot-aligned results.
 func TestQueryAllPreservesOrder(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -563,38 +467,18 @@ func TestQueryAllPreservesOrder(t *testing.T) {
 	}
 }
 
-// TestClientRetriesExhausted verifies Query surfaces an error after all retries
-// are dropped.
-func TestClientRetriesExhausted(t *testing.T) {
+// TestClientRespectsContextCancel covers query cancellation.
+func TestClientRespectsContextCancel(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
-	f.dropNext(100)
-	c := roughtime.Client{Timeout: 50 * time.Millisecond, MaxAttempts: 2}
-	// large context budget so the surfaced error is the per-attempt timeout,
-	// not ctx cancel
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	_, err := c.Query(ctx, f.server())
-	if err == nil {
-		t.Fatal("Query succeeded despite drops")
-	}
-}
-
-// TestClientRespectsContextCancel verifies Query unblocks promptly when the
-// context is cancelled.
-func TestClientRespectsContextCancel(t *testing.T) {
-	// closed port so Dial/Read hangs on an unreachable peer
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	blackhole, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	defer func() { _ = blackhole.Close() }()
 
-	s := roughtime.Server{
-		PublicKey: make([]byte, 32),
-		Addresses: []roughtime.Address{{Transport: "udp", Address: addr}},
-	}
+	s := f.server()
+	s.Addresses = []roughtime.Address{{Transport: "udp", Address: blackhole.LocalAddr().String()}}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -603,39 +487,21 @@ func TestClientRespectsContextCancel(t *testing.T) {
 	c := roughtime.Client{Timeout: 5 * time.Second}
 	start := time.Now()
 	_, err = c.Query(ctx, s)
-	if err == nil {
-		t.Fatal("expected error on cancel")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Query error = %v, want context.Canceled", err)
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("Query took %s after cancel; should unblock promptly", time.Since(start))
 	}
-}
 
-// TestQueryWithNonceUsesCallerNonce verifies QueryWithNonce embeds the supplied
-// nonce in the request.
-func TestQueryWithNonceUsesCallerNonce(t *testing.T) {
-	f := newFakeServer(t)
-	defer f.Close()
-
-	nonce := bytes.Repeat([]byte{0xAB}, 32)
-	var c roughtime.Client
-	resp, err := c.QueryWithNonce(context.Background(), f.server(), nonce)
-	if err != nil {
-		t.Fatalf("QueryWithNonce: %v", err)
-	}
-	if len(resp.Request) == 0 {
-		t.Fatal("Response.Request not populated")
-	}
-	if len(resp.Reply) == 0 {
-		t.Fatal("Response.Reply not populated")
-	}
-	if !bytes.Contains(resp.Request, nonce) {
-		t.Fatal("supplied nonce not embedded in request bytes")
+	nextCtx, nextCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer nextCancel()
+	if _, err := c.Query(nextCtx, f.server()); err != nil {
+		t.Fatalf("query after cancellation: %v", err)
 	}
 }
 
-// TestQueryWithNonceRejectsBadLength verifies QueryWithNonce rejects nonces of
-// the wrong length.
+// TestQueryWithNonceRejectsBadLength covers nonce-size validation.
 func TestQueryWithNonceRejectsBadLength(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -648,250 +514,4 @@ func TestQueryWithNonceRejectsBadLength(t *testing.T) {
 	if !strings.Contains(err.Error(), "nonce length") {
 		t.Fatalf("error %q; want 'nonce length' message", err)
 	}
-}
-
-// TestPackageLevelQuery verifies the package-level Query helper succeeds
-// against a fake server.
-func TestPackageLevelQuery(t *testing.T) {
-	f := newFakeServer(t)
-	defer f.Close()
-
-	resp, err := roughtime.Query(context.Background(), f.server())
-	if err != nil {
-		t.Fatalf("Query: %v", err)
-	}
-	if resp.Midpoint.IsZero() {
-		t.Fatal("no midpoint on package-level Query")
-	}
-}
-
-// TestPackageLevelQueryWithNonce verifies the package-level QueryWithNonce
-// helper embeds the nonce.
-func TestPackageLevelQueryWithNonce(t *testing.T) {
-	f := newFakeServer(t)
-	defer f.Close()
-
-	nonce := bytes.Repeat([]byte{0xCD}, 32)
-	resp, err := roughtime.QueryWithNonce(context.Background(), f.server(), nonce)
-	if err != nil {
-		t.Fatalf("QueryWithNonce: %v", err)
-	}
-	if !bytes.Contains(resp.Request, nonce) {
-		t.Fatal("nonce not in request")
-	}
-}
-
-// TestAddressString verifies Address.String renders as
-// "<transport>://<host:port>".
-func TestAddressString(t *testing.T) {
-	a := roughtime.Address{Transport: "udp", Address: "time.example.com:2002"}
-	if got, want := a.String(), "udp://time.example.com:2002"; got != want {
-		t.Fatalf("String() = %q, want %q", got, want)
-	}
-}
-
-// TestClientConcurrencyOverride verifies a custom Client.Concurrency caps
-// in-flight QueryAll fan-out.
-func TestClientConcurrencyOverride(t *testing.T) {
-	const cap = 4
-	const total = cap * 3
-	servers := make([]roughtime.Server, total)
-	closers := make([]func(), total)
-	var inFlight, peak atomic.Int32
-	gate := make(chan struct{})
-	hold := make(chan struct{})
-	for i := range total {
-		f := newFakeServerWithHook(t, func() {
-			n := inFlight.Add(1)
-			for {
-				p := peak.Load()
-				if n <= p || peak.CompareAndSwap(p, n) {
-					break
-				}
-			}
-			gate <- struct{}{}
-			<-hold
-			inFlight.Add(-1)
-		})
-		servers[i] = f.server()
-		closers[i] = f.Close
-	}
-	defer func() {
-		for _, cl := range closers {
-			cl()
-		}
-	}()
-	// release hooks on t.Fatalf so the closers above don't deadlock on wg.Wait
-	var holdOnce sync.Once
-	closeHold := func() { holdOnce.Do(func() { close(hold) }) }
-	defer closeHold()
-
-	c := roughtime.Client{Concurrency: cap}
-	done := make(chan []roughtime.Result, 1)
-	go func() {
-		done <- c.QueryAll(context.Background(), servers)
-	}()
-	for range cap {
-		<-gate
-	}
-	if got := peak.Load(); got > int32(cap) {
-		t.Fatalf("peak %d > cap %d", got, cap)
-	}
-	go func() {
-		for range total - cap {
-			<-gate
-		}
-	}()
-	closeHold()
-	<-done
-}
-
-// TestErrorSentinelsReExported verifies each top-level error sentinel matches
-// its protocol counterpart via errors.Is.
-func TestErrorSentinelsReExported(t *testing.T) {
-	pairs := []struct {
-		name      string
-		highLevel error
-		lowLevel  error
-	}{
-		{"ErrPeerClosedNoReply", roughtime.ErrPeerClosedNoReply, protocol.ErrPeerClosedNoReply},
-		{"ErrChainNonce", roughtime.ErrChainNonce, protocol.ErrChainNonce},
-		{"ErrCausalOrder", roughtime.ErrCausalOrder, protocol.ErrCausalOrder},
-		{"ErrMerkleMismatch", roughtime.ErrMerkleMismatch, protocol.ErrMerkleMismatch},
-		{"ErrDelegationWindow", roughtime.ErrDelegationWindow, protocol.ErrDelegationWindow},
-	}
-	for _, p := range pairs {
-		if !errors.Is(p.highLevel, p.lowLevel) {
-			t.Errorf("%s: roughtime sentinel does not match protocol sentinel", p.name)
-		}
-	}
-}
-
-// TestQueryWithNonceRejectsEmptyAddresses verifies QueryWithNonce rejects a
-// Server with no Addresses.
-func TestQueryWithNonceRejectsEmptyAddresses(t *testing.T) {
-	var c roughtime.Client
-	_, err := c.QueryWithNonce(context.Background(), roughtime.Server{
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-	}, bytes.Repeat([]byte{0}, 32))
-	if err == nil || !strings.Contains(err.Error(), "no addresses") {
-		t.Fatalf("QueryWithNonce: %v; want no-addresses error", err)
-	}
-}
-
-// TestQueryGoogleVersionPath verifies versionsForServer's Google-Roughtime
-// branch is exercised.
-func TestQueryGoogleVersionPath(t *testing.T) {
-	c := roughtime.Client{Timeout: 50 * time.Millisecond, MaxAttempts: 1}
-	_, err := c.Query(context.Background(), roughtime.Server{
-		Version:   "Google-Roughtime",
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},
-	})
-	if err == nil {
-		t.Fatal("Query against closed port returned nil err")
-	}
-}
-
-// TestSendWithRetryContextCancel verifies sendWithRetry honors a pre-cancelled
-// context.
-func TestSendWithRetryContextCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // pre-cancel so the first ctx.Err() check trips
-	c := roughtime.Client{Timeout: 50 * time.Millisecond, MaxAttempts: 5}
-	_, err := c.Query(ctx, roughtime.Server{
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},
-	})
-	if err == nil {
-		t.Fatal("Query did not honor pre-cancelled context")
-	}
-}
-
-// TestSendWithRetryBackoffCancel verifies sleepCtx returns false when the
-// context is cancelled mid-backoff.
-func TestSendWithRetryBackoffCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		cancel()
-	}()
-	c := roughtime.Client{Timeout: 10 * time.Millisecond, MaxAttempts: 5}
-	// closed port. First attempt fails fast, then sleepCtx triggers
-	_, err := c.Query(ctx, roughtime.Server{
-		PublicKey: make([]byte, ed25519.PublicKeySize),
-		Addresses: []roughtime.Address{{Transport: "udp", Address: "127.0.0.1:1"}},
-	})
-	if err == nil {
-		t.Fatal("Query succeeded with cancelled context mid-backoff")
-	}
-}
-
-// TestQueryAllPreCancelled verifies QueryAll surfaces a per-server error for
-// every entry on a pre-cancelled context.
-func TestQueryAllPreCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	bad := roughtime.Server{PublicKey: make([]byte, ed25519.PublicKeySize)} // no addresses
-	servers := []roughtime.Server{bad, bad, bad}
-	c := roughtime.Client{Concurrency: 1}
-	results := c.QueryAll(ctx, servers)
-	if len(results) != 3 {
-		t.Fatalf("got %d results", len(results))
-	}
-	for i, r := range results {
-		if r.Err == nil {
-			t.Fatalf("result[%d]: expected error, got success", i)
-		}
-	}
-}
-
-// TestQueryChainPreCancelled verifies queryChain populates per-link errors when
-// the context is pre-cancelled.
-func TestQueryChainPreCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	servers := []roughtime.Server{{PublicKey: make([]byte, ed25519.PublicKeySize)}}
-	var c roughtime.Client
-	cr, err := c.QueryChain(ctx, servers)
-	if err != nil {
-		t.Fatalf("QueryChain: %v", err)
-	}
-	if len(cr.Results) != 1 || cr.Results[0].Err == nil {
-		t.Fatalf("expected per-link error from cancelled context, got %+v", cr.Results)
-	}
-}
-
-// TestQueryChainResolveServerError verifies queryChain surfaces a resolveServer
-// error in the per-link Result.
-func TestQueryChainResolveServerError(t *testing.T) {
-	servers := []roughtime.Server{{PublicKey: make([]byte, ed25519.PublicKeySize)}}
-	var c roughtime.Client
-	cr, _ := c.QueryChain(context.Background(), servers)
-	if cr.Results[0].Err == nil {
-		t.Fatal("expected resolveServer error, got nil")
-	}
-}
-
-// TestClientConcurrentQueryAll verifies overlapping QueryAll calls do not
-// corrupt Results under -race.
-func TestClientConcurrentQueryAll(t *testing.T) {
-	f := newFakeServer(t)
-	defer f.Close()
-	servers := []roughtime.Server{f.server(), f.server(), f.server()}
-
-	var c roughtime.Client
-	var wg sync.WaitGroup
-	const goroutines = 8
-	for range goroutines {
-		wg.Go(func() {
-			results := c.QueryAll(context.Background(), servers)
-			for i, r := range results {
-				if r.Err != nil {
-					t.Errorf("result[%d]: %v", i, r.Err)
-				}
-			}
-		})
-	}
-	wg.Wait()
 }

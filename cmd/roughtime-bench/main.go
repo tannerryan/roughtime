@@ -1,38 +1,17 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Command roughtime-bench is a closed-loop load generator for the Roughtime
-// server. Each worker owns one socket, fires a request, waits for the reply,
-// records the RTT, and repeats. It reports throughput, latency percentiles, and
-// an error breakdown.
-//
-// Latencies feed a per-worker Algorithm R reservoir capped at 100k samples, so
-// p99.9 is approximate once a worker exceeds that count. Warmup samples are
-// dropped but sockets stay open across the boundary so the measurement window
-// inherits warm kernel state. Deadlines are set before the timer starts, so the
-// SetReadDeadline cost stays out of the measured RTT.
-//
-// The bench is a closed-loop load generator: it deliberately omits exponential
-// backoff on TCP redial and has no rate limit, so it is not a conformant client
-// and must only target servers you own.
-//
-// With -verify, replies are signature-checked. RTT is recorded on RX before the
-// verify block so verification cost stays out of the percentile. The "verify
-// fail" bucket lumps grease and genuine faults together since the wire cannot
-// distinguish them.
-//
-// Key length selects the suite: 32 bytes Ed25519, 1312 bytes ML-DSA-44
-// (experimental, always TCP). -tcp forces TCP for Ed25519.
-//
-// Example:
-//
-//	go run ./cmd/roughtime-bench -addr server:2002 -pubkey <base64-or-hex> -workers 256 -duration 30s -warmup 2s
+// Command roughtime-bench is a closed-loop Roughtime load generator. It has no
+// rate limit or reconnect backoff and must only target servers you control.
+// Latency percentiles use a run-wide bounded reservoir; -verify excludes
+// unauthenticated replies from it. ML-DSA-44 always uses TCP.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -46,50 +25,49 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
-// addr is the server host:port flag.
-var addr = flag.String("addr", "127.0.0.1:2002", "server host:port")
+var (
+	// addr is the target endpoint flag.
+	addr = flag.String("addr", "127.0.0.1:2002", "server host:port")
+	// pubkey is the root public-key flag.
+	pubkey = flag.String("pubkey", "", "root public key (base64 or hex). 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
+	// useTCP selects TCP for Ed25519.
+	useTCP = flag.Bool("tcp", false, "use TCP transport. ML-DSA-44 keys always use TCP")
+	// workers sets concurrent client sockets.
+	workers = flag.Int("workers", 64, "concurrent client sockets")
+	// duration sets the measurement period.
+	duration = flag.Duration("duration", 10*time.Second, "measurement duration")
+	// warmup sets the unmeasured warmup period.
+	warmup = flag.Duration("warmup", 2*time.Second, "warmup period before measurement (not counted)")
+	// timeout bounds each request.
+	timeout = flag.Duration("timeout", 500*time.Millisecond, "per-request read/write timeout")
+	// verify enables response authentication.
+	verify = flag.Bool("verify", false, "verify every reply's signature and Merkle proof (slower, client-bound)")
+	// showVersion requests version output and exit.
+	showVersion = flag.Bool("version", false, "print version and exit")
+)
 
-// pubkey is the root public key flag (base64 or hex, length selects suite).
-var pubkey = flag.String("pubkey", "", "root public key (base64 or hex). 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
-
-// useTCP forces TCP transport for Ed25519. ML-DSA-44 always uses TCP.
-var useTCP = flag.Bool("tcp", false, "use TCP transport. ML-DSA-44 keys always use TCP")
-
-// workers is the concurrent client socket count flag.
-var workers = flag.Int("workers", 64, "concurrent client sockets")
-
-// duration is the measurement window flag.
-var duration = flag.Duration("duration", 10*time.Second, "measurement duration")
-
-// warmup is the pre-measurement warmup period flag.
-var warmup = flag.Duration("warmup", 2*time.Second, "warmup period before measurement (not counted)")
-
-// timeout is the per-request read/write timeout flag.
-var timeout = flag.Duration("timeout", 500*time.Millisecond, "per-request read/write timeout")
-
-// verify enables per-reply signature and Merkle-proof verification.
-var verify = flag.Bool("verify", false, "verify every reply's signature and Merkle proof (slower, client-bound)")
-
-// showVersion prints the version string and exits.
-var showVersion = flag.Bool("version", false, "print version and exit")
-
-// reservoirSize is the per-worker Algorithm R latency-sample cap.
+// reservoirSize is the run-wide Algorithm R latency-sample cap.
 const reservoirSize = 100_000
 
-// maxWorkers caps -workers so a typo can't exhaust local fds and memory.
+// maxWorkers bounds accidental local fd and memory use.
 const maxWorkers = 65_536
 
-// workerResult represents the per-goroutine stats accumulator.
+// workerResult holds one worker's measurement counters.
 type workerResult struct {
-	latencies []time.Duration
-	received  uint64
-	errVerify uint64
-	errWrite  uint64
-	errRead   uint64
-	timeouts  uint64
+	sent         uint64
+	received     uint64
+	successes    uint64
+	errVerify    uint64
+	errAmp       uint64
+	errWrite     uint64
+	errRead      uint64
+	timeouts     uint64
+	latencyMin   time.Duration
+	latencyMax   time.Duration
+	latencyTotal float64
 }
 
-// benchConfig represents the per-run configuration shared by all workers.
+// benchConfig is immutable configuration shared by workers.
 type benchConfig struct {
 	addr      string
 	transport string
@@ -98,9 +76,11 @@ type benchConfig struct {
 	versions  []protocol.Version
 	timeout   time.Duration
 	verify    bool
+	udpAddr   *net.UDPAddr
+	latencies *latencyReservoir
 }
 
-// main parses flags, validates inputs, and runs the bench.
+// main parses flags and runs the benchmark.
 func main() {
 	flag.Parse()
 	if *showVersion {
@@ -114,10 +94,10 @@ func main() {
 
 	fmt.Fprintln(os.Stderr, "WARNING: closed-loop load generator; do not target servers you do not own")
 
-	// under -verify the bench is CPU-bound, so cap default workers
+	// Verification can be CPU-bound, so cap default workers.
 	if *verify && !flagSet("workers") {
 		if maxW := runtime.NumCPU() * 2; *workers > maxW {
-			fmt.Fprintf(os.Stderr, "bench: -verify is CPU-bound; capping workers %d -> %d (override with -workers)\n", *workers, maxW)
+			fmt.Fprintf(os.Stderr, "bench: -verify can be CPU-bound; capping workers %d -> %d (override with -workers)\n", *workers, maxW)
 			*workers = maxW
 		}
 	}
@@ -142,6 +122,22 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var udpAddr *net.UDPAddr
+	if transport == "udp" {
+		dialer := net.Dialer{Timeout: *timeout}
+		conn, err := dialer.DialContext(ctx, "udp", *addr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bench: resolving target: %s\n", err)
+			os.Exit(1)
+		}
+		resolved, ok := conn.RemoteAddr().(*net.UDPAddr)
+		_ = conn.Close()
+		if !ok {
+			fmt.Fprintln(os.Stderr, "bench: resolved target is not UDP")
+			os.Exit(1)
+		}
+		udpAddr = &net.UDPAddr{IP: append(net.IP(nil), resolved.IP...), Port: resolved.Port, Zone: resolved.Zone}
+	}
 
 	fmt.Printf("roughtime-bench -> %s (%s)\n", *addr, transport)
 	fmt.Printf("  workers=%d duration=%s warmup=%s timeout=%s verify=%t\n",
@@ -155,6 +151,7 @@ func main() {
 		versions:  versions,
 		timeout:   *timeout,
 		verify:    *verify,
+		udpAddr:   udpAddr,
 	}
 
 	// run warmup and measurement in one pass so sockets stay open across the
@@ -163,15 +160,15 @@ func main() {
 	defer totalCancel()
 	start := time.Now()
 	collectAfter := start.Add(*warmup)
-	results, err := runWorkers(totalCtx, cfg, *workers, collectAfter)
+	results, latencies, err := runWorkers(totalCtx, cfg, *workers, collectAfter)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "bench: %s\n", err)
 		os.Exit(1)
 	}
 	// clamp at zero in case a SIGINT cancels before collectAfter elapses
-	elapsed := max(time.Since(collectAfter), 0)
+	elapsed := min(max(time.Since(collectAfter), 0), *duration)
 
-	report(runMeta{workers: *workers, verify: *verify}, results, elapsed)
+	report(runMeta{workers: *workers, verify: *verify}, results, latencies, elapsed)
 }
 
 // flagSet reports whether name was set on the command line.
@@ -211,21 +208,23 @@ func validateFlags() error {
 	return nil
 }
 
-// runWorkers spins up n workers and returns their results when ctx ends.
-func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) ([]workerResult, error) {
+// runWorkers starts n workers and waits for them to finish.
+func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) ([]workerResult, []time.Duration, error) {
 	results := make([]workerResult, n)
+	reservoir := &latencyReservoir{values: make([]time.Duration, 0, reservoirSize)}
+	cfg.latencies = reservoir
 	var wg sync.WaitGroup
-	var dialed atomic.Int32
+	var completed atomic.Int32
 	for i := range n {
 		wg.Go(func() {
 			if worker(ctx, cfg, &results[i], collectAfter) {
-				dialed.Add(1)
+				completed.Add(1)
 			}
 		})
 	}
 	wg.Wait()
-	if dialed.Load() == 0 {
-		return nil, fmt.Errorf("all workers failed to start")
+	if got := int(completed.Load()); got != n {
+		return nil, nil, fmt.Errorf("%d of %d workers failed to start or terminated early", n-got, n)
 	}
-	return results, nil
+	return results, reservoir.values, nil
 }

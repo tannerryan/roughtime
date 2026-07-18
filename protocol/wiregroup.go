@@ -3,7 +3,7 @@
 
 package protocol
 
-// wireGroup identifies a set of drafts that share on-wire behaviour.
+// wireGroup identifies variants that share wire behavior.
 type wireGroup int
 
 const (
@@ -60,7 +60,7 @@ func wireGroupOf(v Version, hasType bool) wireGroup {
 	}
 }
 
-// hashSize returns the Merkle hash output length: 64 for Google, 32 for IETF.
+// hashSize returns 64 for Google and 32 otherwise.
 func hashSize(g wireGroup) int {
 	if g == groupGoogle {
 		return 64
@@ -68,8 +68,7 @@ func hashSize(g wireGroup) int {
 	return 32
 }
 
-// nonceSize returns the nonce length: 64 for Google and drafts 01-04, 32 for
-// drafts 05+.
+// nonceSize returns 64 for Google and drafts 01-04, and 32 otherwise.
 func nonceSize(g wireGroup) int {
 	if g <= groupD03 {
 		return 64
@@ -77,15 +76,13 @@ func nonceSize(g wireGroup) int {
 	return 32
 }
 
-// usesRoughtimHeader reports whether packets use the 12-byte ROUGHTIM header.
+// usesRoughtimHeader reports whether a variant uses ROUGHTIM framing.
 func usesRoughtimHeader(g wireGroup) bool { return g >= groupD01 }
 
-// usesMJDMicroseconds reports whether timestamps use MJD-µs encoding (drafts
-// 01-07).
+// usesMJDMicroseconds reports whether timestamps use MJD-µs encoding.
 func usesMJDMicroseconds(g wireGroup) bool { return g >= groupD01 && g <= groupD07 }
 
-// usesFullPacketLeaf reports whether the Merkle leaf is the full request packet
-// (drafts 12+).
+// usesFullPacketLeaf reports whether the Merkle leaf is the full request packet.
 func usesFullPacketLeaf(g wireGroup) bool { return g >= groupD12 }
 
 // noncInSREP reports whether NONC sits inside SREP (drafts 01-02).
@@ -98,11 +95,10 @@ func NoncInSREP(ver Version, hasType bool) bool { return noncInSREP(wireGroupOf(
 // (drafts 01-11).
 func hasResponseVER(g wireGroup) bool { return g >= groupD01 && g < groupD12 }
 
-// hasResponseNONC reports whether the response echoes NONC at top level (drafts
-// 03+).
+// hasResponseNONC reports whether the response echoes NONC at top level.
 func hasResponseNONC(g wireGroup) bool { return g >= groupD03 }
 
-// hasSREPVERS reports whether SREP carries VER and VERS (drafts 12+).
+// hasSREPVERS reports whether SREP carries VER and VERS.
 func hasSREPVERS(g wireGroup) bool { return g >= groupD12 }
 
 // usesSHA512_256 reports whether the hash is SHA-512/256 (drafts 02 and 07).
@@ -112,7 +108,7 @@ var (
 	// delegationCtxOld is the delegation context for Google and drafts 01-06,
 	// 08-11.
 	delegationCtxOld = []byte("RoughTime v1 delegation signature--\x00")
-	// delegationCtxNew is the delegation context for draft 07 and drafts 12+.
+	// delegationCtxNew is used by draft 07, drafts 12+, and ML-DSA-44.
 	delegationCtxNew = []byte("RoughTime v1 delegation signature\x00")
 )
 

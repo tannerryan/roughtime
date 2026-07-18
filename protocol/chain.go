@@ -8,7 +8,6 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"time"
 )
@@ -21,8 +20,7 @@ var (
 	ErrCausalOrder = errors.New("protocol: causal ordering violation")
 )
 
-// MaxChainLinks caps the link count of a parsed malfeasance report or verified
-// chain.
+// MaxChainLinks is the maximum accepted by verification and report processing.
 const MaxChainLinks = 1024
 
 // ChainLink is one server query in a Roughtime measurement chain.
@@ -31,7 +29,7 @@ type ChainLink struct {
 	Rand []byte
 	// PublicKey is the server's long-term key.
 	PublicKey []byte
-	// Nonce is the nonce sent in Request. It is not serialized.
+	// Nonce caches the nonce from Request; reports do not serialize it separately.
 	Nonce []byte
 	// Request is the full request packet.
 	Request []byte
@@ -47,11 +45,15 @@ type Chain struct {
 }
 
 // ChainNonce derives the next link's nonce, returning random bytes for the
-// first link or H(prevResponse || rand) thereafter.
+// first link. Later links use H(prevResponse || rand), except draft-01, which
+// specifies H(H(prevResponse) || rand).
 func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (nonce, rand []byte, err error) {
 	_, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, nil, err
+	}
+	if entropy == nil {
+		return nil, nil, errors.New("protocol: nil entropy reader")
 	}
 	ns := nonceSize(g)
 
@@ -66,22 +68,25 @@ func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (non
 	if _, err = io.ReadFull(entropy, rand); err != nil {
 		return nil, nil, fmt.Errorf("protocol: read entropy: %w", err)
 	}
-	h := chainHasher(g)
-	h.Write(prevResponse)
-	h.Write(rand)
-	nonce = h.Sum(nil)[:ns]
+	nonce = deriveChainNonce(prevResponse, rand, g, ns)
 	return nonce, rand, nil
 }
 
-// chainHasher returns the chain-nonce hasher. SHA-512 is used for every group
-// since drafts 01-04 require up to 64 bytes, which drafts 02-03's nominal
-// SHA-512/256 cannot fill.
-func chainHasher(_ wireGroup) hash.Hash {
-	return sha512.New()
+// deriveChainNonce applies the version-specific chain hash.
+func deriveChainNonce(response, blind []byte, group wireGroup, size int) []byte {
+	h := sha512.New()
+	if group == groupD01 {
+		sum := sha512.Sum512(response)
+		_, _ = h.Write(sum[:])
+	} else {
+		_, _ = h.Write(response)
+	}
+	_, _ = h.Write(blind)
+	return h.Sum(nil)[:size]
 }
 
-// NextRequest creates the next chained request with Rand, PublicKey, Nonce, and
-// Request populated.
+// NextRequest creates the next chained request. It populates PublicKey, Nonce,
+// Request, and Rand for non-first links.
 func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader) (ChainLink, error) {
 	var prevResp []byte
 	if n := len(c.Links); n > 0 {
@@ -141,8 +146,10 @@ func (c *Chain) Append(link ChainLink) {
 
 // Bound is the verified midpoint and radius for one chain link.
 type Bound struct {
+	// Midpoint is the authenticated center of the server's time interval.
 	Midpoint time.Time
-	Radius   time.Duration
+	// Radius is the authenticated uncertainty around Midpoint.
+	Radius time.Duration
 }
 
 // Verify checks nonce linkage, signature validity, and causal ordering across
@@ -185,10 +192,7 @@ func (c *Chain) VerifyBounds() ([]Bound, error) {
 			if len(link.Rand) != ns {
 				return nil, fmt.Errorf("protocol: chain link %d: %w: rand is %d bytes, want %d", i, ErrChainNonce, len(link.Rand), ns)
 			}
-			h := chainHasher(g)
-			h.Write(c.Links[i-1].Response)
-			h.Write(link.Rand)
-			want := h.Sum(nil)[:ns]
+			want := deriveChainNonce(c.Links[i-1].Response, link.Rand, g, ns)
 			if !bytes.Equal(req.Nonce, want) {
 				return nil, fmt.Errorf("protocol: chain link %d: %w", i, ErrChainNonce)
 			}

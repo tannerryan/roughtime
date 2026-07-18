@@ -8,12 +8,17 @@ package main
 import (
 	"net"
 	"runtime"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 )
 
-// applyReadBuffer sets SO_RCVBUF on conn and logs any kernel truncation.
+// udpWriteTimeout bounds a blocked datagram send during normal operation and
+// shutdown.
+const udpWriteTimeout = 2 * time.Second
+
+// applyReadBuffer sets SO_RCVBUF and logs if the kernel clamps its size.
 func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 	if err := conn.SetReadBuffer(socketRecvBuffer); err != nil {
 		log.Warn("setting UDP receive buffer failed",
@@ -41,10 +46,14 @@ func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 		)
 		return
 	}
+	// Linux reports twice the usable payload buffer for accounting overhead.
+	if runtime.GOOS == "linux" {
+		effective /= 2
+	}
 	if effective < socketRecvBuffer {
 		level := zap.WarnLevel
-		// BSD/Darwin default kern.ipc.maxsockbuf is well under socketRecvBuffer
-		// and rarely raised, so demote to info there to avoid alarming logs
+		// Non-Linux limits are commonly below the requested size, so avoid an
+		// alarming warning there.
 		if runtime.GOOS != "linux" {
 			level = zap.InfoLevel
 		}
@@ -52,7 +61,7 @@ func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 			ce.Write(
 				zap.Int("requested", socketRecvBuffer),
 				zap.Int("effective", effective),
-				zap.String("remediation", "raise net.core.rmem_max (Linux) or kern.ipc.maxsockbuf (BSD/Darwin)"),
+				zap.String("remediation", "raise the operating system's UDP receive-buffer limit"),
 			)
 		}
 		return

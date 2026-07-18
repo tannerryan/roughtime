@@ -11,9 +11,10 @@ import (
 	"time"
 )
 
-// microsPerDay is µs in a non-leap UTC day, used to validate MJD-µs sub-day
-// fields.
-const microsPerDay int64 = 86_400 * 1_000_000
+// microsPerPositiveLeapDay is the exclusive upper bound for the sub-day field
+// on a UTC day containing a positive leap second. The old MJD format cannot be
+// validated more precisely without an external leap-second table.
+const microsPerPositiveLeapDay int64 = 86_401 * 1_000_000
 
 // timeToMJDMicro encodes a time as an MJD-µs timestamp for drafts 01-07.
 func timeToMJDMicro(t time.Time) uint64 {
@@ -52,26 +53,83 @@ func encodeTimestamp(t time.Time, g wireGroup) [8]byte {
 	return buf
 }
 
-// radiMicroseconds encodes a RADI value in µs, clamped to [1, MaxUint32].
-func radiMicroseconds(d time.Duration) uint32 {
-	return uint32(min(max(d.Microseconds(), 1), math.MaxUint32))
+// validateTimestampEncoding rejects values that cannot round-trip through a
+// wire group's unsigned timestamp representation.
+func validateTimestampEncoding(t time.Time, g wireGroup) error {
+	sec := t.Unix()
+	switch {
+	case g == groupGoogle:
+		if sec < 0 || sec > math.MaxInt64/1_000_000 ||
+			(sec == math.MaxInt64/1_000_000 && int64(t.Nanosecond()/1_000) > math.MaxInt64%1_000_000) {
+			return errors.New("protocol: timestamp outside Google microsecond range")
+		}
+	case usesMJDMicroseconds(g):
+		v := timeToMJDMicro(t)
+		// Detect a negative/pre-MJD time or overflow of the 24-bit day field
+		// by round-tripping the encoding.
+		decoded, err := mjdMicroToTime(v)
+		if err != nil || !decoded.Equal(t.Truncate(time.Microsecond)) {
+			return errors.New("protocol: timestamp outside 24-bit MJD microsecond range")
+		}
+	default:
+		if sec < 0 {
+			return errors.New("protocol: timestamp precedes Unix epoch")
+		}
+	}
+	return nil
 }
 
-// radiSeconds encodes a RADI value in seconds with a 3-second floor.
-func radiSeconds(d time.Duration) uint32 {
-	sec := int64(d / time.Second)
-	const floor = int64(3)
-	return uint32(min(max(sec, floor), math.MaxUint32))
+// radiMicroseconds encodes RADI in µs, rounding up with a one-microsecond floor.
+func radiMicroseconds(d time.Duration) (uint32, error) {
+	units := ceilDurationUnits(d, time.Microsecond)
+	units = max(units, 1)
+	if units > math.MaxUint32 {
+		return 0, errors.New("protocol: radius exceeds 32-bit microsecond range")
+	}
+	return uint32(units), nil
+}
+
+// radiSeconds encodes RADI in seconds, rounding up with a three-second floor.
+func radiSeconds(d time.Duration) (uint32, error) {
+	units := ceilDurationUnits(d, time.Second)
+	units = max(units, 3)
+	if units > math.MaxUint32 {
+		return 0, errors.New("protocol: radius exceeds 32-bit second range")
+	}
+	return uint32(units), nil
+}
+
+// ceilDurationUnits rounds a positive duration up to whole units.
+func ceilDurationUnits(d, unit time.Duration) uint64 {
+	if d <= 0 {
+		return 0
+	}
+	units := uint64(d / unit)
+	if d%unit != 0 {
+		units++
+	}
+	return units
+}
+
+// encodeRadius applies the wire group's RADI unit and floor.
+func encodeRadius(d time.Duration, g wireGroup) (uint32, error) {
+	if g == groupGoogle || usesMJDMicroseconds(g) {
+		return radiMicroseconds(d)
+	}
+	return radiSeconds(d)
 }
 
 // mjdMicroToTime converts an MJD-µs timestamp to a [time.Time].
 func mjdMicroToTime(v uint64) (time.Time, error) {
 	mjd := int64(v >> 40)
 	usInDay := int64(v & 0xFFFFFFFFFF)
-	if usInDay >= microsPerDay {
-		return time.Time{}, fmt.Errorf("protocol: MJD sub-day µs %d >= %d (invalid)", usInDay, microsPerDay)
+	if usInDay >= microsPerPositiveLeapDay {
+		return time.Time{}, fmt.Errorf("protocol: MJD sub-day µs %d >= %d (invalid)", usInDay, microsPerPositiveLeapDay)
 	}
 
+	// time.Time cannot represent second 60. Normalize a positive-leap-second
+	// field into the first second of the following nominal Unix day while
+	// preserving its fractional microseconds.
 	unixDays := mjd - 40587
 	sec := unixDays*86400 + usInDay/1_000_000
 	nsec := (usInDay % 1_000_000) * 1000
@@ -114,5 +172,8 @@ func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 
 // DecodeTimestamp decodes an 8-byte wire timestamp per ver's encoding rules.
 func DecodeTimestamp(ver Version, buf []byte) (time.Time, error) {
+	if !isRecognizedVersion(ver) {
+		return time.Time{}, fmt.Errorf("protocol: unsupported timestamp version %s", ver)
+	}
 	return decodeTimestamp(buf, wireGroupOf(ver, false))
 }

@@ -8,8 +8,9 @@ import (
 	mrand "math/rand/v2"
 )
 
-// Grease applies a random grease transformation to a signed reply. It may
-// modify reply in place, so callers must pass a buffer they own.
+// Grease attempts a random transformation of a signed reply. Malformed input
+// may be unchanged; other results may modify reply in place, so callers must
+// own the buffer.
 func Grease(reply []byte, ver Version) []byte {
 	mode := mrand.IntN(4)
 	switch mode {
@@ -26,8 +27,7 @@ func Grease(reply []byte, ver Version) []byte {
 			return out
 		}
 	}
-	// mode 0 or fallback. If no SIG location is found, fall back to
-	// undefined-tag grease so the reply is never returned unchanged
+	// Mode 0 or fallback: try signature corruption, then an undefined tag.
 	if greaseCorruptSig(reply, ver) {
 		return reply
 	}
@@ -114,8 +114,8 @@ func greaseDropTag(reply []byte, ver Version) []byte {
 	for _, scope := range scopes {
 		if scope == 0 {
 			candidates := []uint32{TagSIG, TagSREP, TagCERT, TagPATH, TagINDX}
-			if out, ok := dropOneTag(msg, candidates); ok {
-				encoded, err := encode(out)
+			if dropOneTag(msg, candidates) {
+				encoded, err := encode(msg)
 				if err != nil {
 					return nil
 				}
@@ -137,11 +137,10 @@ func greaseDropTag(reply []byte, ver Version) []byte {
 		} else {
 			candidates = []uint32{TagSIG, TagDELE}
 		}
-		modified, ok := dropOneTag(innerMsg, candidates)
-		if !ok {
+		if !dropOneTag(innerMsg, candidates) {
 			continue
 		}
-		reencoded, err := encode(modified)
+		reencoded, err := encode(innerMsg)
 		if err != nil {
 			return nil
 		}
@@ -156,16 +155,15 @@ func greaseDropTag(reply []byte, ver Version) []byte {
 }
 
 // dropOneTag removes one randomly chosen candidate tag from msg.
-func dropOneTag(msg map[uint32][]byte, candidates []uint32) (map[uint32][]byte, bool) {
-	shuffled := append([]uint32(nil), candidates...)
-	mrand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-	for _, tag := range shuffled {
+func dropOneTag(msg map[uint32][]byte, candidates []uint32) bool {
+	mrand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	for _, tag := range candidates {
 		if _, ok := msg[tag]; ok {
 			delete(msg, tag)
-			return msg, true
+			return true
 		}
 	}
-	return nil, false
+	return false
 }
 
 // greaseWrongVersion overwrites top-level VER with an unsupported version.

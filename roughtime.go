@@ -1,29 +1,10 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Package roughtime is the high-level Roughtime client for Go applications.
-// Most callers want this package. The protocol package is the low-level wire
-// layer used internally and by diagnostic tools.
-//
-// It covers draft-ietf-ntp-roughtime 01-19, Google-Roughtime, and an
-// experimental ML-DSA-44 post-quantum wire variant.
-//
-// The zero [Client] is usable and safe for concurrent use:
-//
-//	var c roughtime.Client
-//	resp, err := c.Query(ctx, roughtime.Server{
-//	    Name:      "time.txryan.com",
-//	    PublicKey: pk,
-//	    Addresses: []roughtime.Address{{Transport: "udp", Address: "time.txryan.com:2002"}},
-//	})
-//
-// [Client.QueryAll] fans out concurrently and [Consensus] aggregates drift
-// across the result slice. [Client.QueryChain] runs causal-chained queries, and
-// [Client.QueryChainWithNonce] seeds the chain for document timestamping.
-// [(*ChainResult).Proof] yields a [*Proof] for offline audit via
-// [(*Proof).MarshalGzip], [(*Proof).MarshalJSON], and [ParseProof]. [Verify]
-// re-validates a single stored request/reply pair, and [ParseEcosystem] decodes
-// the ecosystem JSON.
+// Package roughtime provides a concurrent high-level Roughtime client,
+// multi-server consensus and causal chains, ecosystem parsing, and offline
+// timestamp proofs. The zero [Client] is ready for use. Wire-level callers
+// should use the protocol subpackage.
 package roughtime
 
 import (
@@ -31,6 +12,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,13 +25,22 @@ import (
 // failed.
 var errChainAborted = errors.New("roughtime: chained request aborted")
 
+// defaultClient preserves the protocol-mandated per-server retry state for
+// package-level convenience queries.
+var defaultClient Client
+
+// retryInitMu serializes lazy tracker installation without making Client
+// values themselves non-copyable.
+var retryInitMu sync.Mutex
+
 // Server describes one Roughtime server with a trust root and one or more
 // transport endpoints.
 type Server struct {
 	// Name identifies the server for logs and error messages.
 	Name string
-	// Version is an optional ecosystem label, with [VersionLabelGoogle]
-	// selecting the Google variant.
+	// Version is an optional ecosystem label. [VersionLabelGoogle] and the
+	// numeric Google ecosystem version select Google-Roughtime; other numeric
+	// values cap advertised scheme-compatible versions.
 	Version string
 	// PublicKey is the server's long-term root public key (32 bytes Ed25519 or
 	// 1312 bytes ML-DSA-44).
@@ -76,7 +68,7 @@ func (a Address) String() string {
 type Result struct {
 	// Server is the input server description.
 	Server Server
-	// Address is the resolved transport endpoint, or zero if resolution failed.
+	// Address is the successful transport endpoint, or zero on failure.
 	Address Address
 	// Response is the verified outcome on success.
 	Response *Response
@@ -107,14 +99,31 @@ func (cr *ChainResult) Proof() (*Proof, error) {
 // zero value.
 type Client struct {
 	// Timeout bounds each request/response exchange and defaults to
-	// [DefaultTimeout] when zero.
+	// [DefaultTimeout] when non-positive.
 	Timeout time.Duration
-	// MaxAttempts is the per-server attempt cap with 1s by 1.5^(n-1) backoff
-	// capped at 24h. Zero or one means a single attempt with no retry.
+	// MaxAttempts caps attempts per query. Backoff starts at 1s, grows by 1.5,
+	// persists by root key across calls, and resets after a verified response.
+	// Zero tries each configured endpoint once; negative values mean one attempt.
 	MaxAttempts int
 	// Concurrency caps in-flight queries in [Client.QueryAll] and defaults to
-	// [MaxQueryAllConcurrency] when zero.
+	// [MaxQueryAllConcurrency] when non-positive.
 	Concurrency int
+
+	retry *retryTracker
+}
+
+// retryState is the persistent per-server backoff recommended by drafts 16-17
+// and required by drafts 18-19.
+type retryState struct {
+	interval  time.Duration
+	notBefore time.Time
+	reset     chan struct{}
+}
+
+// retryTracker is shared by copies of an initialized Client.
+type retryTracker struct {
+	mu      sync.Mutex
+	retries map[string]retryState
 }
 
 // Error sentinels re-exported from the protocol package for use with
@@ -137,19 +146,19 @@ var (
 	ErrDelegationWindow = protocol.ErrDelegationWindow
 )
 
-// VersionLabelGoogle is the [Server.Version] string that selects the
-// Google-Roughtime wire variant.
+// VersionLabelGoogle is the textual [Server.Version] value that selects
+// Google-Roughtime. Ecosystem files may also use its numeric version value.
 const VersionLabelGoogle = "Google-Roughtime"
 
 // DefaultTimeout is the per-exchange timeout used when [Client.Timeout] is
-// zero.
+// non-positive.
 const DefaultTimeout = 2 * time.Second
 
 // MaxQueryAllConcurrency is the default cap on in-flight queries in
 // [Client.QueryAll].
 const MaxQueryAllConcurrency = 64
 
-// Retry backoff schedule per draft-ietf-ntp-roughtime §10 (Repeated Queries).
+// Retry backoff schedule from the drafts 16-19 transport guidance.
 const (
 	// retryBackoffInitial is the first backoff interval.
 	retryBackoffInitial = 1 * time.Second
@@ -159,8 +168,7 @@ const (
 	retryBackoffFactor = 1.5
 )
 
-// Query performs a one-shot query against s with up to [Client.MaxAttempts]
-// tries and exponential backoff.
+// Query queries s using the client's retry policy.
 func (c *Client) Query(ctx context.Context, s Server) (*Response, error) {
 	plan, err := resolveServer(s)
 	if err != nil {
@@ -176,15 +184,15 @@ func (c *Client) queryPlanned(ctx context.Context, s Server, plan serverPlan) (*
 	if !isGoogleOnly(plan.versions) {
 		srvHash = protocol.ComputeSRV(s.PublicKey)
 	}
-	nonce, request, err := protocol.CreateRequest(plan.versions, rand.Reader, srvHash)
+	nonce, request, err := protocol.CreateRequestWithOptions(plan.versions, rand.Reader, srvHash, protocol.RequestOptions{LegacyPacketSize: true})
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
 	return c.runQuery(ctx, s, plan, nonce, request)
 }
 
-// QueryWithNonce performs a one-shot query using a caller-supplied nonce (32
-// bytes IETF, 64 bytes Google-Roughtime).
+// QueryWithNonce queries using a caller-supplied nonce (32 bytes IETF, 64 bytes
+// Google-Roughtime).
 func (c *Client) QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*Response, error) {
 	plan, err := resolveServer(s)
 	if err != nil {
@@ -194,7 +202,7 @@ func (c *Client) QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*R
 	if !isGoogleOnly(plan.versions) {
 		srvHash = protocol.ComputeSRV(s.PublicKey)
 	}
-	request, err := protocol.CreateRequestWithNonce(plan.versions, nonce, srvHash)
+	request, err := protocol.CreateRequestWithNonceOptions(plan.versions, nonce, srvHash, protocol.RequestOptions{LegacyPacketSize: true})
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -204,29 +212,26 @@ func (c *Client) QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*R
 // runQuery dispatches the prepared request, verifies the reply, and assembles a
 // Response.
 func (c *Client) runQuery(ctx context.Context, s Server, plan serverPlan, nonce, request []byte) (*Response, error) {
-	reply, rtt, localNow, err := c.sendWithRetry(ctx, plan.address, request)
+	addr, reply, rtt, localNow, midpoint, radius, err := c.sendWithRetry(ctx, s, plan, request, func(reply []byte) (time.Time, time.Duration, error) {
+		return protocol.VerifyReply(plan.versions, reply, s.PublicKey, nonce, request)
+	})
 	if err != nil {
 		return nil, err
 	}
-	midpoint, radius, err := protocol.VerifyReply(plan.versions, reply, s.PublicKey, nonce, request)
-	if err != nil {
-		return nil, fmt.Errorf("verification: %w", err)
-	}
-	return buildResponse(s, plan.address, request, reply, midpoint, radius, rtt, localNow), nil
+	return buildResponse(s, addr, request, reply, midpoint, radius, rtt, localNow), nil
 }
 
-// Query is a package-level convenience equivalent to a zero-[Client]'s
-// [Client.Query].
+// Query is a package-level convenience backed by a shared zero-configured
+// [Client]. The shared client preserves protocol-mandated retry state across
+// calls.
 func Query(ctx context.Context, s Server) (*Response, error) {
-	var c Client
-	return c.Query(ctx, s)
+	return defaultClient.Query(ctx, s)
 }
 
-// QueryWithNonce is a package-level convenience equivalent to a zero-[Client]'s
-// [Client.QueryWithNonce].
+// QueryWithNonce is the caller-nonce form of [Query] and uses the same shared
+// client.
 func QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*Response, error) {
-	var c Client
-	return c.QueryWithNonce(ctx, s, nonce)
+	return defaultClient.QueryWithNonce(ctx, s, nonce)
 }
 
 // Verify re-validates a stored request/reply pair against the server's
@@ -252,10 +257,14 @@ func (c *Client) QueryAll(ctx context.Context, servers []Server) []Result {
 	for i, s := range servers {
 		out[i].Server = s
 	}
+	if len(servers) == 0 {
+		return out
+	}
 	limit := c.Concurrency
 	if limit <= 0 {
 		limit = MaxQueryAllConcurrency
 	}
+	limit = min(limit, len(servers))
 	sem := make(chan struct{}, limit)
 	var wg sync.WaitGroup
 	for i := range servers {
@@ -272,10 +281,12 @@ func (c *Client) QueryAll(ctx context.Context, servers []Server) []Result {
 				out[i].Err = err
 				return
 			}
-			out[i].Address = plan.address
 			resp, err := c.queryPlanned(ctx, out[i].Server, plan)
 			out[i].Response = resp
 			out[i].Err = err
+			if resp != nil {
+				out[i].Address = resp.Address
+			}
 		})
 	}
 	wg.Wait()
@@ -288,9 +299,14 @@ func (c *Client) QueryChain(ctx context.Context, servers []Server) (*ChainResult
 	return c.queryChain(ctx, servers, nil)
 }
 
-// QueryChainWithNonce is [Client.QueryChain] with the first link's nonce set to
-// seed for document timestamping.
+// QueryChainWithNonce is [Client.QueryChain] with the first successful link's
+// nonce set to seed for document timestamping. The seed must be 32 bytes for
+// IETF versions or 64 bytes for Google-Roughtime. Before that link, an otherwise
+// usable server incompatible with the seed aborts the remaining chain.
 func (c *Client) QueryChainWithNonce(ctx context.Context, servers []Server, seed []byte) (*ChainResult, error) {
+	if len(seed) == 0 {
+		return nil, errors.New("roughtime: chain seed nonce is empty")
+	}
 	return c.queryChain(ctx, servers, seed)
 }
 
@@ -313,13 +329,19 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 			results[i].Err = err
 			continue
 		}
-		results[i].Address = plan.address
-
 		var link protocol.ChainLink
 		if len(chain.Links) == 0 && firstNonce != nil {
-			link, err = chain.NextRequestWithNonce(plan.versions, s.PublicKey, firstNonce)
+			link.Nonce = append([]byte(nil), firstNonce...)
 		} else {
-			link, err = chain.NextRequest(plan.versions, s.PublicKey, rand.Reader)
+			var previous []byte
+			if len(chain.Links) > 0 {
+				previous = chain.Links[len(chain.Links)-1].Response
+			}
+			link.Nonce, link.Rand, err = protocol.ChainNonce(previous, rand.Reader, plan.versions)
+		}
+		if err == nil {
+			link.PublicKey = append([]byte(nil), s.PublicKey...)
+			link.Request, err = protocol.CreateRequestWithNonceOptions(plan.versions, link.Nonce, protocol.ComputeSRV(s.PublicKey), protocol.RequestOptions{LegacyPacketSize: true})
 		}
 		if err != nil {
 			results[i].Err = fmt.Errorf("chained request: %w", err)
@@ -331,49 +353,133 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 			return &ChainResult{Results: results, chain: chain}, err
 		}
 
-		reply, rtt, localNow, err := c.sendWithRetry(ctx, plan.address, link.Request)
+		addr, reply, rtt, localNow, midpoint, radius, err := c.sendWithRetry(ctx, s, plan, link.Request, func(reply []byte) (time.Time, time.Duration, error) {
+			return protocol.VerifyReply(plan.versions, reply, s.PublicKey, link.Nonce, link.Request)
+		})
 		if err != nil {
 			results[i].Err = err
 			continue
 		}
-		midpoint, radius, err := protocol.VerifyReply(plan.versions, reply, s.PublicKey, link.Nonce, link.Request)
-		if err != nil {
-			results[i].Err = fmt.Errorf("verification: %w", err)
-			continue
-		}
+		results[i].Address = addr
 		link.Response = reply
 		chain.Append(link)
-		results[i].Response = buildResponse(s, plan.address, link.Request, reply, midpoint, radius, rtt, localNow)
+		results[i].Response = buildResponse(s, addr, link.Request, reply, midpoint, radius, rtt, localNow)
 	}
 	return &ChainResult{Results: results, chain: chain}, nil
 }
 
-// sendWithRetry dispatches request to addr with up to MaxAttempts tries and
-// exponential backoff between them.
-func (c *Client) sendWithRetry(ctx context.Context, addr Address, request []byte) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
+// sendWithRetry dispatches and verifies request under the configured retry
+// policy. Backoff persists across calls and resets after a verified response.
+func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, request []byte, verify func([]byte) (time.Time, time.Duration, error)) (addr Address, reply []byte, rtt time.Duration, localNow, midpoint time.Time, radius time.Duration, err error) {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	attempts := max(c.MaxAttempts, 1)
-	sleep := retryBackoffInitial
+	attempts := c.MaxAttempts
+	if attempts == 0 {
+		attempts = len(plan.addresses)
+	} else if attempts < 0 {
+		attempts = 1
+	}
+	key := string(s.PublicKey)
 	for i := range attempts {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, 0, time.Time{}, ctxErr
+			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
 		}
+		if !c.waitForRetry(ctx, key) {
+			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctx.Err()
+		}
+		addr = plan.addresses[i%len(plan.addresses)]
 		reply, rtt, localNow, err = roundTrip(ctx, addr, request, timeout)
 		if err == nil {
-			return reply, rtt, localNow, nil
+			midpoint, radius, err = verify(reply)
+			if err == nil {
+				c.resetRetry(key)
+				return addr, reply, rtt, localNow, midpoint, radius, nil
+			}
+			err = fmt.Errorf("verification: %w", err)
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return addr, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
+		}
+		c.recordRetryFailure(key)
 		if i == attempts-1 {
-			return nil, 0, time.Time{}, err
+			return addr, nil, 0, time.Time{}, time.Time{}, 0, err
 		}
-		if !sleepCtx(ctx, sleep) {
-			return nil, 0, time.Time{}, ctx.Err()
-		}
-		sleep = nextBackoff(sleep)
 	}
-	return nil, 0, time.Time{}, err
+	return addr, nil, 0, time.Time{}, time.Time{}, 0, err
+}
+
+// waitForRetry waits until the server's persistent retry interval has elapsed.
+func (c *Client) waitForRetry(ctx context.Context, key string) bool {
+	tracker := c.retryTracker()
+	for {
+		tracker.mu.Lock()
+		state, ok := tracker.retries[key]
+		tracker.mu.Unlock()
+		if !ok {
+			return true
+		}
+		d := time.Until(state.notBefore)
+		if d <= 0 {
+			return true
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-timer.C:
+		case <-state.reset:
+			timer.Stop()
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		}
+		// A concurrent failure may have extended the deadline; recheck it.
+	}
+}
+
+// recordRetryFailure advances the persistent per-server retry schedule.
+func (c *Client) recordRetryFailure(key string) {
+	tracker := c.retryTracker()
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	if tracker.retries == nil {
+		tracker.retries = make(map[string]retryState)
+	}
+	state := tracker.retries[key]
+	if state.reset == nil {
+		state.reset = make(chan struct{})
+	}
+	if state.interval == 0 {
+		state.interval = retryBackoffInitial
+	} else {
+		state.interval = nextBackoff(state.interval)
+	}
+	state.notBefore = time.Now().Add(state.interval)
+	tracker.retries[key] = state
+}
+
+// resetRetry clears a server's backoff after a properly signed response.
+func (c *Client) resetRetry(key string) {
+	tracker := c.retryTracker()
+	tracker.mu.Lock()
+	if state, ok := tracker.retries[key]; ok {
+		if state.reset != nil {
+			close(state.reset)
+		}
+		delete(tracker.retries, key)
+	}
+	tracker.mu.Unlock()
+}
+
+// retryTracker returns c's lazily installed tracker. Copies made after first
+// use retain the same pointer and therefore the same lock and retry schedule.
+func (c *Client) retryTracker() *retryTracker {
+	retryInitMu.Lock()
+	defer retryInitMu.Unlock()
+	if c.retry == nil {
+		c.retry = new(retryTracker)
+	}
+	return c.retry
 }
 
 // roundTrip dispatches to the UDP or TCP transport primitive for addr.
@@ -388,18 +494,6 @@ func roundTrip(ctx context.Context, addr Address, request []byte, timeout time.D
 	}
 }
 
-// sleepCtx sleeps for d, returning false if ctx is cancelled first.
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
 // nextBackoff returns the next retry interval per the draft's schedule.
 func nextBackoff(cur time.Duration) time.Duration {
 	next := time.Duration(float64(cur) * retryBackoffFactor)
@@ -409,15 +503,14 @@ func nextBackoff(cur time.Duration) time.Duration {
 	return next
 }
 
-// serverPlan is the resolved (address, versions) tuple for a single query
-// attempt.
+// serverPlan is the ordered endpoint and version plan for one server.
 type serverPlan struct {
-	address  Address
-	versions []protocol.Version
+	addresses []Address
+	versions  []protocol.Version
 }
 
-// resolveServer picks the scheme from PublicKey, selects an address, and
-// returns the VER list to advertise.
+// resolveServer derives the scheme, orders usable addresses, and returns the
+// VER list to advertise.
 func resolveServer(s Server) (serverPlan, error) {
 	if len(s.Addresses) == 0 {
 		return serverPlan{}, errors.New("roughtime: server has no addresses")
@@ -426,60 +519,72 @@ func resolveServer(s Server) (serverPlan, error) {
 	if err != nil {
 		return serverPlan{}, err
 	}
-	addr, err := pickAddress(s, sch)
+	addrs, err := pickAddresses(s, sch)
 	if err != nil {
 		return serverPlan{}, err
 	}
-	return serverPlan{address: addr, versions: versionsForServer(s, sch)}, nil
+	versions, err := versionsForServer(s, sch)
+	if err != nil {
+		return serverPlan{}, err
+	}
+	return serverPlan{addresses: addrs, versions: versions}, nil
 }
 
-// pickAddress selects an address per scheme rules (ML-DSA-44 requires TCP,
-// Google requires UDP, Ed25519 prefers UDP).
-func pickAddress(s Server, sch Scheme) (Address, error) {
-	googleOnly := strings.EqualFold(s.Version, VersionLabelGoogle)
-	var udp, tcp Address
+// pickAddresses orders endpoints per scheme rules (ML-DSA-44 requires TCP,
+// Google requires UDP, and IETF Ed25519 orders UDP before TCP).
+func pickAddresses(s Server, sch Scheme) ([]Address, error) {
+	googleOnly := isGoogleEcosystemVersion(s.Version)
+	if googleOnly && sch != SchemeEd25519 {
+		return nil, errors.New("roughtime: Google-Roughtime requires an Ed25519 key")
+	}
+	var udp, tcp []Address
 	for _, a := range s.Addresses {
 		switch strings.ToLower(a.Transport) {
 		case "udp":
-			if udp.Address == "" {
-				udp = a
-			}
+			udp = append(udp, a)
 		case "tcp":
-			if tcp.Address == "" {
-				tcp = a
-			}
+			tcp = append(tcp, a)
+		default:
+			return nil, fmt.Errorf("roughtime: unsupported transport %q", a.Transport)
 		}
 	}
 	switch {
 	case sch == SchemeMLDSA44:
-		if tcp.Address == "" {
-			return Address{}, errors.New("roughtime: ML-DSA-44 server has no tcp address")
+		if len(tcp) == 0 {
+			return nil, errors.New("roughtime: ML-DSA-44 server has no tcp address")
 		}
 		return tcp, nil
 	case googleOnly:
-		if udp.Address == "" {
-			return Address{}, errors.New("roughtime: Google-Roughtime server has no udp address")
+		if len(udp) == 0 {
+			return nil, errors.New("roughtime: Google-Roughtime server has no udp address")
 		}
 		return udp, nil
-	case udp.Address != "":
-		return udp, nil
-	case tcp.Address != "":
-		return tcp, nil
+	case len(udp)+len(tcp) > 0:
+		return append(udp, tcp...), nil
 	default:
-		return Address{}, errors.New("roughtime: no usable address")
+		return nil, errors.New("roughtime: no usable address")
 	}
 }
 
-// isGoogleOnly reports whether vs is exactly [VersionGoogle].
+// isGoogleOnly reports whether vs is exactly [protocol.VersionGoogle].
 func isGoogleOnly(vs []protocol.Version) bool {
 	return len(vs) == 1 && vs[0] == protocol.VersionGoogle
 }
 
-// versionsForServer returns the VER list for s, honoring [VersionLabelGoogle]
-// for Ed25519.
-func versionsForServer(s Server, sch Scheme) []protocol.Version {
-	if sch == SchemeEd25519 && strings.EqualFold(s.Version, VersionLabelGoogle) {
-		return []protocol.Version{protocol.VersionGoogle}
+// versionsForServer returns s's VER list, honoring textual and numeric Google
+// labels and numeric version caps.
+func versionsForServer(s Server, sch Scheme) ([]protocol.Version, error) {
+	if sch == SchemeEd25519 && isGoogleEcosystemVersion(s.Version) {
+		return []protocol.Version{protocol.VersionGoogle}, nil
 	}
-	return VersionsForScheme(sch)
+	versions := VersionsForScheme(sch)
+	limit, err := strconv.ParseUint(s.Version, 10, 32)
+	if err != nil {
+		return versions, nil
+	}
+	versions = slices.DeleteFunc(versions, func(v protocol.Version) bool { return uint64(v) > limit })
+	if len(versions) == 0 {
+		return nil, fmt.Errorf("roughtime: server version %d has no supported compatible wire version", limit)
+	}
+	return versions, nil
 }

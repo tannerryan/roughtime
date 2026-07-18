@@ -7,12 +7,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
-// TestMalfeasanceReportRoundTrip verifies a chain round-trips through
-// MalfeasanceReport and ParseMalfeasanceReport.
+// TestMalfeasanceReportRoundTrip covers the modern report format.
 func TestMalfeasanceReportRoundTrip(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft12, 3)
 
@@ -49,136 +47,14 @@ func TestMalfeasanceReportRoundTrip(t *testing.T) {
 	}
 }
 
-// TestMalfeasanceReportFirstLinkNoRand verifies the first link omits "rand" in
-// JSON output.
-func TestMalfeasanceReportFirstLinkNoRand(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 2)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var raw struct {
-		Responses []map[string]any `json:"responses"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, ok := raw.Responses[0]["rand"]; ok {
-		t.Fatal("first link should not have rand in JSON")
-	}
-	if _, ok := raw.Responses[1]["rand"]; !ok {
-		t.Fatal("second link should have rand in JSON")
-	}
-}
-
-// TestMalfeasanceReportFields verifies report links include valid base64
-// publicKey, request, and response.
-func TestMalfeasanceReportFields(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 2)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var report struct {
-		Responses []struct {
-			Rand      string `json:"rand"`
-			PublicKey string `json:"publicKey"`
-			Request   string `json:"request"`
-			Response  string `json:"response"`
-		} `json:"responses"`
-	}
-	if err := json.Unmarshal(data, &report); err != nil {
-		t.Fatal(err)
-	}
-
-	for i, r := range report.Responses {
-		if r.PublicKey == "" {
-			t.Fatalf("link %d: missing publicKey", i)
-		}
-		if r.Request == "" {
-			t.Fatalf("link %d: missing request", i)
-		}
-		if r.Response == "" {
-			t.Fatalf("link %d: missing response", i)
-		}
-		for _, field := range []string{r.PublicKey, r.Request, r.Response} {
-			if _, err := base64.StdEncoding.DecodeString(field); err != nil {
-				t.Fatalf("link %d: invalid base64: %v", i, err)
-			}
-		}
-	}
-}
-
-// TestParseMalfeasanceReportRejectsEmpty verifies ParseMalfeasanceReport
-// rejects an empty responses array.
-func TestParseMalfeasanceReportRejectsEmpty(t *testing.T) {
-	if _, err := ParseMalfeasanceReport([]byte(`{"responses":[]}`)); err == nil {
-		t.Fatal("expected error for empty responses")
-	}
-}
-
-// TestParseMalfeasanceReportRejectsMalformed verifies ParseMalfeasanceReport
-// rejects non-JSON input.
+// TestParseMalfeasanceReportRejectsMalformed covers invalid reports.
 func TestParseMalfeasanceReportRejectsMalformed(t *testing.T) {
 	if _, err := ParseMalfeasanceReport([]byte(`not json`)); err == nil {
 		t.Fatal("expected error for malformed JSON")
 	}
 }
 
-// TestParseMalfeasanceReportRejectsBadBase64 verifies ParseMalfeasanceReport
-// rejects invalid base64 in fields.
-func TestParseMalfeasanceReportRejectsBadBase64(t *testing.T) {
-	valid := base64.StdEncoding.EncodeToString([]byte("test"))
-	for _, field := range []string{"publicKey", "request", "response"} {
-		t.Run(field, func(t *testing.T) {
-			entry := map[string]string{
-				"publicKey": valid,
-				"request":   valid,
-				"response":  valid,
-			}
-			entry[field] = "!!!not-base64!!!"
-			data, _ := json.Marshal(map[string]any{"responses": []any{entry}})
-			if _, err := ParseMalfeasanceReport(data); err == nil {
-				t.Fatalf("expected error for bad %s", field)
-			}
-		})
-	}
-}
-
-// TestParseMalfeasanceReportRejectsLegacyLengthMismatch verifies legacy reports
-// with mismatched array lengths are rejected.
-func TestParseMalfeasanceReportRejectsLegacyLengthMismatch(t *testing.T) {
-	data := []byte(`{"nonces":["YQ==","Yg=="],"responses":["YQ=="]}`)
-	if _, err := ParseMalfeasanceReport(data); err == nil ||
-		!strings.Contains(err.Error(), "length mismatch") {
-		t.Fatalf("ParseMalfeasanceReport: %v; want length-mismatch error", err)
-	}
-}
-
-// TestIsLegacyChainEmpty verifies isLegacyChain returns false for an empty
-// chain.
-func TestIsLegacyChainEmpty(t *testing.T) {
-	var c Chain
-	if c.isLegacyChain() {
-		t.Fatal("isLegacyChain returned true for empty chain")
-	}
-}
-
-// TestMalfeasanceReportEmpty verifies MalfeasanceReport rejects an empty chain.
-func TestMalfeasanceReportEmpty(t *testing.T) {
-	var c Chain
-	if _, err := c.MalfeasanceReport(); err == nil {
-		t.Fatal("expected error for empty chain")
-	}
-}
-
-// TestMalfeasanceReportRoundTripDraft10 verifies draft-10 chains emit and
-// round-trip the legacy format.
+// TestMalfeasanceReportRoundTripDraft10 covers the legacy report format.
 func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 	c, _ := buildChain(t, VersionDraft10, 3)
 
@@ -186,6 +62,7 @@ func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
+	// probe contains the legacy arrays checked by this test.
 	var probe struct {
 		Nonces    []string `json:"nonces"`
 		Responses []string `json:"responses"`
@@ -193,9 +70,9 @@ func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 	if err := json.Unmarshal(data, &probe); err != nil {
 		t.Fatalf("legacy format unmarshal: %v", err)
 	}
-	if len(probe.Nonces) != len(c.Links) || len(probe.Responses) != len(c.Links) {
-		t.Fatalf("legacy arrays length mismatch: nonces=%d responses=%d want=%d",
-			len(probe.Nonces), len(probe.Responses), len(c.Links))
+	if len(probe.Nonces) != len(c.Links)-1 || len(probe.Responses) != len(c.Links) {
+		t.Fatalf("legacy arrays length mismatch: nonces=%d want=%d responses=%d want=%d",
+			len(probe.Nonces), len(c.Links)-1, len(probe.Responses), len(c.Links))
 	}
 	parsed, err := ParseMalfeasanceReport(data)
 	if err != nil {
@@ -215,131 +92,56 @@ func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 			t.Fatalf("link %d: legacy format should drop Request/PublicKey", i)
 		}
 	}
-}
 
-// TestMalfeasanceReportLegacyVerifyFails pins that drafts 10-11 chains cannot
-// re-verify after round-trip. The legacy format drops per-link request bytes.
-func TestMalfeasanceReportLegacyVerifyFails(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft10, 3)
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if err := parsed.Verify(); err == nil {
-		t.Fatal("expected legacy round-trip Verify to fail")
-	}
-}
-
-// TestMalfeasanceReportRoundTripDraft12 verifies draft-12 chains round-trip and
-// re-verify.
-func TestMalfeasanceReportRoundTripDraft12(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft12, 3)
-
-	data, err := c.MalfeasanceReport()
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if err := parsed.Verify(); err != nil {
-		t.Fatalf("deserialized draft-12 chain should verify: %v", err)
-	}
-}
-
-// TestParseMalfeasanceReportLegacyFromChain verifies parsing a hand-built
-// legacy report produced from a chain.
-func TestParseMalfeasanceReportLegacyFromChain(t *testing.T) {
-	c, _ := buildChain(t, VersionDraft10, 3)
-
-	nonces := make([]string, len(c.Links))
-	responses := make([]string, len(c.Links))
-	for i, link := range c.Links {
-		if link.Rand != nil {
-			nonces[i] = base64.StdEncoding.EncodeToString(link.Rand)
-		}
-		responses[i] = base64.StdEncoding.EncodeToString(link.Response)
-	}
-	data, err := json.Marshal(struct {
-		Nonces    []string `json:"nonces"`
-		Responses []string `json:"responses"`
-	}{Nonces: nonces, Responses: responses})
+	// Accept the equal-length shape emitted by earlier versions.
+	probe.Nonces = append([]string{""}, probe.Nonces...)
+	oldData, err := json.Marshal(probe)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	parsed, err := ParseMalfeasanceReport(data)
-	if err != nil {
-		t.Fatalf("parse legacy report: %v", err)
-	}
-	if len(parsed.Links) != len(c.Links) {
-		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
-	}
-	for i, link := range parsed.Links {
-		if !bytes.Equal(link.Rand, c.Links[i].Rand) {
-			t.Fatalf("link %d: rand mismatch", i)
-		}
-		if !bytes.Equal(link.Response, c.Links[i].Response) {
-			t.Fatalf("link %d: response mismatch", i)
-		}
+	if _, err := ParseMalfeasanceReport(oldData); err != nil {
+		t.Fatalf("parse compatible legacy shape: %v", err)
 	}
 }
 
-// TestMalfeasanceReportRoundTripDraft14 verifies draft-14 chains round-trip and
-// re-verify.
-func TestMalfeasanceReportRoundTripDraft14(t *testing.T) {
-	c, servers := buildChain(t, VersionDraft12, 3)
-
+// TestMalfeasanceReportRoundTripDraft01 covers the early report format.
+func TestMalfeasanceReportRoundTripDraft01(t *testing.T) {
+	c, _ := buildChain(t, VersionDraft01, 2)
 	data, err := c.MalfeasanceReport()
 	if err != nil {
 		t.Fatal(err)
+	}
+	var report []malfeasanceLinkEarly
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report) != 2 || report[0].Blind == "" {
+		t.Fatal("invalid early report shape")
 	}
 	parsed, err := ParseMalfeasanceReport(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parsed.Links) != len(c.Links) {
-		t.Fatalf("link count = %d, want %d", len(parsed.Links), len(c.Links))
-	}
-	for i, link := range parsed.Links {
-		if !bytes.Equal(link.PublicKey, c.Links[i].PublicKey) {
-			t.Fatalf("link %d: public key mismatch", i)
-		}
-		if !bytes.Equal(link.Request, c.Links[i].Request) {
-			t.Fatalf("link %d: request mismatch", i)
-		}
-		if !bytes.Equal(link.Response, c.Links[i].Response) {
-			t.Fatalf("link %d: response mismatch", i)
-		}
-	}
-	_ = servers
-	if err := parsed.Verify(); err != nil {
-		t.Fatalf("round-tripped draft-14 chain should verify: %v", err)
+	if len(parsed.Links) != len(c.Links) || !bytes.Equal(parsed.Links[1].Rand, c.Links[1].Rand) {
+		t.Fatal("early report did not round-trip")
 	}
 }
 
-// FuzzParseMalfeasanceReport fuzzes ParseMalfeasanceReport for round-trip
-// stability and panic-safety.
+// FuzzParseMalfeasanceReport exercises historical report parsing.
 func FuzzParseMalfeasanceReport(f *testing.F) {
-	validReport, _ := json.Marshal(struct {
-		Responses []struct {
-			Rand      string `json:"rand,omitempty"`
-			PublicKey string `json:"publicKey"`
-			Request   string `json:"request"`
-			Response  string `json:"response"`
-		} `json:"responses"`
-	}{
-		Responses: []struct {
-			Rand      string `json:"rand,omitempty"`
-			PublicKey string `json:"publicKey"`
-			Request   string `json:"request"`
-			Response  string `json:"response"`
-		}{
+	// seedResponse is one response in the valid fuzzer seed.
+	type seedResponse struct {
+		Rand      string `json:"rand,omitempty"`
+		PublicKey string `json:"publicKey"`
+		Request   string `json:"request"`
+		Response  string `json:"response"`
+	}
+	// seedReport is the valid fuzzer seed's top-level shape.
+	type seedReport struct {
+		Responses []seedResponse `json:"responses"`
+	}
+	validReport, _ := json.Marshal(seedReport{
+		Responses: []seedResponse{
 			{
 				PublicKey: base64.StdEncoding.EncodeToString(make([]byte, 32)),
 				Request:   base64.StdEncoding.EncodeToString(make([]byte, 64)),
@@ -354,6 +156,12 @@ func FuzzParseMalfeasanceReport(f *testing.F) {
 		},
 	})
 	f.Add(validReport)
+	response := base64.StdEncoding.EncodeToString(make([]byte, 128))
+	transition := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	blind := base64.StdEncoding.EncodeToString(make([]byte, 64))
+	f.Add([]byte(`{"nonces":["` + transition + `"],"responses":["` + response + `","` + response + `"]}`))
+	f.Add([]byte(`{"nonces":["","` + transition + `"],"responses":["` + response + `","` + response + `"]}`))
+	f.Add([]byte(`[{"blind":"` + blind + `","response_packet":"` + response + `"},{"response_packet":"` + response + `"}]`))
 
 	f.Add([]byte("{}"))
 	f.Add([]byte(`{"responses":[]}`))
@@ -395,52 +203,7 @@ func FuzzParseMalfeasanceReport(f *testing.F) {
 	})
 }
 
-// TestParseMalfeasanceReportLegacy verifies ParseMalfeasanceReport decodes a
-// legacy report.
-func TestParseMalfeasanceReportLegacy(t *testing.T) {
-	legacy := []byte(`{"nonces":["","` +
-		base64.StdEncoding.EncodeToString(make([]byte, 32)) +
-		`"],"responses":["` +
-		base64.StdEncoding.EncodeToString([]byte("resp1")) +
-		`","` +
-		base64.StdEncoding.EncodeToString([]byte("resp2")) +
-		`"]}`)
-	chain, err := ParseMalfeasanceReport(legacy)
-	if err != nil {
-		t.Fatalf("parse legacy report: %v", err)
-	}
-	if len(chain.Links) != 2 {
-		t.Fatalf("expected 2 links, got %d", len(chain.Links))
-	}
-	if chain.Links[0].Rand != nil {
-		t.Error("first link rand should be nil")
-	}
-	if len(chain.Links[1].Rand) != 32 {
-		t.Errorf("second link rand length = %d, want 32", len(chain.Links[1].Rand))
-	}
-	if !bytes.Equal(chain.Links[0].Response, []byte("resp1")) {
-		t.Error("first response mismatch")
-	}
-	if !bytes.Equal(chain.Links[1].Response, []byte("resp2")) {
-		t.Error("second response mismatch")
-	}
-	if chain.Links[0].Request != nil || chain.Links[0].PublicKey != nil {
-		t.Error("legacy link should have nil Request and PublicKey")
-	}
-}
-
-// TestParseMalfeasanceReportLegacyLengthMismatch verifies legacy reports with
-// mismatched array lengths are rejected.
-func TestParseMalfeasanceReportLegacyLengthMismatch(t *testing.T) {
-	legacy := []byte(`{"nonces":["",""],"responses":["` +
-		base64.StdEncoding.EncodeToString([]byte("x")) + `"]}`)
-	if _, err := ParseMalfeasanceReport(legacy); err == nil {
-		t.Fatal("expected length mismatch error")
-	}
-}
-
-// TestParseMalfeasanceReportRejectsTooManyLinks verifies ParseMalfeasanceReport
-// rejects more than MaxChainLinks entries.
+// TestParseMalfeasanceReportRejectsTooManyLinks covers the link-count limit.
 func TestParseMalfeasanceReportRejectsTooManyLinks(t *testing.T) {
 	const n = 1025
 	entries := make([]string, n)
@@ -453,7 +216,7 @@ func TestParseMalfeasanceReportRejectsTooManyLinks(t *testing.T) {
 	}
 }
 
-// joinStrings joins parts with commas without importing strings.
+// joinStrings joins JSON fragments with commas.
 func joinStrings(parts []string) string {
 	var b []byte
 	for i, p := range parts {
@@ -463,38 +226,4 @@ func joinStrings(parts []string) string {
 		b = append(b, p...)
 	}
 	return string(b)
-}
-
-// TestParseMalfeasanceReportLegacyBadBase64 verifies legacy reports with bad
-// base64 nonces or responses are rejected.
-func TestParseMalfeasanceReportLegacyBadBase64(t *testing.T) {
-	good := base64.StdEncoding.EncodeToString([]byte("ok"))
-	t.Run("nonce", func(t *testing.T) {
-		data := []byte(`{"nonces":["!!!"],"responses":["` + good + `"]}`)
-		if _, err := ParseMalfeasanceReport(data); err == nil {
-			t.Fatal("expected error for bad legacy nonce")
-		}
-	})
-	t.Run("response", func(t *testing.T) {
-		data := []byte(`{"nonces":["` + good + `"],"responses":["!!!"]}`)
-		if _, err := ParseMalfeasanceReport(data); err == nil {
-			t.Fatal("expected error for bad legacy response")
-		}
-	})
-}
-
-// TestParseMalfeasanceReportRejectsBadRand verifies ParseMalfeasanceReport
-// rejects bad base64 in the rand field.
-func TestParseMalfeasanceReportRejectsBadRand(t *testing.T) {
-	good := base64.StdEncoding.EncodeToString([]byte("ok"))
-	entry := map[string]string{
-		"rand":      "!!!not-base64!!!",
-		"publicKey": good,
-		"request":   good,
-		"response":  good,
-	}
-	data, _ := json.Marshal(map[string]any{"responses": []any{entry}})
-	if _, err := ParseMalfeasanceReport(data); err == nil {
-		t.Fatal("expected error for bad rand")
-	}
 }

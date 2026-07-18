@@ -18,34 +18,37 @@ type runMeta struct {
 }
 
 // report aggregates per-worker results and prints a summary.
-func report(meta runMeta, results []workerResult, elapsed time.Duration) {
-	total := 0
+func report(meta runMeta, results []workerResult, latencies []time.Duration, elapsed time.Duration) {
+	var sent, received, successes, errVerify, errAmp, errWrite, errRead, timeouts uint64
+	var latencyMin, latencyMax time.Duration
+	var latencyTotal float64
 	for i := range results {
-		total += len(results[i].latencies)
-	}
-	all := make([]time.Duration, 0, total)
-	var received, errVerify, errWrite, errRead, timeouts uint64
-	for i := range results {
-		all = append(all, results[i].latencies...)
+		sent += results[i].sent
 		received += results[i].received
+		successes += results[i].successes
 		errVerify += results[i].errVerify
+		errAmp += results[i].errAmp
 		errWrite += results[i].errWrite
 		errRead += results[i].errRead
 		timeouts += results[i].timeouts
+		if results[i].successes > 0 {
+			if latencyMin == 0 || results[i].latencyMin < latencyMin {
+				latencyMin = results[i].latencyMin
+			}
+			latencyMax = max(latencyMax, results[i].latencyMax)
+			latencyTotal += results[i].latencyTotal
+		}
 	}
 
-	// errVerify is a sub-bucket of received (latency is recorded on RX before
-	// the verify block) so it is not summed into errs or sent
+	// Verification and amplification failures are sub-buckets of received.
 	errs := errWrite + errRead
-	sent := received + errs + timeouts
-	verified := received - errVerify
 
 	var successRate, throughput float64
 	if sent > 0 {
-		successRate = 100 * float64(verified) / float64(sent)
+		successRate = 100 * float64(successes) / float64(sent)
 	}
 	if elapsed > 0 {
-		throughput = float64(verified) / elapsed.Seconds()
+		throughput = float64(successes) / elapsed.Seconds()
 	}
 
 	fmt.Println()
@@ -55,24 +58,27 @@ func report(meta runMeta, results []workerResult, elapsed time.Duration) {
 	fmt.Printf("Sent:         %d\n", sent)
 	fmt.Printf("Received:     %d\n", received)
 	if meta.verify {
-		fmt.Printf("Verify fail:  %d (grease and genuine faults, indistinguishable on the wire, counted in Received)\n", errVerify)
+		fmt.Printf("Verify fail:  %d (grease or fault)\n", errVerify)
+	}
+	if errAmp > 0 {
+		fmt.Printf("Amplifying:   %d\n", errAmp)
 	}
 	fmt.Printf("Errors:       %d\n", errs)
 	fmt.Printf("Timeouts:     %d\n", timeouts)
 	fmt.Printf("Success rate: %.2f%%\n", successRate)
 	fmt.Printf("Throughput:   %.0f req/s\n", throughput)
 
-	if len(all) > 0 {
-		slices.Sort(all)
+	if len(latencies) > 0 {
+		slices.Sort(latencies)
 		fmt.Println()
 		fmt.Println("latency:")
-		fmt.Printf("  min:   %s\n", all[0].Round(time.Microsecond))
-		fmt.Printf("  p50:   %s\n", percentile(all, 0.50).Round(time.Microsecond))
-		fmt.Printf("  p90:   %s\n", percentile(all, 0.90).Round(time.Microsecond))
-		fmt.Printf("  p99:   %s\n", percentile(all, 0.99).Round(time.Microsecond))
-		fmt.Printf("  p99.9: %s\n", percentile(all, 0.999).Round(time.Microsecond))
-		fmt.Printf("  max:   %s\n", all[len(all)-1].Round(time.Microsecond))
-		fmt.Printf("  mean:  %s\n", mean(all).Round(time.Microsecond))
+		fmt.Printf("  min:   %s\n", latencyMin.Round(time.Microsecond))
+		fmt.Printf("  p50:   %s\n", percentile(latencies, 0.50).Round(time.Microsecond))
+		fmt.Printf("  p90:   %s\n", percentile(latencies, 0.90).Round(time.Microsecond))
+		fmt.Printf("  p99:   %s\n", percentile(latencies, 0.99).Round(time.Microsecond))
+		fmt.Printf("  p99.9: %s\n", percentile(latencies, 0.999).Round(time.Microsecond))
+		fmt.Printf("  max:   %s\n", latencyMax.Round(time.Microsecond))
+		fmt.Printf("  mean:  %s\n", time.Duration(latencyTotal/float64(successes)).Round(time.Microsecond))
 	}
 }
 
@@ -84,13 +90,4 @@ func percentile(sorted []time.Duration, p float64) time.Duration {
 	}
 	idx := min(max(int(math.Ceil(p*float64(len(sorted))))-1, 0), len(sorted)-1)
 	return sorted[idx]
-}
-
-// mean returns the arithmetic mean of xs.
-func mean(xs []time.Duration) time.Duration {
-	var sum time.Duration
-	for _, x := range xs {
-		sum += x
-	}
-	return sum / time.Duration(len(xs))
 }

@@ -15,6 +15,7 @@ import (
 
 	"github.com/tannerryan/roughtime/protocol"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 )
 
 // batchQueueSize bounds the batcher channel. Overflow is dropped for
@@ -31,7 +32,9 @@ const readErrorBackoff = 100 * time.Millisecond
 // bufPool recycles read buffers to cut GC pressure under load.
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, maxPacketSize)
+		// The extra byte detects oversize datagrams even on kernels that do not
+		// surface MSG_TRUNC through ReadMsgUDP.
+		b := make([]byte, maxPacketSize+1)
 		return &b
 	},
 }
@@ -40,11 +43,14 @@ var bufPool = sync.Pool{
 // channel-fed batcher.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
-	// snapshot at entry so test mutations don't race in-flight reads
 	maxSize := batchMaxSize
 	maxLatency := batchMaxLatency
 
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{Port: *port})
+	addr, err := net.ResolveUDPAddr("udp", serverListenAddr())
+	if err != nil {
+		return fmt.Errorf("resolving UDP listen address: %w", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
 		return fmt.Errorf("starting UDP server: %w", err)
 	}
@@ -57,7 +63,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	// per-iteration recovery lives inside batcher so batches persist and
 	// close(batchCh) on shutdown isn't raced by a restart
 	batcherWg.Go(func() {
-		batcher(batcherLog, conn, state, batchCh, maxSize, maxLatency)
+		batcher(ctx, batcherLog, conn, state, batchCh, maxSize, maxLatency)
 	})
 
 	listenLog.Info("listening",
@@ -69,10 +75,9 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	// past deadline unblocks the read loop without closing the socket while
 	// in-flight work still holds it
 	go func() {
-		defer recoverGoroutine(listenLog, "shutdown unblocker")
 		<-ctx.Done()
 		listenLog.Info("shutdown initiated, unblocking reads")
-		_ = conn.SetReadDeadline(time.Unix(1, 0))
+		_ = conn.SetDeadline(time.Unix(1, 0))
 	}()
 
 	// readOne does one read-dispatch iteration and returns true on shutdown.
@@ -81,7 +86,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		defer recoverGoroutine(listenLog, "listen")
 
 		bufPtr := bufPool.Get().(*[]byte)
-		reqLen, peer, err := conn.ReadFromUDP(*bufPtr)
+		reqLen, _, flags, peer, err := conn.ReadMsgUDP(*bufPtr, nil)
 		if err != nil {
 			bufPool.Put(bufPtr)
 			if ctx.Err() != nil {
@@ -93,6 +98,14 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			case <-ctx.Done():
 				return true
 			case <-time.After(readErrorBackoff):
+			}
+			return false
+		}
+		if flags&unix.MSG_TRUNC != 0 || reqLen > maxPacketSize {
+			bufPool.Put(bufPtr)
+			incDropped(transportUDP, dropOversize)
+			if ce := listenLog.Check(zap.DebugLevel, "dropped truncated UDP request"); ce != nil {
+				ce.Write(zap.Stringer("peer", peer), zap.Int("reported_size", reqLen), zap.Int("buffer_size", len(*bufPtr)))
 			}
 			return false
 		}
@@ -148,7 +161,8 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 
 // batcher groups validated requests by (version, hasType) and flushes on size
 // or latency triggers.
-func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], incoming <-chan validatedRequest, maxSize int, maxLatency time.Duration) {
+func batcher(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], incoming <-chan validatedRequest, maxSize int, maxLatency time.Duration) {
+	// pending holds one keyed batch and its first-arrival time.
 	type pending struct {
 		items []validatedRequest
 		start time.Time
@@ -185,13 +199,13 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 		if b == nil || len(b.items) == 0 {
 			return
 		}
-		flushBatch(log, conn, state, key.version, b.items)
 		delete(batches, key)
+		flushBatch(ctx, log, conn, state, key.version, b.items)
 	}
 
 	// step runs one select iteration and returns true after incoming closes and
-	// residual batches flush. Per-iteration recovery keeps batches alive across
-	// a recovered panic
+	// residual batches flush. Per-iteration recovery keeps the batcher serving
+	// after a recovered panic.
 	step := func() (done bool) {
 		defer recoverGoroutine(log, "batcher")
 		select {
@@ -234,7 +248,7 @@ func batcher(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState
 
 // flushBatch signs a batch, writes responses, and returns pooled read buffers
 // regardless of outcome.
-func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) {
+func flushBatch(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) {
 	defer func() {
 		for i := range items {
 			if items[i].bufPtr != nil {
@@ -243,10 +257,15 @@ func flushBatch(log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certSt
 			}
 		}
 	}()
-	defer recoverGoroutine(log, "flushBatch")
-
-	replies := signAndBuildReplies(log, state.Load(), ver, items)
-	for _, r := range replies {
+	replies := signAndBuildRepliesCurrent(log, state, ver, items)
+	for i, r := range replies {
+		if ctx.Err() != nil {
+			for range replies[i:] {
+				incDropped(transportUDP, dropWrite)
+			}
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
 		if _, err := conn.WriteToUDP(r.bytes, r.peer); err != nil {
 			log.Warn("UDP write failed", zap.Stringer("peer", r.peer), zap.Error(err))
 			incDropped(transportUDP, dropWrite)

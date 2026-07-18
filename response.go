@@ -4,6 +4,7 @@
 package roughtime
 
 import (
+	"bytes"
 	"strings"
 	"time"
 
@@ -46,11 +47,11 @@ func (r *Response) Drift() time.Duration {
 // InSync reports whether |Drift| is within the server's uncertainty Radius
 // using a closed interval.
 func (r *Response) InSync() bool {
-	d := r.Drift()
-	if d < 0 {
-		d = -d
+	if r == nil || r.Radius < 0 {
+		return false
 	}
-	return d <= r.Radius
+	d := r.Drift()
+	return d >= -r.Radius && d <= r.Radius
 }
 
 // buildResponse assembles a [Response] from a successful verification.
@@ -62,8 +63,8 @@ func buildResponse(s Server, addr Address, request, reply []byte, midpoint time.
 		Radius:          radius,
 		RTT:             rtt,
 		LocalNow:        localNow,
-		Request:         request,
-		Reply:           reply,
+		Request:         bytes.Clone(request),
+		Reply:           bytes.Clone(reply),
 		AmplificationOK: !strings.EqualFold(addr.Transport, "udp") || len(reply) <= len(request),
 	}
 	if ver, ok := protocol.ExtractVersion(reply); ok {

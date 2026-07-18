@@ -1,35 +1,9 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Command roughtime-client queries one or more Roughtime servers and prints the
-// authenticated timestamps.
-//
-// Single server:
-//
-//	go run ./cmd/roughtime-client -addr time.txryan.com:2002 -pubkey iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA=
-//
-// Multiple servers:
-//
-//	go run ./cmd/roughtime-client -servers ecosystem.json
-//
-// Single server from a JSON list:
-//
-//	go run ./cmd/roughtime-client -servers ecosystem.json -name time.txryan.com
-//
-// The CLI is a thin wrapper over [github.com/tannerryan/roughtime], which
-// exposes the same functionality as a Go library.
-//
-// Supports Google-Roughtime, IETF Roughtime drafts 01-19, and an experimental
-// ML-DSA-44 post-quantum extension.
-//
-// Server selection from a JSON list defaults to a random sample of five
-// distinct operators (by registered domain), so no operator can dominate the
-// consensus. -all queries every server and -name pins to one. The three are
-// mutually exclusive.
-//
-// Transport defaults to UDP and falls back to TCP when an address only lists
-// TCP. -tcp forces TCP for Ed25519 servers, while ML-DSA-44 keys always use TCP
-// regardless of the flag.
+// Command roughtime-client queries one server or a JSON ecosystem and prints
+// authenticated timestamps. It supports Google-Roughtime, IETF drafts 05–19,
+// and the experimental ML-DSA-44 extension.
 package main
 
 import (
@@ -41,7 +15,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -50,30 +23,33 @@ import (
 	"github.com/tannerryan/roughtime/internal/version"
 )
 
-// CLI flags configuring server selection, transport, and retry behaviour.
 var (
+	// serversFile is the ecosystem path flag.
 	serversFile = flag.String("servers", "", "path to JSON server list")
-	nameFilter  = flag.String("name", "", "query only the named server from the JSON list")
-	addr        = flag.String("addr", "", "host:port of a single Roughtime server")
-	pubkey      = flag.String("pubkey", "", "root public key (base64 or hex, with -addr); 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
-	useTCP      = flag.Bool("tcp", false, "force TCP transport for Ed25519 servers (ML-DSA-44 keys always use TCP)")
-	timeout     = flag.Duration("timeout", 500*time.Millisecond, "read/write timeout per attempt")
-	retries     = flag.Int("retries", 3, "max attempts per server (1 = single attempt; backoff 1s × 1.5^(n-1) between attempts, cap 24h)")
-	chainMode   = flag.Bool("chain", true, "chain queries sequentially: each nonce is H(previous reply || fresh random salt)")
-	all         = flag.Bool("all", false, "query every server in the ecosystem (default: random 5)")
+	// nameFilter selects one ecosystem entry.
+	nameFilter = flag.String("name", "", "query only the named server from the JSON list")
+	// addr is the direct server endpoint flag.
+	addr = flag.String("addr", "", "host:port of a single Roughtime server")
+	// pubkey is the direct server root-key flag.
+	pubkey = flag.String("pubkey", "", "root public key (base64 or hex, with -addr); 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
+	// useTCP forces TCP for Ed25519.
+	useTCP = flag.Bool("tcp", false, "force TCP for IETF Ed25519 servers (Google-Roughtime is UDP-only; ML-DSA-44 always uses TCP)")
+	// timeout bounds each exchange attempt.
+	timeout = flag.Duration("timeout", time.Second, "read/write timeout per attempt")
+	// retries caps attempts per server.
+	retries = flag.Int("retries", 3, "max attempts per server (1 = single attempt; backoff 1s × 1.5^(n-1) between attempts, cap 24h)")
+	// chainMode enables causal ecosystem queries.
+	chainMode = flag.Bool("chain", true, "chain queries sequentially: each nonce derives from the previous reply and fresh random salt")
+	// all disables default ecosystem sampling.
+	all = flag.Bool("all", false, "query every transport-compatible ecosystem server (default: up to 5 endpoint-domain groups)")
+	// showVersion requests version output and exit.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
 
-// defaultSampleSize is the number of servers randomly sampled from the
-// ecosystem when neither -all nor -name is set.
+// defaultSampleSize caps the default ecosystem sample.
 const defaultSampleSize = 5
 
-// maxEcosystemFileBytes caps the ecosystem JSON read at 4 MiB, fitting
-// MaxEcosystemServers entries of base64-encoded ML-DSA-44 keys.
-const maxEcosystemFileBytes = 4 * 1024 * 1024
-
-// main parses flags, validates them, and runs the client under a
-// signal-cancelable context.
+// main parses flags and runs the client.
 func main() {
 	flag.Parse()
 	if *showVersion {
@@ -81,22 +57,20 @@ func main() {
 		return
 	}
 	if err := validateFlags(); err != nil {
-		fmt.Fprintf(os.Stderr, "client: %s\n", err)
+		fmt.Fprintln(os.Stderr, "client:", err)
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	err := run(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "client: %s\n", err)
+	if err := run(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "client:", err)
+		if errors.Is(ctx.Err(), context.Canceled) {
+			os.Exit(130)
+		}
+		os.Exit(1)
 	}
-	// exit non-zero when interrupted by a signal, even if partial results
-	// printed
 	if errors.Is(ctx.Err(), context.Canceled) {
 		os.Exit(130)
-	}
-	if err != nil {
-		os.Exit(1)
 	}
 }
 
@@ -135,8 +109,7 @@ func validateFlags() error {
 	return nil
 }
 
-// run resolves the server list and dispatches Query, QueryChain, or QueryAll
-// based on flags.
+// run dispatches the selected direct or ecosystem workflow.
 func run(ctx context.Context) error {
 	servers, err := loadServers()
 	if err != nil {
@@ -169,7 +142,7 @@ func run(ctx context.Context) error {
 	} else {
 		results = c.QueryAll(ctx, servers)
 	}
-	if err := printTable(results, proof, servers); err != nil {
+	if err := printTable(results, proof); err != nil {
 		return err
 	}
 	return qcErr
@@ -178,7 +151,7 @@ func run(ctx context.Context) error {
 // loadServers resolves the configured flags into the list of servers to query.
 func loadServers() ([]roughtime.Server, error) {
 	if *serversFile != "" {
-		safeFile := roughtime.SanitizeForDisplay(*serversFile)
+		safeFile := display(*serversFile, 256)
 		servers, err := loadServersFile(*serversFile)
 		if err != nil {
 			return nil, err
@@ -189,7 +162,7 @@ func loadServers() ([]roughtime.Server, error) {
 					continue
 				}
 				if *useTCP {
-					if strings.EqualFold(s.Version, roughtime.VersionLabelGoogle) {
+					if isGoogleServerVersion(s.Version) {
 						return nil, fmt.Errorf("server %q is Google-Roughtime (UDP-only), incompatible with -tcp", roughtime.SanitizeForDisplay(*nameFilter))
 					}
 					s.Addresses = tcpAddresses(s.Addresses)
@@ -215,7 +188,7 @@ func loadServers() ([]roughtime.Server, error) {
 	if *addr != "" && *pubkey != "" {
 		host, port, err := net.SplitHostPort(*addr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid -addr %q: %w", roughtime.SanitizeForDisplay(*addr), err)
+			return nil, fmt.Errorf("invalid -addr %q: %w", display(*addr, 256), err)
 		}
 		cleanAddr := net.JoinHostPort(host, port)
 		pk, err := roughtime.DecodePublicKey(*pubkey)
@@ -245,7 +218,7 @@ func filterTCPOnly(servers []roughtime.Server) []roughtime.Server {
 	out := make([]roughtime.Server, 0, len(servers))
 	for _, s := range servers {
 		// Google-Roughtime is UDP-only, so it can never answer over TCP
-		if strings.EqualFold(s.Version, roughtime.VersionLabelGoogle) {
+		if isGoogleServerVersion(s.Version) {
 			continue
 		}
 		tcp := tcpAddresses(s.Addresses)
@@ -256,6 +229,11 @@ func filterTCPOnly(servers []roughtime.Server) []roughtime.Server {
 		out = append(out, s)
 	}
 	return out
+}
+
+// isGoogleServerVersion recognizes the textual and numeric ecosystem labels.
+func isGoogleServerVersion(value string) bool {
+	return strings.EqualFold(value, roughtime.VersionLabelGoogle) || value == "3000600613"
 }
 
 // tcpAddresses returns the subset of addrs whose transport is TCP.
@@ -269,29 +247,21 @@ func tcpAddresses(addrs []roughtime.Address) []roughtime.Address {
 	return tcp
 }
 
-// loadServersFile reads and parses an ecosystem JSON file capped at
-// maxEcosystemFileBytes.
+// loadServersFile reads and parses a size-capped ecosystem JSON file.
 func loadServersFile(path string) ([]roughtime.Server, error) {
-	f, err := os.Open(filepath.Clean(path))
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading server list: %w", err)
 	}
 	defer func() { _ = f.Close() }()
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("reading server list: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("server list %s is not a regular file", roughtime.SanitizeForDisplay(path))
-	}
 	// read one past the cap so oversize is reported explicitly, not as JSON
 	// truncation
-	data, err := io.ReadAll(io.LimitReader(f, maxEcosystemFileBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, roughtime.MaxEcosystemBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading server list: %w", err)
 	}
-	if len(data) > maxEcosystemFileBytes {
-		return nil, fmt.Errorf("server list %s exceeds %d bytes", roughtime.SanitizeForDisplay(path), maxEcosystemFileBytes)
+	if len(data) > roughtime.MaxEcosystemBytes {
+		return nil, fmt.Errorf("server list %s exceeds %d bytes", roughtime.SanitizeForDisplay(path), roughtime.MaxEcosystemBytes)
 	}
 	return roughtime.ParseEcosystem(data)
 }

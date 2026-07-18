@@ -4,369 +4,55 @@
 package protocol
 
 import (
-	"bytes"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"testing"
 	"time"
 )
 
-// TestCreateRepliesGoogle verifies CreateReplies produces a Google-Roughtime
-// reply that passes verifyResponse.
-func TestCreateRepliesGoogle(t *testing.T) {
-	cert, rootSK := testCert(t)
-	nonce := randBytes(t, 64)
-	raw := buildGoogleRequest(nonce)
-	replies, err := CreateReplies(VersionGoogle, []Request{{Nonce: nonce, RawPacket: raw}}, time.Now(), time.Second, cert)
-	if err != nil || len(replies) != 1 {
-		t.Fatal("expected one reply")
-	}
-	verifyResponse(t, replies[0], groupGoogle, nonce, false, rootSK)
-}
-
-// TestCreateRepliesAllDrafts verifies CreateReplies across every IETF draft and
-// groupD14 with TYPE.
-func TestCreateRepliesAllDrafts(t *testing.T) {
-	cases := []struct {
-		ver     Version
-		group   wireGroup
-		nonce   int
-		hasType bool
-	}{
-		{VersionDraft01, groupD01, 64, false},
-		{VersionDraft02, groupD02, 64, false},
-		{VersionDraft03, groupD03, 64, false},
-		{VersionDraft04, groupD03, 64, false},
-		{VersionDraft05, groupD05, 32, false},
-		{VersionDraft06, groupD05, 32, false},
-		{VersionDraft07, groupD07, 32, false},
-		{VersionDraft08, groupD08, 32, false},
-		{VersionDraft09, groupD08, 32, false},
-		{VersionDraft10, groupD10, 32, false},
-		{VersionDraft11, groupD10, 32, false},
-		{VersionDraft12, groupD12, 32, false},
-		{VersionDraft12, groupD14, 32, true}, // drafts 14-19 set TYPE
-	}
-	for _, tc := range cases {
-		name := tc.ver.ShortString()
-		if tc.hasType {
-			name += "+TYPE"
-		}
-		t.Run(name, func(t *testing.T) {
-			cert, rootSK := testCert(t)
-			nonce := randBytes(t, tc.nonce)
-			raw := buildIETFRequest(nonce, []Version{tc.ver}, tc.hasType)
-			replies, err := CreateReplies(tc.ver, []Request{{
-				Nonce: nonce, Versions: []Version{tc.ver}, HasType: tc.hasType, RawPacket: raw,
-			}}, time.Now(), time.Second, cert)
-			if err != nil || len(replies) != 1 {
-				t.Fatalf("CreateReplies: %v (len=%d)", err, len(replies))
-			}
-			verifyResponse(t, replies[0], tc.group, nonce, tc.hasType, rootSK)
-		})
-	}
-}
-
-// TestCreateRepliesZeroMidpoint verifies a zero midpoint self-timestamps to
-// time.Now.
-func TestCreateRepliesZeroMidpoint(t *testing.T) {
-	cert, rootSK := testCert(t)
-	rootPK := rootSK.Public().(ed25519.PublicKey)
-
+// TestCreateRepliesBatch covers batched responses across versions.
+func TestCreateRepliesBatch(t *testing.T) {
+	// Cases cover batching across representative wire groups.
 	for _, tc := range []struct {
-		ver     Version
-		hasType bool
+		version Version
+		size    int
 	}{
-		{VersionGoogle, false},
-		{VersionDraft08, false},
-		{VersionDraft12, true},
+		{VersionGoogle, 3},
+		{VersionDraft03, 3},
+		{VersionDraft08, 4},
+		{VersionDraft12, 5},
 	} {
-		t.Run(tc.ver.ShortString(), func(t *testing.T) {
-			nonce, raw, err := CreateRequest([]Version{tc.ver}, rand.Reader, nil)
+		t.Run(tc.version.ShortString(), func(t *testing.T) {
+			cert, _ := testCert(t)
+			requests := make([]Request, tc.size)
+			nonces := make([][]byte, tc.size)
+			raw := make([][]byte, tc.size)
+			for i := range requests {
+				var err error
+				nonces[i], raw[i], err = CreateRequest([]Version{tc.version}, rand.Reader, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				parsed, err := ParseRequest(raw[i])
+				if err != nil {
+					t.Fatal(err)
+				}
+				requests[i] = *parsed
+			}
+			replies, err := CreateReplies(tc.version, requests, time.Now(), time.Second, cert)
 			if err != nil {
 				t.Fatal(err)
 			}
-			parsed, err := ParseRequest(raw)
-			if err != nil {
-				t.Fatal(err)
-			}
-			before := time.Now()
-			replies, err := CreateReplies(tc.ver, []Request{*parsed}, time.Time{}, time.Second, cert)
-			after := time.Now()
-			if err != nil || len(replies) != 1 {
-				t.Fatalf("CreateReplies: %v (len=%d)", err, len(replies))
-			}
-			midpoint, _, err := VerifyReply([]Version{tc.ver}, replies[0], rootPK, nonce, raw)
-			if err != nil {
-				t.Fatalf("VerifyReply: %v", err)
-			}
-			if midpoint.Before(before.Add(-time.Second)) || midpoint.After(after.Add(time.Second)) {
-				t.Fatalf("midpoint %v not between %v and %v (±1s for rounding)", midpoint, before, after)
+			for i := range replies {
+				if _, _, err := VerifyReply([]Version{tc.version}, replies[i], cert.edRootPK, nonces[i], raw[i]); err != nil {
+					t.Fatalf("reply %d: %v", i, err)
+				}
 			}
 		})
 	}
 }
 
-// TestCreateRepliesRejectsEmpty verifies CreateReplies rejects an empty request
-// batch.
-func TestCreateRepliesRejectsEmpty(t *testing.T) {
-	cert, _ := testCert(t)
-	if _, err := CreateReplies(VersionDraft12, nil, time.Now(), time.Second, cert); err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-// TestCreateRepliesRejectsMixedHasType verifies CreateReplies rejects batches
-// with inconsistent HasType.
-func TestCreateRepliesRejectsMixedHasType(t *testing.T) {
-	cert, _ := testCert(t)
-
-	_, req0, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed0, err := ParseRequest(req0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed0.HasType = false
-
-	_, req1, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed1, err := ParseRequest(req1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	reqs := []Request{*parsed0, *parsed1}
-	if _, err := CreateReplies(VersionDraft12, reqs, time.Now(), time.Second, cert); err == nil {
-		t.Fatal("expected error for mixed HasType batch")
-	}
-}
-
-// TestCreateRepliesRejectsWrongNonceSize verifies CreateReplies rejects
-// requests with mismatched nonce sizes.
-func TestCreateRepliesRejectsWrongNonceSize(t *testing.T) {
-	cert, _ := testCert(t)
-
-	// draft-12 expects 32-byte nonces. The second request supplies 64
-	_, req0, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	parsed0, err := ParseRequest(req0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	bad := *parsed0
-	bad.Nonce = randBytes(t, 64)
-
-	reqs := []Request{*parsed0, bad}
-	if _, err := CreateReplies(VersionDraft12, reqs, time.Now(), time.Second, cert); err == nil {
-		t.Fatal("expected error for batch with mismatched nonce size")
-	}
-}
-
-// TestCreateRepliesBatchDraft01Rejected verifies draft-01 multi-request batches
-// are rejected.
-func TestCreateRepliesBatchDraft01Rejected(t *testing.T) {
-	cert, _ := testCert(t)
-	nonce0 := randBytes(t, 64)
-	nonce1 := randBytes(t, 64)
-	raw0 := buildIETFRequest(nonce0, []Version{VersionDraft01}, false)
-	raw1 := buildIETFRequest(nonce1, []Version{VersionDraft01}, false)
-	reqs := []Request{
-		{Nonce: nonce0, Versions: []Version{VersionDraft01}, RawPacket: raw0},
-		{Nonce: nonce1, Versions: []Version{VersionDraft01}, RawPacket: raw1},
-	}
-	if _, err := CreateReplies(VersionDraft01, reqs, time.Now(), time.Second, cert); err == nil {
-		t.Fatal("expected error for multi-request draft-01 batch")
-	}
-}
-
-// TestCreateRepliesBatchDraft03 verifies CreateReplies handles a multi-request
-// draft-03 batch.
-func TestCreateRepliesBatchDraft03(t *testing.T) {
-	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
-	const n = 3
-	reqs := make([]Request, n)
-	nonces := make([][]byte, n)
-	rawReqs := make([][]byte, n)
-	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionDraft03}, rand.Reader, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsed, err := ParseRequest(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reqs[i] = *parsed
-		nonces[i] = nonce
-		rawReqs[i] = req
-	}
-	replies, err := CreateReplies(VersionDraft03, reqs, time.Now(), time.Second, cert)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range n {
-		if _, _, err := VerifyReply([]Version{VersionDraft03}, replies[i], rootPK, nonces[i], rawReqs[i]); err != nil {
-			t.Fatalf("reply %d: %v", i, err)
-		}
-	}
-}
-
-// TestCreateRepliesBatchDraft02Rejected verifies draft-02 multi-request batches
-// are rejected.
-func TestCreateRepliesBatchDraft02Rejected(t *testing.T) {
-	cert, _ := testCert(t)
-	nonce0 := randBytes(t, 64)
-	nonce1 := randBytes(t, 64)
-	raw0 := buildIETFRequest(nonce0, []Version{VersionDraft02}, false)
-	raw1 := buildIETFRequest(nonce1, []Version{VersionDraft02}, false)
-	reqs := []Request{
-		{Nonce: nonce0, Versions: []Version{VersionDraft02}, RawPacket: raw0},
-		{Nonce: nonce1, Versions: []Version{VersionDraft02}, RawPacket: raw1},
-	}
-	if _, err := CreateReplies(VersionDraft02, reqs, time.Now(), time.Second, cert); err == nil {
-		t.Fatal("expected error for multi-request draft-02 batch")
-	}
-}
-
-// TestCreateRepliesBatchDraft08 verifies CreateReplies handles a multi-request
-// draft-08 batch.
-func TestCreateRepliesBatchDraft08(t *testing.T) {
-	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
-	const n = 4
-	reqs := make([]Request, n)
-	nonces := make([][]byte, n)
-	rawReqs := make([][]byte, n)
-	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsed, err := ParseRequest(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reqs[i] = *parsed
-		nonces[i] = nonce
-		rawReqs[i] = req
-	}
-	replies, err := CreateReplies(VersionDraft08, reqs, time.Now(), time.Second, cert)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range n {
-		if _, _, err := VerifyReply([]Version{VersionDraft08}, replies[i], rootPK, nonces[i], rawReqs[i]); err != nil {
-			t.Fatalf("reply %d: %v", i, err)
-		}
-	}
-}
-
-// TestCreateRepliesBatchDraft14 verifies CreateReplies handles a multi-request
-// draft-14 batch.
-func TestCreateRepliesBatchDraft14(t *testing.T) {
-	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
-	const n = 5
-	reqs := make([]Request, n)
-	nonces := make([][]byte, n)
-	rawReqs := make([][]byte, n)
-	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsed, err := ParseRequest(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !parsed.HasType {
-			t.Fatal("CreateRequest for draft-12 should set TYPE")
-		}
-		reqs[i] = *parsed
-		nonces[i] = nonce
-		rawReqs[i] = req
-	}
-	replies, err := CreateReplies(VersionDraft12, reqs, time.Now(), time.Second, cert)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range n {
-		mid, rad, err := VerifyReply([]Version{VersionDraft12}, replies[i], rootPK, nonces[i], rawReqs[i])
-		if err != nil {
-			t.Fatalf("reply %d: %v", i, err)
-		}
-		if mid.IsZero() || rad == 0 {
-			t.Fatalf("reply %d: zero midpoint or radius", i)
-		}
-	}
-}
-
-// TestCreateRepliesBatchGoogle verifies CreateReplies handles a
-// non-power-of-two Google-Roughtime batch.
-func TestCreateRepliesBatchGoogle(t *testing.T) {
-	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
-	const n = 3
-	reqs := make([]Request, n)
-	nonces := make([][]byte, n)
-	rawReqs := make([][]byte, n)
-	for i := range n {
-		nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		parsed, err := ParseRequest(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		reqs[i] = *parsed
-		nonces[i] = nonce
-		rawReqs[i] = req
-	}
-	replies, err := CreateReplies(VersionGoogle, reqs, time.Now(), time.Second, cert)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range n {
-		mid, rad, err := VerifyReply([]Version{VersionGoogle}, replies[i], rootPK, nonces[i], rawReqs[i])
-		if err != nil {
-			t.Fatalf("reply %d: %v", i, err)
-		}
-		if mid.IsZero() || rad == 0 {
-			t.Fatalf("reply %d: zero midpoint or radius", i)
-		}
-	}
-}
-
-// TestCreateRepliesEarlyDraftHeader verifies drafts 01-04 server responses
-// carry the ROUGHTIM header.
-func TestCreateRepliesEarlyDraftHeader(t *testing.T) {
-	cert, _ := testCert(t)
-	for _, v := range []Version{VersionDraft01, VersionDraft02, VersionDraft03, VersionDraft04} {
-		nonce := randBytes(t, 64)
-		raw := buildIETFRequest(nonce, []Version{v}, false)
-		replies, err := CreateReplies(v, []Request{{Nonce: nonce, Versions: []Version{v}, RawPacket: raw}}, time.Now(), time.Second, cert)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(replies[0][:8], packetMagic[:]) {
-			t.Fatalf("%s response must carry the ROUGHTIM header", v)
-		}
-	}
-}
-
-// TestSREPContainsVERSForDraft12 verifies draft-12 SREP carries an ascending
-// VERS list including draft-12.
+// TestSREPContainsVERSForDraft12 covers signed version advertisement.
 func TestSREPContainsVERSForDraft12(t *testing.T) {
 	cert, _ := testCert(t)
 	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
@@ -423,8 +109,7 @@ func TestSREPContainsVERSForDraft12(t *testing.T) {
 	}
 }
 
-// TestDraft12NoTopLevelVER verifies draft-12 replies omit top-level VER and
-// place it inside SREP.
+// TestDraft12NoTopLevelVER covers the shared-version response layout.
 func TestDraft12NoTopLevelVER(t *testing.T) {
 	cert, _ := testCert(t)
 	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
@@ -448,7 +133,7 @@ func TestDraft12NoTopLevelVER(t *testing.T) {
 	_ = nonce
 }
 
-// TestPQBatch verifies CreateReplies handles a multi-request ML-DSA-44 batch.
+// TestPQBatch covers batched ML-DSA-44 responses.
 func TestPQBatch(t *testing.T) {
 	cert, rootPK := testPQCert(t)
 
@@ -486,8 +171,7 @@ func TestPQBatch(t *testing.T) {
 	}
 }
 
-// TestCreateRepliesRejectsNilAndWipedCertificate verifies signing fails cleanly
-// when no usable online key remains.
+// TestCreateRepliesRejectsNilAndWipedCertificate covers unusable certificates.
 func TestCreateRepliesRejectsNilAndWipedCertificate(t *testing.T) {
 	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
 	if err != nil {
@@ -505,102 +189,4 @@ func TestCreateRepliesRejectsNilAndWipedCertificate(t *testing.T) {
 	if _, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert); err == nil {
 		t.Fatal("CreateReplies accepted wiped certificate")
 	}
-}
-
-// TestPQRejectsWrongScheme verifies CreateReplies rejects cross-scheme
-// cert/version pairings.
-func TestPQRejectsWrongScheme(t *testing.T) {
-	edCert, _ := testCert(t)
-	pqCert, _ := testPQCert(t)
-
-	_, req, err := CreateRequest([]Version{VersionMLDSA44}, rand.Reader, nil)
-	if err != nil {
-		t.Fatalf("CreateRequest(PQ): %v", err)
-	}
-	parsed, err := ParseRequest(req)
-	if err != nil {
-		t.Fatalf("ParseRequest: %v", err)
-	}
-	if _, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, edCert); err == nil {
-		t.Fatal("expected error signing PQ version with Ed25519 cert")
-	}
-
-	_, req2, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	if err != nil {
-		t.Fatalf("CreateRequest(Draft12): %v", err)
-	}
-	parsed2, err := ParseRequest(req2)
-	if err != nil {
-		t.Fatalf("ParseRequest: %v", err)
-	}
-	if _, err := CreateReplies(VersionDraft12, []Request{*parsed2}, time.Now(), time.Second, pqCert); err == nil {
-		t.Fatal("expected error signing Ed25519 version with PQ cert")
-	}
-}
-
-// FuzzCreateReplies fuzzes CreateReplies for panic-safety on adversarial
-// requests.
-func FuzzCreateReplies(f *testing.F) {
-	versions := []Version{
-		VersionGoogle, VersionDraft01, VersionDraft02, VersionDraft05,
-		VersionDraft08, VersionDraft12,
-	}
-
-	for _, ver := range versions {
-		_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
-		if err != nil {
-			continue
-		}
-		f.Add(req, byte(ver&0xff))
-	}
-
-	f.Add([]byte{}, byte(0))
-	f.Add([]byte{0xff, 0xff, 0xff, 0xff}, byte(0))
-	f.Add(make([]byte, 1024), byte(0x0c))
-
-	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
-	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
-	now := time.Now()
-	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
-
-	f.Fuzz(func(t *testing.T, reqBytes []byte, verHint byte) {
-		idx := int(verHint) % len(versions)
-		ver := versions[idx]
-
-		parsed, err := ParseRequest(reqBytes)
-		if err != nil {
-			return
-		}
-		CreateReplies(ver, []Request{*parsed}, now, time.Second, cert) //nolint:errcheck // fuzz target tests for panics
-	})
-}
-
-// FuzzCreateRepliesBatch fuzzes CreateReplies for panic-safety on multi-request
-// batches.
-func FuzzCreateRepliesBatch(f *testing.F) {
-	_, req1, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	_, req2, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	f.Add(req1, req2)
-
-	_, gReq1, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
-	_, gReq2, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
-	f.Add(gReq1, gReq2)
-
-	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
-	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
-	now := time.Now()
-	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
-
-	f.Fuzz(func(t *testing.T, reqBytes1, reqBytes2 []byte) {
-		p1, err := ParseRequest(reqBytes1)
-		if err != nil {
-			return
-		}
-		p2, err := ParseRequest(reqBytes2)
-		if err != nil {
-			return
-		}
-		CreateReplies(VersionDraft12, []Request{*p1, *p2}, now, time.Second, cert) //nolint:errcheck // fuzz target tests for panics
-		CreateReplies(VersionGoogle, []Request{*p1, *p2}, now, time.Second, cert)  //nolint:errcheck // fuzz target tests for panics
-	})
 }

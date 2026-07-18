@@ -17,6 +17,21 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
+// reset clears every request counter for test isolation.
+func (c *requestCounters) reset() {
+	c.udpEd.Store(0)
+	c.tcpEd.Store(0)
+	c.tcpPQ.Store(0)
+}
+
+// reset clears every drop counter for test isolation.
+func (c *dropCounters) reset() {
+	for i := range dropReasonCount {
+		c.udp[i].Store(0)
+		c.tcp[i].Store(0)
+	}
+}
+
 // pickFreeTCPPort returns an ephemeral TCP port after closing the holder
 // socket.
 func pickFreeTCPPort(t *testing.T) int {

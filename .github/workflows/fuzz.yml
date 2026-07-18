@@ -1,10 +1,12 @@
 name: Fuzz
 
 on:
+  schedule:
+    - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
       fuzz_time:
-        description: Time per fuzz target (e.g. 30s, 5m, 1h)
+        description: Time per fuzz target
         required: false
         default: 30s
 
@@ -18,7 +20,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
-      - run: make fuzz FUZZ_TIME=${{ inputs.fuzz_time }}
+      - name: Run fuzzers
+        env:
+          FUZZ_TIME: ${{ inputs.fuzz_time || '30s' }}
+        run: make fuzz
       - if: failure()
         uses: actions/upload-artifact@v7
         with:

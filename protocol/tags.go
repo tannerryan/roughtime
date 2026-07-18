@@ -3,7 +3,7 @@
 
 package protocol
 
-// Tag constants from the IANA Roughtime tag registry.
+// Roughtime tag constants, including historical compatibility tags.
 const (
 	// TagSIG is the signature tag.
 	TagSIG uint32 = 0x00474953
@@ -15,7 +15,7 @@ const (
 	TagNONC uint32 = 0x434e4f4e
 	// TagDELE is the delegation tag.
 	TagDELE uint32 = 0x454c4544
-	// TagTYPE is the response-type tag.
+	// TagTYPE is the request/response message-type tag.
 	TagTYPE uint32 = 0x45505954
 	// TagPATH is the Merkle path tag.
 	TagPATH uint32 = 0x48544150

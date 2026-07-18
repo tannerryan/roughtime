@@ -4,32 +4,59 @@
 package protocol
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 )
 
 // responseCtx is the SREP signature context.
 var responseCtx = []byte("RoughTime v1 response signature\x00")
 
-// CreateReplies builds signed responses for a batch of requests.
+// ReplyOptions controls wire choices that cannot be inferred from the shared
+// version number.
+type ReplyOptions struct {
+	// Draft14NodeFirst emits the node-first Merkle convention specified by
+	// drafts 14-15. Drafts 16-19 use hash-first under the same VersionDraft12
+	// and TYPE=1 identifiers, which remains the default for compatibility.
+	Draft14NodeFirst bool
+}
+
+// CreateReplies builds signed responses for a batch of requests. A zero
+// midpoint uses the current time. Radius is rounded up to the wire unit and its
+// required floor. Midpoints outside years 2000–3000 are rejected. For the
+// ambiguous TYPE=1 wire group it emits the draft-16+ hash-first Merkle form;
+// use [CreateRepliesWithOptions] for a draft-14/15 peer.
 func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate) ([][]byte, error) {
+	return CreateRepliesWithOptions(ver, requests, midpoint, radius, cert, ReplyOptions{})
+}
+
+// CreateRepliesWithOptions builds signed responses with explicit choices for
+// wire behavior that the negotiated version cannot disambiguate.
+func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate, opts ReplyOptions) ([][]byte, error) {
 	if len(requests) == 0 {
 		return nil, errors.New("protocol: no requests")
 	}
 	if cert == nil {
 		return nil, errors.New("protocol: nil certificate")
 	}
-	if cert.wiped {
-		return nil, errors.New("protocol: certificate signing key wiped")
+	if !isRecognizedVersion(ver) {
+		return nil, fmt.Errorf("protocol: unsupported response version %s", ver)
 	}
 	if uint64(len(requests)) > maxMerkleLeaves {
 		return nil, fmt.Errorf("protocol: batch size %d exceeds Merkle cap 2^32", len(requests))
 	}
 
 	g := wireGroupOf(ver, requests[0].HasType)
+	if opts.Draft14NodeFirst && g != groupD14 {
+		return nil, errors.New("protocol: Draft14NodeFirst requires VersionDraft12 with TYPE")
+	}
+	if !cert.supportsVersion(ver) {
+		return nil, fmt.Errorf("protocol: certificate is not configured for version %s", ver)
+	}
 
 	ns := nonceSize(g)
 	for i := range requests {
@@ -38,6 +65,9 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 		}
 		if len(requests[i].Nonce) != ns {
 			return nil, fmt.Errorf("protocol: request %d nonce is %d bytes, want %d", i, len(requests[i].Nonce), ns)
+		}
+		if err := validateRequestForReply(ver, requests[i], cert); err != nil {
+			return nil, fmt.Errorf("protocol: request %d: %w", i, err)
 		}
 	}
 
@@ -52,6 +82,33 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 			ver, schemeOfGroup(g), cert.scheme)
 	}
 
+	// A zero midpoint requests self-timestamping. Validate all explicit and
+	// generated values before signing so this function cannot emit a reply its
+	// own verifier rejects.
+	if midpoint.IsZero() {
+		midpoint = time.Now()
+	}
+	if err := validateTimestampEncoding(midpoint, g); err != nil {
+		return nil, fmt.Errorf("protocol: invalid midpoint: %w", err)
+	}
+	if midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint) {
+		return nil, errors.New("protocol: midpoint outside plausible calendar range")
+	}
+	if radius < 0 {
+		return nil, errors.New("protocol: radius must not be negative")
+	}
+	if g >= groupD10 && radius == 0 {
+		return nil, errors.New("protocol: radius must not be zero for drafts 10+")
+	}
+	if _, err := encodeRadius(radius, g); err != nil {
+		return nil, err
+	}
+	certMint := encodeTimestamp(cert.mint, g)
+	certMaxt := encodeTimestamp(cert.maxt, g)
+	if _, _, err := validateDelegationWindow(midpoint, radius, certMint[:], certMaxt[:], g); err != nil {
+		return nil, fmt.Errorf("protocol: refusing to sign unverifiable midpoint: %w", err)
+	}
+
 	leafData := make([][]byte, len(requests))
 	for i := range requests {
 		if usesFullPacketLeaf(g) {
@@ -60,15 +117,9 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 			leafData[i] = requests[i].Nonce
 		}
 	}
-	tree := newMerkleTree(g, leafData)
+	tree := newMerkleTreeWithOrder(g, leafData, merkleNodeFirst(g) || opts.Draft14NodeFirst)
 
-	// zero midpoint uses the moment of signing. Tests and replays needing
-	// deterministic output must pass a non-zero midpoint
-	if midpoint.IsZero() {
-		midpoint = time.Now()
-	}
-
-	srepBytes, err := buildSREP(ver, g, requests, midpoint, radius, tree.rootHash)
+	srepBytes, err := buildSREP(ver, g, requests, midpoint, radius, tree.rootHash, cert.signedVERS())
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +144,9 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 	}
 
 	certBytes := cert.certBytes(g)
+	if len(certBytes) == 0 {
+		return nil, fmt.Errorf("protocol: certificate unavailable for wire group %d", g)
+	}
 
 	replies := make([][]byte, len(requests))
 	for i := range requests {
@@ -107,14 +161,14 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 
 // buildSREP constructs the signed response carrying MIDP, RADI, ROOT, and
 // version tags.
-func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time, radius time.Duration, rootHash []byte) ([]byte, error) {
+func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time, radius time.Duration, rootHash, supportedVERS []byte) ([]byte, error) {
 	midpBuf := encodeTimestamp(midpoint, g)
 	var radiBuf [4]byte
-	if g == groupGoogle || usesMJDMicroseconds(g) {
-		binary.LittleEndian.PutUint32(radiBuf[:], radiMicroseconds(radius))
-	} else {
-		binary.LittleEndian.PutUint32(radiBuf[:], radiSeconds(radius))
+	wireRadius, err := encodeRadius(radius, g)
+	if err != nil {
+		return nil, err
 	}
+	binary.LittleEndian.PutUint32(radiBuf[:], wireRadius)
 
 	srepTags := map[uint32][]byte{
 		TagRADI: radiBuf[:],
@@ -128,10 +182,13 @@ func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time,
 		srepTags[TagNONC] = requests[0].Nonce
 	}
 	if hasSREPVERS(g) {
+		if len(supportedVERS) == 0 || len(supportedVERS)%4 != 0 {
+			return nil, errors.New("protocol: empty or malformed configured VERS")
+		}
 		var vBuf [4]byte
 		binary.LittleEndian.PutUint32(vBuf[:], uint32(ver))
 		srepTags[TagVER] = vBuf[:]
-		srepTags[TagVERS] = suiteSupportedVersionsBytes(schemeOfGroup(g))
+		srepTags[TagVERS] = supportedVERS
 	}
 
 	b, err := encode(srepTags)
@@ -139,6 +196,41 @@ func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time,
 		return nil, fmt.Errorf("protocol: encode SREP: %w", err)
 	}
 	return b, nil
+}
+
+// validateRequestForReply checks the fields needed to build a valid reply.
+func validateRequestForReply(ver Version, req Request, cert *Certificate) error {
+	if wireGroupOf(ver, req.HasType) >= groupD10 && len(req.SRV) != 0 && !bytes.Equal(req.SRV, ComputeSRV(cert.rootPublicKey())) {
+		return errors.New("request SRV does not identify this certificate root")
+	}
+	if len(req.RawPacket) == 0 {
+		// Before draft 12 the Merkle leaf is the nonce, so the historical API
+		// permitted callers to construct Request values without retaining the
+		// encoded packet. Drafts 12+ authenticate the full packet and must have it.
+		if usesFullPacketLeaf(wireGroupOf(ver, req.HasType)) {
+			return errors.New("missing RawPacket for full-packet Merkle leaf")
+		}
+		if ver == VersionGoogle {
+			if len(req.Versions) != 0 {
+				return errors.New("google-format request unexpectedly contains versions")
+			}
+			return nil
+		}
+		// Historically Request{Nonce: ...} was sufficient for nonce-leaf IETF
+		// versions. If a caller supplies an offer list, keep validating it.
+		if len(req.Versions) > 0 && !slices.Contains(req.Versions, ver) {
+			return fmt.Errorf("selected version %s was not offered", ver)
+		}
+		return nil
+	}
+	if ver == VersionGoogle {
+		if len(req.Versions) != 0 {
+			return errors.New("google-format request unexpectedly contains versions")
+		}
+	} else if !slices.Contains(req.Versions, ver) {
+		return fmt.Errorf("selected version %s was not offered", ver)
+	}
+	return nil
 }
 
 // buildReply constructs a single response message for request i.

@@ -13,7 +13,6 @@ import (
 	"io"
 	mrand "math/rand/v2"
 	"net"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +33,7 @@ var tcpReqBufPool = sync.Pool{
 	},
 }
 
-// TCP tunables. A var so tests can shrink them.
+// TCP tunables are variables so tests can override them.
 var (
 	// maxTCPConnections caps concurrent accepted connections.
 	maxTCPConnections int32 = 16384
@@ -59,49 +58,37 @@ var (
 	maxTCPReplyBytes = 8 * 1024
 )
 
-// TCP-specific connection-lifecycle counters. Reason-classified drop counters
-// live as labeled series under requests_dropped_total in metrics.go.
 var (
-	// statsTCPAccepted counts conns accepted by the listener.
+	// statsTCPAccepted counts connections returned by Accept.
 	statsTCPAccepted atomic.Uint64
-	// statsTCPRejected counts conns closed at accept due to the connection cap.
+	// statsTCPRejected counts connections closed at the connection cap.
 	statsTCPRejected atomic.Uint64
-	// statsTCPCompleted counts request/reply round-trips that finished cleanly.
+	// statsTCPCompleted counts successful request/reply round trips.
 	statsTCPCompleted atomic.Uint64
 )
 
-// tcpBatchItem is a request submitted to the batcher by a handler.
+// tcpBatchItem carries a validated request to a scheme batcher.
 type tcpBatchItem struct {
-	// req is the parsed Roughtime request body.
-	req protocol.Request
-	// version is the negotiated wire version for this request.
+	req     protocol.Request
 	version protocol.Version
-	// hasType records whether the request carries the explicit TYPE tag.
 	hasType bool
-	// peer is the remote address used for log fields.
-	peer net.Addr
-	// reply receives the signed response or batch error exactly once.
-	reply chan<- tcpBatchReply
+	peer    net.Addr
+	reply   chan<- tcpBatchReply
 }
 
-// tcpBatchReply carries the signed response back to the handler.
+// tcpBatchReply carries a framed reply or batch error.
 type tcpBatchReply struct {
-	// bytes is the framed reply on success.
 	bytes []byte
-	// err is set when the batch failed to sign or produced an oversize reply.
-	err error
+	err   error
 }
 
-// activeConnSet tracks live conns so shutdown can force-close them after
-// tcpShutdownGrace.
+// activeConnSet tracks live connections for forced shutdown.
 type activeConnSet struct {
-	// mu guards m.
 	mu sync.Mutex
-	// m is the live connection set.
-	m map[net.Conn]struct{}
+	m  map[net.Conn]struct{}
 }
 
-// (activeConnSet) add registers c so closeAll can reach it during shutdown.
+// add records c as active.
 func (s *activeConnSet) add(c net.Conn) {
 	s.mu.Lock()
 	if s.m == nil {
@@ -111,14 +98,14 @@ func (s *activeConnSet) add(c net.Conn) {
 	s.mu.Unlock()
 }
 
-// (activeConnSet) remove drops c from the live set.
+// remove stops tracking c.
 func (s *activeConnSet) remove(c net.Conn) {
 	s.mu.Lock()
 	delete(s.m, c)
 	s.mu.Unlock()
 }
 
-// (activeConnSet) closeAll force-closes every live conn.
+// closeAll closes every tracked connection.
 func (s *activeConnSet) closeAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -137,7 +124,7 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 	prefs := tcpServerPrefs(edState, pqState)
 
 	tcpLog := logger.Named("tcp")
-	addr := net.JoinHostPort("::", strconv.Itoa(*port))
+	addr := serverListenAddr()
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
@@ -182,7 +169,6 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 
 	// close listener on shutdown to unblock Accept
 	go func() {
-		defer recoverGoroutine(tcpLog, "shutdown closer")
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
@@ -235,7 +221,6 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 	drainStart := time.Now()
 	done := make(chan struct{})
 	go func() {
-		defer recoverGoroutine(tcpLog, "shutdown drainer")
 		wg.Wait()
 		close(done)
 	}()
@@ -282,8 +267,8 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 	return nil
 }
 
-// handleTCPConn reads framed Roughtime packets until idle timeout or peer
-// close, batching each via the per-scheme batcher.
+// handleTCPConn processes framed Roughtime packets sequentially until idle
+// timeout, cancellation, or peer close.
 func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) {
 	reqBufPtr := tcpReqBufPool.Get().(*[]byte)
 	// a submitted-but-unanswered item still aliases reqBuf inside the batcher,
@@ -366,7 +351,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 				return
 			case <-submitTimer.C:
 				incDropped(transportTCP, dropQueue)
-				if ce := log.Check(zap.WarnLevel, "TCP batcher queue full"); ce != nil {
+				if ce := log.Check(zap.DebugLevel, "TCP batcher queue full"); ce != nil {
 					ce.Write(zap.Stringer("peer", conn.RemoteAddr()))
 				}
 				return
@@ -389,7 +374,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		}
 		outstanding = false
 		if br.err != nil {
-			// batch-level failure already logged by flushTCPBatch
+			// The drop metric records certificate-state and signing failures.
 			incDropped(transportTCP, dropBatchErr)
 			return
 		}
@@ -409,7 +394,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 
 // prepareTCPItem parses, negotiates, and SRV-checks reqBytes, returning the
 // tcpBatchItem and destination batch channel. On failure the dropReason
-// classifies the rejection, empty on success.
+// classifies the rejection; success returns dropNone.
 func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) (tcpBatchItem, chan<- tcpBatchItem, dropReason, error) {
 	req, err := protocol.ParseRequest(reqBytes)
 	if err != nil {
@@ -448,7 +433,7 @@ func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pq
 		}
 		return tcpBatchItem{}, nil, dropSRV, errors.New("SRV mismatch")
 	}
-	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, "", nil
+	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, dropNone, nil
 }
 
 // filterTCPPrefsBySRV keeps only versions whose configured key matches srv.
@@ -488,6 +473,7 @@ func tcpRouteForVersion(ver protocol.Version, edState, pqState *atomic.Pointer[c
 // tcpBatcher accumulates requests by (version, hasType) and flushes on size or
 // latency triggers.
 func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-chan tcpBatchItem, maxSize int, maxLatency time.Duration) {
+	// pending holds one keyed batch and its first-arrival time.
 	type pending struct {
 		items []tcpBatchItem
 		start time.Time
@@ -545,7 +531,7 @@ func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-ch
 		if b == nil || len(b.items) == 0 {
 			return
 		}
-		flushTCPBatch(log, state.Load(), key.version, b.items)
+		flushTCPBatchCurrent(log, state, key.version, b.items)
 		delete(batches, key)
 	}
 
@@ -583,33 +569,24 @@ func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-ch
 	}
 }
 
-// flushTCPBatch signs a homogeneous batch and dispatches each reply back to its
-// handler.
-func flushTCPBatch(log *zap.Logger, st *certState, ver protocol.Version, items []tcpBatchItem) {
-	delivered := make([]bool, len(items))
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
+// flushTCPBatchCurrent signs with the currently published certificate,
+// retrying a concurrent rotation before beginning the operation.
+func flushTCPBatchCurrent(log *zap.Logger, state *atomic.Pointer[certState], ver protocol.Version, items []tcpBatchItem) {
+	st := acquireCurrent(state)
+	if st == nil {
+		deliverTCPBatchError(items, errors.New("active certificate unavailable"))
+		return
+	}
+	defer st.release()
+	now := wallClockNow()
+	if now.Before(st.notBefore) || !now.Before(st.expiry) {
+		err := errors.New("active certificate expired")
+		if now.Before(st.notBefore) {
+			err = errors.New("active certificate is not yet valid")
 		}
-		statsPanics.Add(1)
-		log.Error("flushTCPBatch panic recovered",
-			zap.Stringer("version", ver),
-			zap.Int("batch_size", len(items)),
-			zap.Any("panic", r),
-			zap.Stack("stack"),
-		)
-		err := fmt.Errorf("flushTCPBatch panic: %v", r)
-		for i := range items {
-			if delivered[i] {
-				continue
-			}
-			select {
-			case items[i].reply <- tcpBatchReply{err: err}:
-			default:
-			}
-		}
-	}()
+		deliverTCPBatchError(items, err)
+		return
+	}
 
 	reqs := make([]protocol.Request, len(items))
 	for i := range items {
@@ -618,19 +595,12 @@ func flushTCPBatch(log *zap.Logger, st *certState, ver protocol.Version, items [
 	// zero midpoint defers timestamping to CreateReplies
 	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
 	if err != nil {
-		statsBatchErrs.Add(1)
 		log.Warn("batch CreateReplies failed",
 			zap.Stringer("version", ver),
 			zap.Int("batch_size", len(items)),
 			zap.Error(err),
 		)
-		for i := range items {
-			select {
-			case items[i].reply <- tcpBatchReply{err: err}:
-			default:
-			}
-			delivered[i] = true
-		}
+		deliverTCPBatchError(items, err)
 		return
 	}
 	statsBatches.Add(1)
@@ -644,32 +614,27 @@ func flushTCPBatch(log *zap.Logger, st *certState, ver protocol.Version, items [
 				}
 			}
 		}
-		// signing-bug guard: oversized replies indicate a CreateReplies/Grease
-		// bug. Fail the handler with an error rather than write garbage on the
-		// wire
-		var br tcpBatchReply
-		if len(reply) > maxTCPReplyBytes {
-			log.Warn("oversize TCP reply rejected",
-				zap.Stringer("peer", items[i].peer),
-				zap.Stringer("version", ver),
-				zap.Int("reply_size", len(reply)),
-				zap.Int("max", maxTCPReplyBytes),
-			)
-			br = tcpBatchReply{err: fmt.Errorf("reply size %d exceeds sanity bound %d", len(reply), maxTCPReplyBytes)}
-		} else {
-			br = tcpBatchReply{bytes: reply}
-		}
 		// non-blocking: a full buffer means the handler already returned
 		select {
-		case items[i].reply <- br:
+		case items[i].reply <- tcpBatchReply{bytes: reply}:
 		default:
 		}
-		delivered[i] = true
 	}
 }
 
-// tcpServerPrefs builds the offered preference list with PQ first when
-// configured and VersionGoogle filtered out.
+// deliverTCPBatchError reports a batch failure to each waiting request.
+func deliverTCPBatchError(items []tcpBatchItem, err error) {
+	statsBatchErrs.Add(1)
+	for i := range items {
+		select {
+		case items[i].reply <- tcpBatchReply{err: err}:
+		default:
+		}
+	}
+}
+
+// tcpServerPrefs builds the server's internal preference list with PQ first
+// when configured and VersionGoogle omitted.
 func tcpServerPrefs(edState, pqState *atomic.Pointer[certState]) []protocol.Version {
 	var prefs []protocol.Version
 	if pqState != nil {
@@ -686,23 +651,16 @@ func tcpServerPrefs(edState, pqState *atomic.Pointer[certState]) []protocol.Vers
 	return prefs
 }
 
-// writeTCPReply writes an already-framed reply to w, rejecting payloads over
-// maxTCPReplyBytes before any bytes are sent.
-func writeTCPReply(w io.Writer, reply []byte) error {
+// writeTCPReply writes one bounded reply and rejects short writes.
+func writeTCPReply(conn net.Conn, reply []byte) error {
 	if len(reply) > maxTCPReplyBytes {
 		return fmt.Errorf("reply size %d exceeds sanity bound %d", len(reply), maxTCPReplyBytes)
 	}
-	for len(reply) > 0 {
-		n, err := w.Write(reply)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		reply = reply[n:]
+	n, err := conn.Write(reply)
+	if err == nil && n != len(reply) {
+		return io.ErrShortWrite
 	}
-	return nil
+	return err
 }
 
 // versionNames renders a preference list as readable names for structured logs.

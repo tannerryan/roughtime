@@ -4,112 +4,46 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"time"
 
 	"github.com/tannerryan/roughtime"
 )
 
-// tsFormat is the display-only timestamp layout.
-const tsFormat = time.RFC3339Nano
-
-// printCheck prints one OK-prefixed line in the verification stanza.
-func printCheck(label, detail string) {
-	fmt.Printf("  %-18s OK   %s\n", label, detail)
+// printReceipt prints a newly created receipt summary.
+func printReceipt(document string, size int64, digest []byte, proofPath string, proofSize int, links []roughtime.ProofLink, profile proofProfile) {
+	fmt.Println("Roughtime timestamp created")
+	fmt.Printf("Document:     %s (%d bytes)\n", display(document), size)
+	fmt.Printf("SHA-256:      %x\n", digest)
+	fmt.Printf("Proof:        %s (%d bytes)\n", display(proofPath), proofSize)
+	fmt.Printf("Measurement:  two passes across %d endpoint-domain groups\n", profile.groups)
+	printBound(links)
 }
 
-// printDocument prints the document path, size, and SHA-256.
-func printDocument(path string, size int64, digest []byte) {
-	fmt.Println("Document")
-	fmt.Printf("  Path:             %s\n", path)
-	fmt.Printf("  Size:             %d bytes\n", size)
-	fmt.Printf("  SHA-256:          %x\n", digest)
-	fmt.Println()
-}
-
-// printSeedLink prints the seed link's crypto detail and confirms its nonce
-// equals the document hash.
-func printSeedLink(l roughtime.ProofLink, docDigest []byte, names map[string]string) {
-	lo, hi := l.Window()
-	fmt.Println("Document Binding (Link 0, Seed)")
-	fmt.Printf("  Witness:          %s\n", nameOf(l.PublicKey, names))
-	fmt.Printf("  Wire version:     %s\n", l.Version.ShortString())
-	fmt.Printf("  Key (fp):         %s\n", fingerprint(l.PublicKey))
-	fmt.Printf("  Nonce:            %x\n", l.Nonce)
-	if bytes.Equal(l.Nonce, docDigest) {
-		fmt.Println("                    MATCHES SHA-256(document)")
+// printVerification prints a verified receipt summary.
+func printVerification(document string, size int64, digest []byte, proofPath string, proofSize int, links []roughtime.ProofLink, profile proofProfile) {
+	label := "legacy"
+	if profile.twoPass {
+		label = fmt.Sprintf("two-pass (%d endpoint-domain groups)", profile.groups)
 	}
-	fmt.Printf("  Midpoint (UTC):   %s\n", l.Midpoint.UTC().Format(tsFormat))
-	fmt.Printf("  Radius:           ±%s\n", l.Radius)
-	fmt.Printf("  Time window:      [%s, %s]\n", lo.UTC().Format(tsFormat), hi.UTC().Format(tsFormat))
-	fmt.Println()
+	fmt.Println("Roughtime timestamp valid")
+	fmt.Printf("Document:     %s (%d bytes)\n", display(document), size)
+	fmt.Printf("SHA-256:      %x\n", digest)
+	fmt.Printf("Proof:        %s (%d bytes)\n", display(proofPath), proofSize)
+	fmt.Printf("Measurement:  %s\n", label)
+	printBound(links)
 }
 
-// printCorroborating prints the tabular summary of links 1..N with
-// fingerprinted keys.
-func printCorroborating(links []roughtime.ProofLink, names map[string]string) {
+// printBound prints the tightest attested upper bound.
+func printBound(links []roughtime.ProofLink) {
 	if len(links) == 0 {
 		return
 	}
-	fmt.Printf("Corroborating Witnesses (%d)\n", len(links))
-	fmt.Printf("  %-3s  %-30s  %-10s  %-16s  %-24s  %s\n",
-		"#", "Witness", "Version", "Key (fp)", "Midpoint (UTC)", "Radius")
-	for i, l := range links {
-		fmt.Printf("  %-3d  %-30s  %-10s  %-16s  %-24s  ±%s\n",
-			i+1,
-			nameOf(l.PublicKey, names),
-			l.Version.ShortString(),
-			fingerprint(l.PublicKey),
-			l.Midpoint.UTC().Format(tsFormat),
-			l.Radius)
-	}
-	fmt.Println()
-}
-
-// printFailures prints the per-server error list, if any.
-func printFailures(results []roughtime.Result) {
-	var failed []roughtime.Result
-	for _, r := range results {
-		if r.Err != nil {
-			failed = append(failed, r)
+	upper := links[0].Midpoint.Add(links[0].Radius)
+	for _, link := range links[1:] {
+		if candidate := link.Midpoint.Add(link.Radius); candidate.Before(upper) {
+			upper = candidate
 		}
 	}
-	if len(failed) == 0 {
-		return
-	}
-	fmt.Printf("Failures (%d)\n", len(failed))
-	for _, r := range failed {
-		fmt.Printf("  %-30s  %s\n",
-			roughtime.SanitizeForDisplay(r.Server.Name),
-			roughtime.SanitizeForDisplay(r.Err.Error()))
-	}
-	fmt.Println()
-}
-
-// printAttestationWindow prints the [earliest, latest] bound and witness count.
-func printAttestationWindow(links []roughtime.ProofLink) {
-	if len(links) == 0 {
-		return
-	}
-	earliest, latest := links[0].Window()
-	boundIdx := 0
-	for i, l := range links {
-		if _, hi := l.Window(); hi.Before(latest) {
-			latest = hi
-			boundIdx = i
-		}
-	}
-	keys := make(map[string]struct{}, len(links))
-	for _, l := range links {
-		keys[string(l.PublicKey)] = struct{}{}
-	}
-	// The chain proves only an upper bound: earliest is where link 0's window
-	// opens, not a proven lower bound on the document's age.
-	fmt.Println("Verified Attestation Window")
-	fmt.Printf("  Existed no later than:  %s  (link %d upper bound)\n", latest.UTC().Format(tsFormat), boundIdx)
-	fmt.Printf("  Stamp window opens:     %s  (link 0 lower bound)\n", earliest.UTC().Format(tsFormat))
-	fmt.Printf("  Width:                  %s\n", latest.Sub(earliest))
-	fmt.Printf("  Witnesses:              %d independent keys\n", len(keys))
-	fmt.Println()
+	fmt.Printf("Upper bound:  %s\n", upper.UTC().Format(time.RFC3339Nano))
 }

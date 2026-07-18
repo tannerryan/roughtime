@@ -20,7 +20,7 @@ import (
 
 // Metrics-listener tunables.
 const (
-	// metricsContentType is the Prometheus text-format mediatype.
+	// metricsContentType is the Prometheus text-format media type.
 	metricsContentType = "text/plain; version=0.0.4; charset=utf-8"
 	// metricsReadHeaderTimeout bounds slowloris-style header reads.
 	metricsReadHeaderTimeout = 5 * time.Second
@@ -39,13 +39,13 @@ const (
 // scrapeBufPool recycles full-response buffers across scrapes.
 var scrapeBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-// listenMetrics serves /metrics and /healthz on addr until ctx is cancelled. A
-// bind failure returns immediately so the caller can fail fast.
+// listenMetrics serves /metrics and /healthz until cancellation or a listener
+// failure.
 func listenMetrics(ctx context.Context, addr string) error {
 	log := logger.Named("metrics")
 	mux := http.NewServeMux()
-	mux.Handle("/metrics", recoverHTTP(log, "metrics handler", http.HandlerFunc(handleMetrics)))
-	mux.Handle("/healthz", recoverHTTP(log, "healthz handler", http.HandlerFunc(handleHealthz)))
+	mux.HandleFunc("/metrics", handleMetrics)
+	mux.HandleFunc("/healthz", handleHealthz)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -75,9 +75,7 @@ func listenMetrics(ctx context.Context, addr string) error {
 		<-shutdownDone
 	}()
 	go func() {
-		// close even on panic so the deferred wait can't deadlock
 		defer close(shutdownDone)
-		defer recoverGoroutine(log, "metrics shutdown")
 		<-serveCtx.Done()
 		sctx, scancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
 		defer scancel()
@@ -115,16 +113,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(buf.Bytes())
 }
 
-// recoverHTTP routes handler panics through recoverGoroutine so they bump
-// statsPanics instead of being absorbed by net/http's default recovery.
-func recoverHTTP(log *zap.Logger, where string, h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer recoverGoroutine(log, where)
-		h.ServeHTTP(w, r)
-	})
-}
-
-// handleHealthz returns 200 OK whenever the listener is up.
+// handleHealthz reports metrics-listener liveness for GET and HEAD requests.
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")

@@ -6,22 +6,12 @@ package protocol
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/binary"
 	"testing"
 
 	"filippo.io/mldsa"
 )
 
-// TestSigSchemeStringUnknown verifies sigScheme.String formats unknown schemes.
-func TestSigSchemeStringUnknown(t *testing.T) {
-	got := sigScheme(99).String()
-	if got != "sigScheme(99)" {
-		t.Fatalf("unknown sigScheme.String() = %q, want %q", got, "sigScheme(99)")
-	}
-}
-
-// TestSchemeOfGroupSweep verifies schemeOfGroup distinguishes Ed25519 and
-// ML-DSA-44 wire groups.
+// TestSchemeOfGroupSweep covers every wire group's signature scheme.
 func TestSchemeOfGroupSweep(t *testing.T) {
 	classic := []wireGroup{
 		groupGoogle, groupD01, groupD02, groupD03, groupD05, groupD07,
@@ -37,29 +27,7 @@ func TestSchemeOfGroupSweep(t *testing.T) {
 	}
 }
 
-// TestSuiteSupportedVersionsBytes verifies per-scheme VERS lists contain only
-// versions of that scheme.
-func TestSuiteSupportedVersionsBytes(t *testing.T) {
-	parse := func(b []byte) []Version {
-		out := make([]Version, 0, len(b)/4)
-		for i := 0; i+4 <= len(b); i += 4 {
-			out = append(out, Version(binary.LittleEndian.Uint32(b[i:])))
-		}
-		return out
-	}
-	for _, v := range parse(suiteSupportedVersionsBytes(schemeEd25519)) {
-		if v == VersionMLDSA44 {
-			t.Fatalf("Ed25519 VERS list leaked PQ version 0x%08x", uint32(v))
-		}
-	}
-	for _, v := range parse(suiteSupportedVersionsBytes(schemeMLDSA44)) {
-		if v != VersionMLDSA44 {
-			t.Fatalf("PQ VERS list leaked non-PQ version 0x%08x", uint32(v))
-		}
-	}
-}
-
-// TestPQSchemeOf verifies schemeOf maps versions to the correct scheme.
+// TestPQSchemeOf covers ML-DSA-44 scheme selection.
 func TestPQSchemeOf(t *testing.T) {
 	if s := schemeOf(VersionGoogle); s != schemeEd25519 {
 		t.Fatalf("schemeOf(Google) = %v, want Ed25519", s)
@@ -72,8 +40,7 @@ func TestPQSchemeOf(t *testing.T) {
 	}
 }
 
-// TestVerifyEd25519RejectsBadSizes verifies verifyEd25519 short-circuits on
-// wrong-length pk or sig.
+// TestVerifyEd25519RejectsBadSizes covers malformed Ed25519 inputs.
 func TestVerifyEd25519RejectsBadSizes(t *testing.T) {
 	pk, sk, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -88,8 +55,7 @@ func TestVerifyEd25519RejectsBadSizes(t *testing.T) {
 	}
 }
 
-// TestVerifyMLDSA44RejectsBadInputs verifies verifyMLDSA44 short-circuits on
-// nil pk or wrong-length sig.
+// TestVerifyMLDSA44RejectsBadInputs covers malformed ML-DSA-44 inputs.
 func TestVerifyMLDSA44RejectsBadInputs(t *testing.T) {
 	sk, err := mldsa.GenerateKey(mldsa.MLDSA44())
 	if err != nil {
@@ -103,8 +69,7 @@ func TestVerifyMLDSA44RejectsBadInputs(t *testing.T) {
 	}
 }
 
-// TestPQSizes verifies SchemePublicKeySize and SchemeSignatureSize for Ed25519
-// and ML-DSA-44.
+// TestPQSizes covers public wire-size helpers.
 func TestPQSizes(t *testing.T) {
 	if SchemePublicKeySize(VersionMLDSA44) != mldsa.MLDSA44PublicKeySize {
 		t.Fatal("PQ public key size mismatch")

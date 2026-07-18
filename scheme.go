@@ -42,8 +42,8 @@ func SchemeOfKey(pk []byte) (Scheme, error) {
 	}
 }
 
-// VersionsForScheme returns the wire-version preference list to advertise for a
-// server in the given scheme.
+// VersionsForScheme returns the ML-DSA-44 extension for [SchemeMLDSA44] and
+// IETF drafts 05 and later for other values.
 func VersionsForScheme(sch Scheme) []protocol.Version {
 	if sch == SchemeMLDSA44 {
 		return []protocol.Version{protocol.VersionMLDSA44}
@@ -79,7 +79,7 @@ func DecodePublicKey(s string) ([]byte, error) {
 			return b, nil
 		}
 	}
-	return nil, fmt.Errorf("roughtime: public key %q is not a 32-byte Ed25519 or 1312-byte ML-DSA-44 key in base64 or hex", truncateForErr(s))
+	return nil, fmt.Errorf("roughtime: public key %q is not a 32-byte Ed25519 or 1312-byte ML-DSA-44 key in base64 or hex", SanitizeForDisplay(truncateForErr(s)))
 }
 
 // truncateForErr bounds an attacker-controlled string at a rune boundary before

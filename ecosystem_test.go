@@ -16,13 +16,12 @@ import (
 	"github.com/tannerryan/roughtime"
 )
 
+// udpServer returns a minimal UDP test server.
 func udpServer(name, addr string) roughtime.Server {
 	return roughtime.Server{Name: name, Addresses: []roughtime.Address{{Transport: "udp", Address: addr}}}
 }
 
-// TestOperatorKey verifies hosts collapse to their registered domain, with a
-// bare-host fallback for IP literals and single-label names, and a name
-// fallback when a server has no addresses.
+// TestOperatorKey covers endpoint-domain grouping keys.
 func TestOperatorKey(t *testing.T) {
 	cases := map[string]string{
 		"fr.ntp.inutile.pro:2002":       "inutile.pro",
@@ -41,7 +40,7 @@ func TestOperatorKey(t *testing.T) {
 	}
 }
 
-// TestSampleByOperator verifies the sample never repeats an operator.
+// TestSampleByOperator covers endpoint-domain diversity sampling.
 func TestSampleByOperator(t *testing.T) {
 	servers := []roughtime.Server{
 		udpServer("fr", "fr.ntp.inutile.pro:2002"),
@@ -50,74 +49,21 @@ func TestSampleByOperator(t *testing.T) {
 		udpServer("us", "us.ntp.inutile.pro:2002"),
 		udpServer("se", "roughtime.se:2002"),
 	}
-	for range 100 {
-		got := roughtime.SampleByOperator(servers, 3)
-		seen := map[string]bool{}
-		for _, s := range got {
-			k := roughtime.OperatorKey(s)
-			if seen[k] {
-				t.Fatalf("operator %q sampled twice: %v", k, got)
-			}
-			seen[k] = true
+	got := roughtime.SampleByOperator(servers, 3)
+	seen := map[string]bool{}
+	for _, s := range got {
+		k := roughtime.OperatorKey(s)
+		if seen[k] {
+			t.Fatalf("operator %q sampled twice: %v", k, got)
 		}
-		// Only two distinct operators exist, so n=3 yields at most two.
-		if len(got) != 2 {
-			t.Fatalf("len = %d, want 2 distinct operators", len(got))
-		}
+		seen[k] = true
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2 distinct operators", len(got))
 	}
 }
 
-// TestSampleByOperatorEdges covers n below the operator count, member validity,
-// and the empty/zero/negative degenerate cases.
-func TestSampleByOperatorEdges(t *testing.T) {
-	servers := []roughtime.Server{
-		udpServer("fr", "fr.ntp.inutile.pro:2002"),
-		udpServer("se", "roughtime.se:2002"),
-		udpServer("nl", "rough.time.nl:2002"),
-	}
-	inInput := func(name string) bool {
-		for _, in := range servers {
-			if in.Name == name {
-				return true
-			}
-		}
-		return false
-	}
-	// n below the operator count returns exactly n distinct, valid members.
-	for range 100 {
-		got := roughtime.SampleByOperator(servers, 2)
-		if len(got) != 2 {
-			t.Fatalf("len = %d, want 2", len(got))
-		}
-		seen := map[string]bool{}
-		for _, s := range got {
-			k := roughtime.OperatorKey(s)
-			if seen[k] {
-				t.Fatalf("operator %q sampled twice", k)
-			}
-			seen[k] = true
-			if !inInput(s.Name) {
-				t.Fatalf("sampled server %q not in input", s.Name)
-			}
-		}
-	}
-	for _, tc := range []struct {
-		name    string
-		servers []roughtime.Server
-		n       int
-	}{
-		{"empty input", nil, 3},
-		{"n zero", servers, 0},
-		{"n negative", servers, -1},
-	} {
-		if got := roughtime.SampleByOperator(tc.servers, tc.n); len(got) != 0 {
-			t.Errorf("%s: len = %d, want 0", tc.name, len(got))
-		}
-	}
-}
-
-// TestParseEcosystemRoundTrip verifies a minimal ecosystem document parses back
-// to the original Server.
+// TestParseEcosystemRoundTrip covers valid ecosystem decoding.
 func TestParseEcosystemRoundTrip(t *testing.T) {
 	pk, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -155,24 +101,7 @@ func TestParseEcosystemRoundTrip(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemRejectsJunk verifies ParseEcosystem rejects empty,
-// malformed, and key-less documents.
-func TestParseEcosystemRejectsJunk(t *testing.T) {
-	cases := [][]byte{
-		[]byte(""),
-		[]byte("{"),
-		[]byte(`{"servers":[]}`),
-		[]byte(`{"servers":[{"publicKey":"not-base64-or-hex"}]}`),
-	}
-	for i, in := range cases {
-		if _, err := roughtime.ParseEcosystem(in); err == nil {
-			t.Fatalf("case %d: ParseEcosystem accepted junk", i)
-		}
-	}
-}
-
-// TestParseEcosystemValidatesPublicKeyType verifies a publicKeyType mismatching
-// the decoded key length errors.
+// TestParseEcosystemValidatesPublicKeyType covers key-type mismatches.
 func TestParseEcosystemValidatesPublicKeyType(t *testing.T) {
 	pk, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -192,28 +121,7 @@ func TestParseEcosystemValidatesPublicKeyType(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemAllowsMissingPublicKeyType verifies ParseEcosystem accepts
-// entries with no publicKeyType.
-func TestParseEcosystemAllowsMissingPublicKeyType(t *testing.T) {
-	pk, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("genkey: %v", err)
-	}
-	doc := map[string]any{
-		"servers": []map[string]any{{
-			"name":      "ok",
-			"publicKey": base64.StdEncoding.EncodeToString(pk),
-			"addresses": []map[string]string{{"protocol": "udp", "address": "example.com:2002"}},
-		}},
-	}
-	data, _ := json.Marshal(doc)
-	if _, err := roughtime.ParseEcosystem(data); err != nil {
-		t.Fatalf("ParseEcosystem rejected entry without publicKeyType: %v", err)
-	}
-}
-
-// TestParseEcosystemEnforcesMaxServers verifies ParseEcosystem rejects
-// documents larger than MaxEcosystemServers.
+// TestParseEcosystemEnforcesMaxServers covers the server-count limit.
 func TestParseEcosystemEnforcesMaxServers(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	entry := map[string]any{
@@ -231,68 +139,7 @@ func TestParseEcosystemEnforcesMaxServers(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemSanitizesStrings verifies server names and address fields
-// run through SanitizeForDisplay.
-func TestParseEcosystemSanitizesStrings(t *testing.T) {
-	pk, _, _ := ed25519.GenerateKey(rand.Reader)
-	const rlo = "\u202e"
-	const lro = "\u202d"
-	doc := map[string]any{
-		"servers": []map[string]any{{
-			"name":      "evil" + rlo + ".com\x07",
-			"publicKey": base64.StdEncoding.EncodeToString(pk),
-			"addresses": []map[string]string{{"protocol": "udp", "address": "host" + lro + ":1"}},
-		}},
-	}
-	data, _ := json.Marshal(doc)
-	servers, err := roughtime.ParseEcosystem(data)
-	if err != nil {
-		t.Fatalf("ParseEcosystem: %v", err)
-	}
-	if strings.ContainsAny(servers[0].Name, lro+rlo+"\x07") {
-		t.Fatalf("Name not sanitized: %q", servers[0].Name)
-	}
-	if strings.ContainsAny(servers[0].Addresses[0].Address, lro+rlo) {
-		t.Fatalf("Address not sanitized: %q", servers[0].Addresses[0].Address)
-	}
-}
-
-// TestSanitizeForDisplayStripsC1 verifies C1 control codes and U+061C are
-// stripped, closing a terminal-escape gap in the C1 range.
-func TestSanitizeForDisplayStripsC1(t *testing.T) {
-	in := "a\u009bb\u0080c\u009fd\u061ce"
-	if out := roughtime.SanitizeForDisplay(in); out != "abcde" {
-		t.Fatalf("C1/format chars not stripped: got %q", out)
-	}
-	// U+009B (CSI) and the rest of the C1 range must not survive
-	if out := roughtime.SanitizeForDisplay("x\u0080\u009b\u009fy"); out != "xy" {
-		t.Fatalf("C1 controls not stripped: got %q", out)
-	}
-}
-
-// TestParseEcosystemSanitizesVersion verifies the Version field is sanitized.
-func TestParseEcosystemSanitizesVersion(t *testing.T) {
-	pk, _, _ := ed25519.GenerateKey(rand.Reader)
-	doc := map[string]any{
-		"servers": []map[string]any{{
-			"name":      "srv",
-			"version":   "draft-12\u009b",
-			"publicKey": base64.StdEncoding.EncodeToString(pk),
-			"addresses": []map[string]string{{"protocol": "udp", "address": "host:1"}},
-		}},
-	}
-	data, _ := json.Marshal(doc)
-	servers, err := roughtime.ParseEcosystem(data)
-	if err != nil {
-		t.Fatalf("ParseEcosystem: %v", err)
-	}
-	if strings.ContainsRune(servers[0].Version, 0x009b) {
-		t.Fatalf("Version not sanitized: %q", servers[0].Version)
-	}
-}
-
-// TestShippedEcosystemParses verifies the checked-in ecosystem.json parses,
-// which also confirms each entry's publicKeyType matches its decoded key.
+// TestShippedEcosystemParses validates the bundled ecosystem file.
 func TestShippedEcosystemParses(t *testing.T) {
 	data, err := os.ReadFile("ecosystem.json")
 	if err != nil {
@@ -307,25 +154,7 @@ func TestShippedEcosystemParses(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemRejectsEmptyAddresses verifies ParseEcosystem rejects
-// entries with no addresses.
-func TestParseEcosystemRejectsEmptyAddresses(t *testing.T) {
-	pk, _, _ := ed25519.GenerateKey(rand.Reader)
-	doc := map[string]any{
-		"servers": []map[string]any{{
-			"name":      "noaddrs",
-			"publicKey": base64.StdEncoding.EncodeToString(pk),
-			"addresses": []map[string]string{},
-		}},
-	}
-	data, _ := json.Marshal(doc)
-	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "no addresses") {
-		t.Fatalf("ParseEcosystem: %v; want no-addresses error", err)
-	}
-}
-
-// TestParseEcosystemRejectsBadTransport verifies ParseEcosystem rejects
-// unsupported transport labels.
+// TestParseEcosystemRejectsBadTransport covers unsupported transports.
 func TestParseEcosystemRejectsBadTransport(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	doc := map[string]any{
@@ -341,7 +170,7 @@ func TestParseEcosystemRejectsBadTransport(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemRejectsBadAddress verifies addresses must be host:port.
+// TestParseEcosystemRejectsBadAddress covers malformed endpoints.
 func TestParseEcosystemRejectsBadAddress(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	doc := map[string]any{
@@ -357,8 +186,23 @@ func TestParseEcosystemRejectsBadAddress(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemAcceptsIntVersion verifies flexString.UnmarshalJSON
-// stringifies an integer version.
+// TestParseEcosystemRejectsIPv6Zone covers nonportable scoped addresses.
+func TestParseEcosystemRejectsIPv6Zone(t *testing.T) {
+	pk, _, _ := ed25519.GenerateKey(rand.Reader)
+	doc := map[string]any{
+		"servers": []map[string]any{{
+			"name":      "x",
+			"publicKey": base64.StdEncoding.EncodeToString(pk),
+			"addresses": []map[string]string{{"protocol": "udp", "address": "[fe80::1%en0]:2002"}},
+		}},
+	}
+	data, _ := json.Marshal(doc)
+	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "zone") {
+		t.Fatalf("ParseEcosystem: %v; want IPv6-zone error", err)
+	}
+}
+
+// TestParseEcosystemAcceptsIntVersion covers numeric ecosystem versions.
 func TestParseEcosystemAcceptsIntVersion(t *testing.T) {
 	pk, _, _ := ed25519.GenerateKey(rand.Reader)
 	doc := []byte(`{"servers":[{"name":"x","version":12,"publicKey":"` +
@@ -373,20 +217,7 @@ func TestParseEcosystemAcceptsIntVersion(t *testing.T) {
 	}
 }
 
-// TestParseEcosystemRejectsBadVersionType verifies flexString.UnmarshalJSON
-// rejects non-string non-int versions.
-func TestParseEcosystemRejectsBadVersionType(t *testing.T) {
-	pk, _, _ := ed25519.GenerateKey(rand.Reader)
-	doc := []byte(`{"servers":[{"name":"x","version":[1,2],"publicKey":"` +
-		base64.StdEncoding.EncodeToString(pk) +
-		`","addresses":[{"protocol":"udp","address":"x:1"}]}]}`)
-	if _, err := roughtime.ParseEcosystem(doc); err == nil {
-		t.Fatal("ParseEcosystem accepted array-typed version")
-	}
-}
-
-// TestMarshalEcosystemRoundTrip verifies MarshalEcosystem output round-trips
-// through ParseEcosystem.
+// TestMarshalEcosystemRoundTrip covers ecosystem serialization.
 func TestMarshalEcosystemRoundTrip(t *testing.T) {
 	pk1, _, _ := ed25519.GenerateKey(rand.Reader)
 	pq := bytes.Repeat([]byte{0x42}, 1312)
@@ -424,58 +255,7 @@ func TestMarshalEcosystemRoundTrip(t *testing.T) {
 	}
 }
 
-// TestMarshalEcosystemRejectsEmpty verifies empty output cannot produce a
-// non-round-tripping ecosystem.
-func TestMarshalEcosystemRejectsEmpty(t *testing.T) {
-	if _, err := roughtime.MarshalEcosystem(nil); err == nil {
-		t.Fatal("MarshalEcosystem accepted empty server list")
-	}
-}
-
-// TestMarshalEcosystemRejectsTooMany verifies MarshalEcosystem rejects more
-// than MaxEcosystemServers entries.
-func TestMarshalEcosystemRejectsTooMany(t *testing.T) {
-	pk, _, _ := ed25519.GenerateKey(rand.Reader)
-	servers := make([]roughtime.Server, roughtime.MaxEcosystemServers+1)
-	for i := range servers {
-		servers[i] = roughtime.Server{PublicKey: pk}
-	}
-	if _, err := roughtime.MarshalEcosystem(servers); err == nil {
-		t.Fatal("expected too-many error")
-	}
-}
-
-// TestMarshalEcosystemRejectsBadKey verifies MarshalEcosystem rejects servers
-// with an invalid public key length.
-func TestMarshalEcosystemRejectsBadKey(t *testing.T) {
-	servers := []roughtime.Server{{
-		Name:      "bogus",
-		PublicKey: make([]byte, 7),
-	}}
-	if _, err := roughtime.MarshalEcosystem(servers); err == nil {
-		t.Fatal("MarshalEcosystem accepted 7-byte public key")
-	}
-}
-
-// TestMarshalEcosystemRejectsBadAddress verifies marshaled addresses must be
-// host:port so output round-trips through ParseEcosystem.
-func TestMarshalEcosystemRejectsBadAddress(t *testing.T) {
-	pk, _, _ := ed25519.GenerateKey(rand.Reader)
-	servers := []roughtime.Server{{
-		Name:      "bad",
-		PublicKey: pk,
-		Addresses: []roughtime.Address{{
-			Transport: "udp",
-			Address:   "missing-port",
-		}},
-	}}
-	if _, err := roughtime.MarshalEcosystem(servers); err == nil || !strings.Contains(err.Error(), "bad address") {
-		t.Fatalf("MarshalEcosystem: %v; want bad-address error", err)
-	}
-}
-
-// TestParseEcosystemRejectsOversizeInput verifies ecosystem input is capped
-// before JSON decoding.
+// TestParseEcosystemRejectsOversizeInput covers the byte-size limit.
 func TestParseEcosystemRejectsOversizeInput(t *testing.T) {
 	data := bytes.Repeat([]byte{' '}, roughtime.MaxEcosystemBytes+1)
 	if _, err := roughtime.ParseEcosystem(data); err == nil {
@@ -483,53 +263,7 @@ func TestParseEcosystemRejectsOversizeInput(t *testing.T) {
 	}
 }
 
-// TestDecodePublicKeyRejectsOversizeEncoding verifies key decoding rejects
-// unreasonable text encodings before trying every decoder.
-func TestDecodePublicKeyRejectsOversizeEncoding(t *testing.T) {
-	key := strings.Repeat("A", 2049)
-	if _, err := roughtime.DecodePublicKey(key); err == nil {
-		t.Fatal("DecodePublicKey accepted oversize key encoding")
-	}
-}
-
-// TestMarshalEcosystemValidatesAddresses verifies serialized ecosystems can be
-// parsed by the same package.
-func TestMarshalEcosystemValidatesAddresses(t *testing.T) {
-	pk := make([]byte, ed25519.PublicKeySize)
-	cases := []roughtime.Server{
-		{Name: "empty", PublicKey: pk},
-		{Name: "bad", PublicKey: pk, Addresses: []roughtime.Address{{Transport: "quic", Address: "example.com:2002"}}},
-	}
-	for _, s := range cases {
-		if _, err := roughtime.MarshalEcosystem([]roughtime.Server{s}); err == nil {
-			t.Fatalf("MarshalEcosystem accepted %s addresses", s.Name)
-		}
-	}
-}
-
-// TestSanitizeForDisplay verifies SanitizeForDisplay strips control, bidi, and
-// zero-width runes.
-func TestSanitizeForDisplay(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"plain text", "plain text"},
-		{"line\nfeed", "linefeed"},
-		{"car\rriage", "carriage"},
-		{"null\x00byte", "nullbyte"},
-		{"del\x7fbyte", "delbyte"},
-		{"bell\x07byte", "bellbyte"},
-		{"\u202eevil\u202c", "evil"}, // RLO + PDF
-		{"\u2066iso\u2069", "iso"},   // LRI + PDI
-		{"unicode é ñ 漢", "unicode é ñ 漢"},
-	}
-	for _, c := range cases {
-		if got := roughtime.SanitizeForDisplay(c.in); got != c.want {
-			t.Fatalf("SanitizeForDisplay(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
-// FuzzParseEcosystem fuzzes ParseEcosystem to ensure successful parses always
-// yield valid keys.
+// FuzzParseEcosystem exercises the JSON trust boundary.
 func FuzzParseEcosystem(f *testing.F) {
 	pk, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

@@ -9,10 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math"
 	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,362 +18,98 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
-// dropReason is the "reason" label value for requests_dropped_total.
-type dropReason string
+// dropReason classifies why a request was discarded.
+type dropReason uint8
 
-// Drop reasons. UDP cannot produce framing/read, TCP cannot produce undersize.
-// Everything else applies to both transports.
+// Drop-reason constants index [dropCounters].
 const (
-	// dropFraming is a TCP header magic, length, or parse failure.
-	dropFraming dropReason = "framing"
-	// dropRead is a TCP body short-read or read timeout.
-	dropRead dropReason = "read"
-	// dropOversize is a packet whose declared body length exceeds the cap.
-	dropOversize dropReason = "oversize"
-	// dropUndersize is a UDP packet shorter than minRequestSize.
-	dropUndersize dropReason = "undersize"
-	// dropParse is a request body parse failure.
-	dropParse dropReason = "parse"
-	// dropVersion is a version negotiation failure.
-	dropVersion dropReason = "version"
-	// dropConfig is a TCP route mismatch: negotiated scheme not configured.
-	dropConfig dropReason = "config"
-	// dropSRV is an SRV tag that does not address a configured root key.
-	dropSRV dropReason = "srv"
-	// dropQueue is a batcher queue saturation past the submit wait.
-	dropQueue dropReason = "queue"
-	// dropBatchErr is a batch-level signing or oversize-reply failure.
-	dropBatchErr dropReason = "batch_err"
-	// dropWrite is a failed socket write of a fully signed reply.
-	dropWrite dropReason = "write"
+	// dropFraming indicates invalid TCP framing.
+	dropFraming dropReason = iota
+	// dropRead indicates a transport read failure.
+	dropRead
+	// dropOversize indicates an oversized request.
+	dropOversize
+	// dropUndersize indicates an undersized UDP request.
+	dropUndersize
+	// dropParse indicates an invalid protocol message.
+	dropParse
+	// dropVersion indicates failed version negotiation.
+	dropVersion
+	// dropConfig indicates unavailable scheme configuration.
+	dropConfig
+	// dropSRV indicates a server-binding mismatch.
+	dropSRV
+	// dropQueue indicates queue backpressure.
+	dropQueue
+	// dropBatchErr indicates reply-creation failure.
+	dropBatchErr
+	// dropWrite indicates a transport write failure.
+	dropWrite
+	// dropReasonCount is the number of counted reasons.
+	dropReasonCount
+	// dropNone is the success sentinel.
+	dropNone = dropReasonCount
 )
 
-// counter is a labeled monotonic counter. Series are registered at init and the
-// slice is read-only thereafter.
-type counter struct {
-	// name is the metric name.
-	name string
-	// help renders in the # HELP line.
-	help string
-	// labelNames is the order register expects values.
-	labelNames []string
-	// series holds one entry per registered label tuple.
-	series []*counterSeries
+// dropNames maps counted reasons to metric labels.
+var dropNames = [...]string{
+	"framing", "read", "oversize", "undersize", "parse", "version",
+	"config", "srv", "queue", "batch_err", "write",
 }
 
-// counterSeries is one (label-tuple, value) sample.
-type counterSeries struct {
-	// labelValues align with the parent counter's labelNames.
-	labelValues []string
-	// val is the per-series counter.
-	val atomic.Uint64
-}
-
-// newCounter constructs a counter. Labels may be empty for an un-labeled one.
-func newCounter(name, help string, labels ...string) *counter {
-	return &counter{name: name, help: help, labelNames: labels}
-}
-
-// (counter) register reserves a series and returns its atomic counter. Must be
-// called from init.
-func (c *counter) register(values ...string) *atomic.Uint64 {
-	if len(values) != len(c.labelNames) {
-		panic(fmt.Sprintf("metrics: counter %s expects %d label values, got %d", c.name, len(c.labelNames), len(values)))
-	}
-	s := &counterSeries{labelValues: append([]string(nil), values...)}
-	c.series = append(c.series, s)
-	return &s.val
-}
-
-// (counter) total sums every series.
-func (c *counter) total() uint64 {
-	var n uint64
-	for _, s := range c.series {
-		n += s.val.Load()
-	}
-	return n
-}
-
-// (counter) reset zeroes every series, for tests.
-func (c *counter) reset() {
-	for _, s := range c.series {
-		s.val.Store(0)
-	}
-}
-
-// (counter) writeTo renders the counter in text exposition format.
-func (c *counter) writeTo(w io.Writer) {
-	writeHelpType(w, c.name, "counter", c.help)
-	for _, s := range c.series {
-		writeSample(w, c.name, c.labelNames, s.labelValues, float64(s.val.Load()))
-	}
-}
-
-// gauge is a labeled gauge holding float64 values via the IEEE-754 bit pattern
-// in an atomic.Uint64.
-type gauge struct {
-	name       string
-	help       string
-	labelNames []string
-	series     []*gaugeSeries
-}
-
-// gaugeSeries is one (label-tuple, value) sample. Un-Set series are skipped at
-// scrape time so an unconfigured scheme doesn't render a default-zero sample.
-type gaugeSeries struct {
-	labelValues []string
-	bits        atomic.Uint64
-	set         atomic.Bool
-}
-
-// (gaugeSeries) Set publishes v.
-func (s *gaugeSeries) Set(v float64) {
-	s.bits.Store(math.Float64bits(v))
-	s.set.Store(true)
-}
-
-// (gaugeSeries) Load returns the current value and whether it has been Set.
-func (s *gaugeSeries) Load() (float64, bool) {
-	if !s.set.Load() {
-		return 0, false
-	}
-	return math.Float64frombits(s.bits.Load()), true
-}
-
-// newGauge constructs a gauge.
-func newGauge(name, help string, labels ...string) *gauge {
-	return &gauge{name: name, help: help, labelNames: labels}
-}
-
-// (gauge) register reserves a series. Must be called from init.
-func (g *gauge) register(values ...string) *gaugeSeries {
-	if len(values) != len(g.labelNames) {
-		panic(fmt.Sprintf("metrics: gauge %s expects %d label values, got %d", g.name, len(g.labelNames), len(values)))
-	}
-	s := &gaugeSeries{labelValues: append([]string(nil), values...)}
-	g.series = append(g.series, s)
-	return s
-}
-
-// (gauge) writeTo renders every Set series. Never-Set series are skipped.
-func (g *gauge) writeTo(w io.Writer) {
-	writeHelpType(w, g.name, "gauge", g.help)
-	for _, s := range g.series {
-		if v, ok := s.Load(); ok {
-			writeSample(w, g.name, g.labelNames, s.labelValues, v)
-		}
-	}
-}
-
-// infoGauge always reports 1. The signal is in label values, which may rotate
-// at runtime. Multiple series per metric are supported.
-type infoGauge struct {
-	name       string
-	help       string
-	labelNames []string
-	series     []*infoSeries
-}
-
-// infoSeries is one series within an infoGauge with its own label snapshot.
-type infoSeries struct {
-	// parent enables label-count validation in Set.
-	parent *infoGauge
-	// state is the current label-value snapshot, nil before Set is called.
-	state atomic.Pointer[[]string]
-}
-
-// newInfoGauge constructs an infoGauge.
-func newInfoGauge(name, help string, labels ...string) *infoGauge {
-	return &infoGauge{name: name, help: help, labelNames: labels}
-}
-
-// (infoGauge) register reserves a series. Must be called from init.
-func (g *infoGauge) register() *infoSeries {
-	s := &infoSeries{parent: g}
-	g.series = append(g.series, s)
-	return s
-}
-
-// (infoSeries) Set publishes label values atomically. values is copied so the
-// caller may mutate it.
-func (s *infoSeries) Set(values ...string) {
-	if len(values) != len(s.parent.labelNames) {
-		panic(fmt.Sprintf("metrics: infoGauge %s expects %d label values, got %d", s.parent.name, len(s.parent.labelNames), len(values)))
-	}
-	cp := append([]string(nil), values...)
-	s.state.Store(&cp)
-}
-
-// (infoGauge) writeTo renders every Set series. Never-Set series are skipped.
-func (g *infoGauge) writeTo(w io.Writer) {
-	writeHelpType(w, g.name, "gauge", g.help)
-	for _, s := range g.series {
-		if vals := s.state.Load(); vals != nil {
-			writeSample(w, g.name, g.labelNames, *vals, 1)
-		}
-	}
-}
-
-// counterFn is an un-labeled counter sampled from fn at scrape time, so the
-// existing atomic.Uint64 counters can be exposed without duplicating state.
-type counterFn struct {
-	name string
-	help string
-	fn   func() uint64
-}
-
-// newCounterFn constructs a counterFn.
-func newCounterFn(name, help string, fn func() uint64) *counterFn {
-	return &counterFn{name: name, help: help, fn: fn}
-}
-
-// (counterFn) writeTo renders the counter in text exposition format.
-func (c *counterFn) writeTo(w io.Writer) {
-	writeHelpType(w, c.name, "counter", c.help)
-	writeSample(w, c.name, nil, nil, float64(c.fn()))
-}
-
-// exporter is a metric capable of writing its own samples.
-type exporter interface {
-	writeTo(w io.Writer)
-}
-
-// registry is the metrics list rendered by /metrics, populated at init.
-var registry []exporter
-
-// addMetric appends m to the registry. Init-only.
-func addMetric(m exporter) { registry = append(registry, m) }
-
-// Labeled counters. Every valid label tuple is pre-registered in
-// initLabeledSeries, read via a cached pointer (UDP hot path) or the map
-// (cold).
-var (
-	requestsReceived = newCounter(
-		"roughtime_requests_received_total",
-		"Validated requests, by transport and scheme.",
-		"transport", "scheme",
-	)
-	requestsResponded = newCounter(
-		"roughtime_requests_responded_total",
-		"Replies written to the wire, by transport and scheme.",
-		"transport", "scheme",
-	)
-	requestsDropped = newCounter(
-		"roughtime_requests_dropped_total",
-		"Requests dropped before reply, by transport and reason.",
-		"transport", "reason",
-	)
-	certRotations = newCounter(
-		"roughtime_cert_rotations_total",
-		"Online certificate rotations, by scheme.",
-		"scheme",
-	)
-)
-
-// Un-labeled counters sampled from the existing atomic.Uint64s so the source of
-// truth stays at the increment site.
-var (
-	panicsRecovered = newCounterFn(
-		"roughtime_panics_total",
-		"Goroutine panics recovered.",
-		func() uint64 { return statsPanics.Load() },
-	)
-	ampSuppressed = newCounterFn(
-		"roughtime_udp_amp_suppressed_total",
-		"UDP replies suppressed to prevent amplification.",
-		func() uint64 { return statsAmpDropped.Load() },
-	)
-	tcpAccepted = newCounterFn(
-		"roughtime_tcp_accepted_total",
-		"TCP connections accepted.",
-		func() uint64 { return statsTCPAccepted.Load() },
-	)
-	tcpRejected = newCounterFn(
-		"roughtime_tcp_rejected_total",
-		"TCP connections rejected at the connection cap.",
-		func() uint64 { return statsTCPRejected.Load() },
-	)
-	tcpCompleted = newCounterFn(
-		"roughtime_tcp_completed_total",
-		"TCP request/reply round-trips completed.",
-		func() uint64 { return statsTCPCompleted.Load() },
-	)
-	batches = newCounterFn(
-		"roughtime_batches_total",
-		"Signing batches flushed.",
-		func() uint64 { return statsBatches.Load() },
-	)
-	batchedRequests = newCounterFn(
-		"roughtime_batched_reqs_total",
-		"Requests included in flushed batches.",
-		func() uint64 { return statsBatchedReqs.Load() },
-	)
-	batchErrors = newCounterFn(
-		"roughtime_batch_errs_total",
-		"Batches that failed to sign.",
-		func() uint64 { return statsBatchErrs.Load() },
-	)
-)
-
-// Gauges and info gauges.
-var (
-	certExpiry = newGauge(
-		"roughtime_cert_expiry_timestamp_seconds",
-		"Unix time when the active certificate expires, by scheme.",
-		"scheme",
-	)
-	certProvisioned = newGauge(
-		"roughtime_cert_provisioned_timestamp_seconds",
-		"Unix time when the active certificate was last provisioned, by scheme.",
-		"scheme",
-	)
-	buildInfo = newInfoGauge(
-		"roughtime_build_info",
-		"Build metadata.",
-		"version", "go_version",
-	)
-	certInfo = newInfoGauge(
-		"roughtime_cert_info",
-		"Active certificate metadata, by scheme.",
-		"scheme", "online_pubkey", "root_pubkey",
-	)
-)
-
-// schemeCertMetrics bundles the per-scheme cert lifecycle series.
-type schemeCertMetrics struct {
-	rotations   *atomic.Uint64
-	expiry      *gaugeSeries
-	provisioned *gaugeSeries
-	info        *infoSeries
-}
-
-// Pre-registered series pointers used directly by increment-site helpers. The
-// stored *atomic.Uint64 avoids a per-event map lookup on the hot path.
-var (
-	// receivedSeries[transport][scheme] = atomic counter pointer.
-	receivedSeries map[string]map[string]*atomic.Uint64
-	// respondedSeries[transport][scheme] = atomic counter pointer.
-	respondedSeries map[string]map[string]*atomic.Uint64
-	droppedSeries   map[string]map[dropReason]*atomic.Uint64
-	// udpReceivedEd and udpRespondedEd are the per-datagram UDP series (UDP is
-	// Ed25519-only), cached to skip the nested-map lookup on every packet.
-	udpReceivedEd  *atomic.Uint64
-	udpRespondedEd *atomic.Uint64
-	// certMetricsByScheme[scheme] holds rotations/expiry/provisioned/info
-	// series for that scheme.
-	certMetricsByScheme map[string]*schemeCertMetrics
-	buildInfoSeries     *infoSeries
-)
-
-// Label constants. Bare strings would invite typos at increment sites.
+// Metric label values.
 const (
+	// schemeEd25519 is the Ed25519 label.
 	schemeEd25519 = "ed25519"
+	// schemeMLDSA44 is the ML-DSA-44 label.
 	schemeMLDSA44 = "mldsa44"
-	transportUDP  = "udp"
-	transportTCP  = "tcp"
+	// transportUDP is the UDP label.
+	transportUDP = "udp"
+	// transportTCP is the TCP label.
+	transportTCP = "tcp"
 )
 
-// schemeForVersion maps a wire version to its scheme label.
+// requestCounters stores totals for supported transport/scheme pairs.
+type requestCounters struct {
+	udpEd, tcpEd, tcpPQ atomic.Uint64
+}
+
+// total returns the aggregate count.
+func (c *requestCounters) total() uint64 {
+	return c.udpEd.Load() + c.tcpEd.Load() + c.tcpPQ.Load()
+}
+
+// dropCounters stores totals by transport and reason.
+type dropCounters struct {
+	udp [dropReasonCount]atomic.Uint64
+	tcp [dropReasonCount]atomic.Uint64
+}
+
+// total returns all classified drops.
+func (c *dropCounters) total() uint64 {
+	var total uint64
+	for i := range dropReasonCount {
+		total += c.udp[i].Load() + c.tcp[i].Load()
+	}
+	return total
+}
+
+var (
+	// requestsReceived counts validated requests.
+	requestsReceived requestCounters
+	// requestsResponded counts replies written successfully.
+	requestsResponded requestCounters
+	// requestsDropped counts classified drops.
+	requestsDropped dropCounters
+	// udpReceivedEd aliases the hot-path UDP Ed25519 receive counter.
+	udpReceivedEd = &requestsReceived.udpEd
+	// udpRespondedEd aliases the hot-path UDP Ed25519 response counter.
+	udpRespondedEd = &requestsResponded.udpEd
+	// statsWorkerExits counts unexpected UDP worker exits.
+	statsWorkerExits atomic.Uint64
+)
+
+// schemeForVersion returns a version's signing-scheme label.
 func schemeForVersion(v protocol.Version) string {
 	if v == protocol.VersionMLDSA44 {
 		return schemeMLDSA44
@@ -384,212 +117,196 @@ func schemeForVersion(v protocol.Version) string {
 	return schemeEd25519
 }
 
-// init wires every metric into the registry and pre-registers each valid label
-// tuple. Build info is set here. Other gauges are populated by serve.
-func init() {
-	addMetric(requestsReceived)
-	addMetric(requestsResponded)
-	addMetric(requestsDropped)
-	addMetric(certRotations)
-	addMetric(panicsRecovered)
-	addMetric(ampSuppressed)
-	addMetric(tcpAccepted)
-	addMetric(tcpRejected)
-	addMetric(tcpCompleted)
-	addMetric(batches)
-	addMetric(batchedRequests)
-	addMetric(batchErrors)
-	addMetric(certExpiry)
-	addMetric(certProvisioned)
-	addMetric(buildInfo)
-	addMetric(certInfo)
-
-	initLabeledSeries()
-
-	buildInfoSeries.Set(version.Version, runtime.Version())
+// requestCounter returns the counter for a supported transport/scheme pair.
+func requestCounter(c *requestCounters, transport, scheme string) *atomic.Uint64 {
+	switch {
+	case transport == transportUDP && scheme == schemeEd25519:
+		return &c.udpEd
+	case transport == transportTCP && scheme == schemeEd25519:
+		return &c.tcpEd
+	case transport == transportTCP && scheme == schemeMLDSA44:
+		return &c.tcpPQ
+	default:
+		return nil
+	}
 }
 
-// initLabeledSeries pre-registers an atomic for every valid label tuple.
-func initLabeledSeries() {
-	// UDP carries Ed25519 only. ML-DSA-44 is TCP-exclusive.
-	receivedSeries = map[string]map[string]*atomic.Uint64{
-		transportUDP: {
-			schemeEd25519: requestsReceived.register(transportUDP, schemeEd25519),
-		},
-		transportTCP: {
-			schemeEd25519: requestsReceived.register(transportTCP, schemeEd25519),
-			schemeMLDSA44: requestsReceived.register(transportTCP, schemeMLDSA44),
-		},
-	}
-	respondedSeries = map[string]map[string]*atomic.Uint64{
-		transportUDP: {
-			schemeEd25519: requestsResponded.register(transportUDP, schemeEd25519),
-		},
-		transportTCP: {
-			schemeEd25519: requestsResponded.register(transportTCP, schemeEd25519),
-			schemeMLDSA44: requestsResponded.register(transportTCP, schemeMLDSA44),
-		},
-	}
-	udpReceivedEd = receivedSeries[transportUDP][schemeEd25519]
-	udpRespondedEd = respondedSeries[transportUDP][schemeEd25519]
-
-	// UDP can't produce framing/read (TCP-only) or oversize (kernel truncates),
-	// and TCP can't produce undersize. udpHasQueue gates dropQueue
-	// per-platform.
-	udpReasons := []dropReason{dropUndersize, dropParse, dropVersion, dropSRV, dropBatchErr, dropWrite}
-	if udpHasQueue {
-		udpReasons = append(udpReasons, dropQueue)
-	}
-	tcpReasons := []dropReason{dropFraming, dropRead, dropOversize, dropParse, dropVersion, dropConfig, dropSRV, dropQueue, dropBatchErr, dropWrite}
-	droppedSeries = map[string]map[dropReason]*atomic.Uint64{
-		transportUDP: {},
-		transportTCP: {},
-	}
-	for _, r := range udpReasons {
-		droppedSeries[transportUDP][r] = requestsDropped.register(transportUDP, string(r))
-	}
-	for _, r := range tcpReasons {
-		droppedSeries[transportTCP][r] = requestsDropped.register(transportTCP, string(r))
-	}
-
-	certMetricsByScheme = map[string]*schemeCertMetrics{}
-	for _, scheme := range []string{schemeEd25519, schemeMLDSA44} {
-		certMetricsByScheme[scheme] = &schemeCertMetrics{
-			rotations:   certRotations.register(scheme),
-			expiry:      certExpiry.register(scheme),
-			provisioned: certProvisioned.register(scheme),
-			info:        certInfo.register(),
-		}
-	}
-	buildInfoSeries = buildInfo.register()
-}
-
-// incReceived bumps requests_received_total by one.
+// incReceived records one validated request.
 func incReceived(transport, scheme string) {
-	if c := receivedSeries[transport][scheme]; c != nil {
-		c.Add(1)
+	if counter := requestCounter(&requestsReceived, transport, scheme); counter != nil {
+		counter.Add(1)
 	}
 }
 
-// incResponded bumps requests_responded_total by n.
+// incResponded records successfully written replies.
 func incResponded(transport, scheme string, n uint64) {
-	if c := respondedSeries[transport][scheme]; c != nil {
-		c.Add(n)
+	if counter := requestCounter(&requestsResponded, transport, scheme); counter != nil {
+		counter.Add(n)
 	}
 }
 
-// incDropped bumps requests_dropped_total by one.
+// dropCounter returns the counter for a valid transport/reason pair.
+func dropCounter(transport string, reason dropReason) *atomic.Uint64 {
+	if reason >= dropReasonCount {
+		return nil
+	}
+	if transport == transportTCP {
+		return &requestsDropped.tcp[reason]
+	}
+	if transport == transportUDP {
+		return &requestsDropped.udp[reason]
+	}
+	return nil
+}
+
+// incDropped records one classified request drop.
 func incDropped(transport string, reason dropReason) {
-	if c := droppedSeries[transport][reason]; c != nil {
-		c.Add(1)
+	if counter := dropCounter(transport, reason); counter != nil {
+		counter.Add(1)
 	}
 }
 
-// droppedFor returns requests_dropped_total for one (transport, reason), used
-// by shutdown logs that surface per-reason totals.
+// droppedFor returns the count for a transport/reason pair.
 func droppedFor(transport string, reason dropReason) uint64 {
-	if c := droppedSeries[transport][reason]; c != nil {
-		return c.Load()
+	if counter := dropCounter(transport, reason); counter != nil {
+		return counter.Load()
 	}
 	return 0
 }
 
-// certMetricsFor returns the cert lifecycle series for scheme. It panics on
-// unknown so a refactor mistake fails fast.
-func certMetricsFor(scheme string) *schemeCertMetrics {
-	sm, ok := certMetricsByScheme[scheme]
-	if !ok {
-		panic(fmt.Sprintf("metrics: unknown scheme %q", scheme))
+// certMetric stores certificate metrics for one scheme.
+type certMetric struct {
+	rotations atomic.Uint64
+	state     atomic.Pointer[certMetricState]
+}
+
+// certMetricState is an immutable certificate metadata snapshot.
+type certMetricState struct {
+	onlinePK, rootPK string
+	expiry           int64
+	provisioned      int64
+}
+
+// certMetrics stores certificate metrics by signing scheme.
+var certMetrics = map[string]*certMetric{
+	schemeEd25519: {},
+	schemeMLDSA44: {},
+}
+
+// noteCertProvisioned publishes active certificate metadata.
+func noteCertProvisioned(scheme string, onlinePK, rootPK []byte, expiry, provisioned time.Time) {
+	if metric := certMetrics[scheme]; metric != nil {
+		metric.state.Store(&certMetricState{
+			onlinePK: hex.EncodeToString(onlinePK), rootPK: hex.EncodeToString(rootPK),
+			expiry: expiry.Unix(), provisioned: provisioned.Unix(),
+		})
 	}
-	return sm
 }
 
-// noteCertProvisioned publishes the post-provision metric snapshot for scheme.
-func noteCertProvisioned(scheme string, onlinePK, rootPK []byte, expiry, provisionedAt time.Time) {
-	sm := certMetricsFor(scheme)
-	sm.info.Set(scheme, hex.EncodeToString(onlinePK), hex.EncodeToString(rootPK))
-	sm.expiry.Set(float64(expiry.Unix()))
-	sm.provisioned.Set(float64(provisionedAt.Unix()))
-}
-
-// noteCertRotation bumps cert_rotations_total for scheme.
+// noteCertRotation records one online-certificate rotation.
 func noteCertRotation(scheme string) {
-	certMetricsFor(scheme).rotations.Add(1)
+	if metric := certMetrics[scheme]; metric != nil {
+		metric.rotations.Add(1)
+	}
 }
 
-// writeRegistry renders every registered metric to w.
+// writeRegistry writes the complete Prometheus registry.
 func writeRegistry(w io.Writer) {
-	for _, m := range registry {
-		m.writeTo(w)
+	writeMeta(w, "roughtime_requests_received_total", "counter", "Validated requests, by transport and scheme.")
+	writeRequestSamples(w, "roughtime_requests_received_total", &requestsReceived)
+	writeMeta(w, "roughtime_requests_responded_total", "counter", "Replies written to the wire, by transport and scheme.")
+	writeRequestSamples(w, "roughtime_requests_responded_total", &requestsResponded)
+
+	writeMeta(w, "roughtime_requests_dropped_total", "counter", "Classified request drops, by transport and reason.")
+	udpReasons := []dropReason{dropUndersize, dropOversize, dropParse, dropVersion, dropSRV, dropBatchErr, dropWrite}
+	if udpHasQueue {
+		udpReasons = append(udpReasons, dropQueue)
 	}
-}
+	for _, reason := range udpReasons {
+		writeUint(w, "roughtime_requests_dropped_total", fmt.Sprintf(`transport="udp",reason="%s"`, dropNames[reason]), requestsDropped.udp[reason].Load())
+	}
+	for _, reason := range []dropReason{dropFraming, dropRead, dropOversize, dropParse, dropVersion, dropConfig, dropSRV, dropQueue, dropBatchErr, dropWrite} {
+		writeUint(w, "roughtime_requests_dropped_total", fmt.Sprintf(`transport="tcp",reason="%s"`, dropNames[reason]), requestsDropped.tcp[reason].Load())
+	}
 
-// writeHelpType emits the # HELP and # TYPE banner.
-func writeHelpType(w io.Writer, name, kind, help string) {
-	_, _ = io.WriteString(w, "# HELP ")
-	_, _ = io.WriteString(w, name)
-	_, _ = io.WriteString(w, " ")
-	_, _ = io.WriteString(w, escapeHelp(help))
-	_, _ = io.WriteString(w, "\n# TYPE ")
-	_, _ = io.WriteString(w, name)
-	_, _ = io.WriteString(w, " ")
-	_, _ = io.WriteString(w, kind)
-	_, _ = io.WriteString(w, "\n")
-}
+	writeMeta(w, "roughtime_cert_rotations_total", "counter", "Online certificate rotations, by scheme.")
+	for _, scheme := range []string{schemeEd25519, schemeMLDSA44} {
+		writeUint(w, "roughtime_cert_rotations_total", `scheme="`+scheme+`"`, certMetrics[scheme].rotations.Load())
+	}
+	writePlainCounters(w)
 
-// writeSample emits one sample. Nil or empty labels produce an un-labeled
-// sample. Labels render in alphabetical key order for deterministic output.
-func writeSample(w io.Writer, name string, labelNames, labelValues []string, value float64) {
-	_, _ = io.WriteString(w, name)
-	if len(labelNames) > 0 {
-		_, _ = io.WriteString(w, "{")
-		idx := make([]int, len(labelNames))
-		for i := range idx {
-			idx[i] = i
+	writeMeta(w, "roughtime_cert_expiry_timestamp_seconds", "gauge", "Unix time when the active certificate expires, by scheme.")
+	for _, scheme := range []string{schemeEd25519, schemeMLDSA44} {
+		if state := certMetrics[scheme].state.Load(); state != nil {
+			writeInt(w, "roughtime_cert_expiry_timestamp_seconds", `scheme="`+scheme+`"`, state.expiry)
 		}
-		sort.SliceStable(idx, func(i, j int) bool { return labelNames[idx[i]] < labelNames[idx[j]] })
-		for i, k := range idx {
-			if i > 0 {
-				_, _ = io.WriteString(w, ",")
-			}
-			_, _ = io.WriteString(w, labelNames[k])
-			_, _ = io.WriteString(w, `="`)
-			_, _ = io.WriteString(w, escapeLabel(labelValues[k]))
-			_, _ = io.WriteString(w, `"`)
+	}
+	writeMeta(w, "roughtime_cert_provisioned_timestamp_seconds", "gauge", "Unix time when the active certificate was last provisioned, by scheme.")
+	for _, scheme := range []string{schemeEd25519, schemeMLDSA44} {
+		if state := certMetrics[scheme].state.Load(); state != nil {
+			writeInt(w, "roughtime_cert_provisioned_timestamp_seconds", `scheme="`+scheme+`"`, state.provisioned)
 		}
-		_, _ = io.WriteString(w, "}")
 	}
-	_, _ = io.WriteString(w, " ")
-	_, _ = io.WriteString(w, formatValue(value))
-	_, _ = io.WriteString(w, "\n")
+
+	writeMeta(w, "roughtime_build_info", "gauge", "Build metadata.")
+	_, _ = fmt.Fprintf(w, "roughtime_build_info{version=\"%s\",go_version=\"%s\"} 1\n", escapeLabel(version.Version), escapeLabel(runtime.Version()))
+	writeMeta(w, "roughtime_cert_info", "gauge", "Active certificate metadata, by scheme.")
+	for _, scheme := range []string{schemeEd25519, schemeMLDSA44} {
+		if state := certMetrics[scheme].state.Load(); state != nil {
+			_, _ = fmt.Fprintf(w, "roughtime_cert_info{scheme=\"%s\",online_pubkey=\"%s\",root_pubkey=\"%s\"} 1\n", scheme, state.onlinePK, state.rootPK)
+		}
+	}
 }
 
-// formatValue renders v: integers up to 2^53 without a decimal point, others as
-// the shortest round-trippable float.
-func formatValue(v float64) string {
-	if math.IsNaN(v) {
-		return "NaN"
-	}
-	if math.IsInf(v, 1) {
-		return "+Inf"
-	}
-	if math.IsInf(v, -1) {
-		return "-Inf"
-	}
-	if v == math.Trunc(v) && math.Abs(v) < 1<<53 {
-		return strconv.FormatInt(int64(v), 10)
-	}
-	return strconv.FormatFloat(v, 'g', -1, 64)
+// writeRequestSamples writes each supported transport/scheme sample.
+func writeRequestSamples(w io.Writer, name string, counters *requestCounters) {
+	writeUint(w, name, `transport="udp",scheme="ed25519"`, counters.udpEd.Load())
+	writeUint(w, name, `transport="tcp",scheme="ed25519"`, counters.tcpEd.Load())
+	writeUint(w, name, `transport="tcp",scheme="mldsa44"`, counters.tcpPQ.Load())
 }
 
-// escapeHelp escapes \ and newline per the Prometheus text format.
-func escapeHelp(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, "\n", `\n`)
-	return r.Replace(s)
+// writePlainCounters writes server-wide unlabeled counters.
+func writePlainCounters(w io.Writer) {
+	// Each entry describes one unlabeled counter.
+	for _, metric := range []struct {
+		name, help string
+		value      uint64
+	}{
+		{"roughtime_panics_total", "Goroutine panics recovered.", statsPanics.Load()},
+		{"roughtime_udp_amp_suppressed_total", "UDP replies suppressed to prevent amplification.", statsAmpDropped.Load()},
+		{"roughtime_tcp_accepted_total", "TCP connections accepted.", statsTCPAccepted.Load()},
+		{"roughtime_tcp_rejected_total", "TCP connections rejected at the connection cap.", statsTCPRejected.Load()},
+		{"roughtime_tcp_completed_total", "TCP request/reply round-trips completed.", statsTCPCompleted.Load()},
+		{"roughtime_batches_total", "Signing batches completed.", statsBatches.Load()},
+		{"roughtime_batched_reqs_total", "Requests included in completed signing batches.", statsBatchedReqs.Load()},
+		{"roughtime_batch_errs_total", "Batches that could not produce replies.", statsBatchErrs.Load()},
+		{"roughtime_udp_worker_exits_total", "UDP worker goroutines that exited unexpectedly.", statsWorkerExits.Load()},
+	} {
+		writeMeta(w, metric.name, "counter", metric.help)
+		writeUint(w, metric.name, "", metric.value)
+	}
 }
 
-// escapeLabel escapes \, " and newline per the Prometheus text format.
-func escapeLabel(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
-	return r.Replace(s)
+// writeMeta writes Prometheus HELP and TYPE records.
+func writeMeta(w io.Writer, name, kind, help string) {
+	_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+}
+
+// writeUint writes an unsigned metric sample.
+func writeUint(w io.Writer, name, labels string, value uint64) {
+	if labels == "" {
+		_, _ = fmt.Fprintf(w, "%s %d\n", name, value)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "%s{%s} %d\n", name, labels, value)
+}
+
+// writeInt writes a labeled signed metric sample.
+func writeInt(w io.Writer, name, labels string, value int64) {
+	_, _ = fmt.Fprintf(w, "%s{%s} %d\n", name, labels, value)
+}
+
+// escapeLabel escapes a Prometheus label value.
+func escapeLabel(value string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(value)
 }

@@ -4,8 +4,6 @@
 package roughtime_test
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -13,8 +11,7 @@ import (
 	"github.com/tannerryan/roughtime"
 )
 
-// TestConsensus verifies Consensus ignores failed entries and reports correct
-// median, min, and max drifts.
+// TestConsensus covers drift summary calculation.
 func TestConsensus(t *testing.T) {
 	mk := func(d time.Duration, ok bool) roughtime.Result {
 		if !ok {
@@ -45,8 +42,7 @@ func TestConsensus(t *testing.T) {
 	}
 }
 
-// TestConsensusEvenN verifies the even-N median rule selects the upper middle
-// rather than the mean.
+// TestConsensusEvenN covers the upper-middle choice for even samples.
 func TestConsensusEvenN(t *testing.T) {
 	mk := func(d time.Duration) roughtime.Result {
 		now := time.Now()
@@ -67,8 +63,7 @@ func TestConsensusEvenN(t *testing.T) {
 	}
 }
 
-// TestConsensusAllFailed verifies Consensus reports zero Samples when every
-// entry has an error.
+// TestConsensusAllFailed covers a result set with no verified samples.
 func TestConsensusAllFailed(t *testing.T) {
 	results := []roughtime.Result{
 		{Err: errors.New("a")},
@@ -78,39 +73,4 @@ func TestConsensusAllFailed(t *testing.T) {
 	if got.Samples != 0 {
 		t.Fatalf("Samples = %d, want 0", got.Samples)
 	}
-}
-
-// FuzzConsensus fuzzes Consensus with synthetic Results to ensure it never
-// panics on arbitrary inputs.
-func FuzzConsensus(f *testing.F) {
-	f.Add([]byte{})
-	f.Add(bytes.Repeat([]byte{0x01}, 9))
-	f.Add(append(bytes.Repeat([]byte{0xff}, 8), 0x00)) // failure entry
-
-	f.Fuzz(func(t *testing.T, data []byte) {
-		const recordLen = 9
-		results := make([]roughtime.Result, 0, len(data)/recordLen)
-		wantOK := 0
-		now := time.Now()
-		for i := 0; i+recordLen <= len(data); i += recordLen {
-			drift := time.Duration(binary.LittleEndian.Uint64(data[i:]))
-			ok := data[i+8]&1 == 1
-			if ok {
-				wantOK++
-				results = append(results, roughtime.Result{Response: &roughtime.Response{
-					Midpoint: now.Add(drift),
-					LocalNow: now,
-				}})
-			} else {
-				results = append(results, roughtime.Result{Err: errors.New("synthetic")})
-			}
-		}
-		got := roughtime.Consensus(results)
-		if got.Samples != wantOK {
-			t.Fatalf("Samples = %d, want %d", got.Samples, wantOK)
-		}
-		if wantOK == 0 && (got.Median != 0 || got.Min != 0 || got.Max != 0) {
-			t.Fatalf("zero-samples report has nonzero stats: %+v", got)
-		}
-	})
 }

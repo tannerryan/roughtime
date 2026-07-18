@@ -9,6 +9,7 @@ import (
 	"bytes"
 	mrand "math/rand/v2"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
@@ -17,38 +18,27 @@ import (
 
 // validatedRequest is a parsed UDP request ready for batch signing.
 type validatedRequest struct {
-	// req is the parsed Roughtime request body.
-	req protocol.Request
-	// peer is the remote UDP address used for log fields and the reply
-	// destination.
-	peer *net.UDPAddr
-	// requestSize is the on-the-wire size of the original request, used for
-	// amplification clamping.
+	req         protocol.Request
+	peer        *net.UDPAddr
 	requestSize int
-	// bufPtr, when non-nil, must be returned to the pool after signing.
-	bufPtr *[]byte
-	// version is the negotiated wire version for this request.
-	version protocol.Version
+	bufPtr      *[]byte
+	version     protocol.Version
 }
 
 // batchKey groups requests that can share a single signing operation.
 type batchKey struct {
-	// version is the negotiated wire version.
 	version protocol.Version
-	// hasType records whether the requests carry the explicit TYPE tag.
 	hasType bool
 }
 
 // readyReply is a response awaiting send.
 type readyReply struct {
-	// peer is the remote UDP address to send to.
-	peer *net.UDPAddr
-	// bytes is the framed reply payload.
+	peer  *net.UDPAddr
 	bytes []byte
 }
 
 // validateRequest parses a request, validates SRV, and negotiates a version. On
-// failure the dropReason classifies the rejection, empty on success.
+// failure the dropReason classifies the rejection.
 func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, dropReason, bool) {
 	req, err := protocol.ParseRequest(requestBytes)
 	if err != nil {
@@ -81,12 +71,38 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 		requestSize: reqSize,
 		bufPtr:      bufPtr,
 		version:     responseVer,
-	}, "", true
+	}, dropNone, true
 }
 
-// signAndBuildReplies signs a homogeneous batch and returns grease-applied,
-// amplification-filtered replies.
-func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, items []validatedRequest) []readyReply {
+// rejectUDPBatch records a certificate-state failure for every item.
+func rejectUDPBatch(log *zap.Logger, ver protocol.Version, items []validatedRequest, message string) []readyReply {
+	statsBatchErrs.Add(1)
+	for range items {
+		incDropped(transportUDP, dropBatchErr)
+	}
+	log.Warn(message,
+		zap.Stringer("version", ver),
+		zap.Int("batch_size", len(items)),
+	)
+	return nil
+}
+
+// signAndBuildRepliesCurrent signs a homogeneous UDP batch with the currently
+// published certificate.
+func signAndBuildRepliesCurrent(log *zap.Logger, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) []readyReply {
+	st := acquireCurrent(state)
+	if st == nil {
+		return rejectUDPBatch(log, ver, items, "active certificate unavailable before signing")
+	}
+	defer st.release()
+
+	now := wallClockNow()
+	if now.Before(st.notBefore) {
+		return rejectUDPBatch(log, ver, items, "not-yet-valid certificate rejected before signing")
+	}
+	if !now.Before(st.expiry) {
+		return rejectUDPBatch(log, ver, items, "expired certificate rejected before signing")
+	}
 	reqs := make([]protocol.Request, len(items))
 	for i := range items {
 		reqs[i] = items[i].req
@@ -127,14 +143,12 @@ func signAndBuildReplies(log *zap.Logger, st *certState, ver protocol.Version, i
 		// amplification protection: reply MUST NOT exceed request size on UDP
 		if len(reply) > items[i].requestSize {
 			statsAmpDropped.Add(1)
-			if ce := log.Check(zap.WarnLevel, "amplification-blocked response"); ce != nil {
-				ce.Write(
-					zap.Stringer("peer", items[i].peer),
-					zap.Int("request_size", items[i].requestSize),
-					zap.Int("reply_size", len(reply)),
-					zap.Stringer("version", ver),
-				)
-			}
+			log.Warn("amplification-blocked response",
+				zap.Stringer("peer", items[i].peer),
+				zap.Int("request_size", items[i].requestSize),
+				zap.Int("reply_size", len(reply)),
+				zap.Stringer("version", ver),
+			)
 			continue
 		}
 		out = append(out, readyReply{peer: items[i].peer, bytes: reply})

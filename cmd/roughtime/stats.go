@@ -13,16 +13,16 @@ import (
 	"go.uber.org/zap"
 )
 
-// Server-wide un-labeled counters. Labeled request/response/drop counters live
+// Server-wide unlabeled counters. Labeled request/response/drop counters live
 // in metrics.go.
 var (
 	// statsPanics counts goroutine panics absorbed by recoverGoroutine.
 	statsPanics atomic.Uint64
-	// statsBatches counts signing batches flushed by either listener.
+	// statsBatches counts successfully signed batches from either listener.
 	statsBatches atomic.Uint64
-	// statsBatchedReqs counts requests included in a flushed batch.
+	// statsBatchedReqs counts requests included in successfully signed batches.
 	statsBatchedReqs atomic.Uint64
-	// statsBatchErrs counts batches that failed to sign.
+	// statsBatchErrs counts batches that could not produce replies.
 	statsBatchErrs atomic.Uint64
 	// statsAmpDropped counts UDP replies suppressed by the amplification guard.
 	statsAmpDropped atomic.Uint64
@@ -76,10 +76,10 @@ func statsLoop(ctx context.Context, log *zap.Logger, edState, pqState *atomic.Po
 			zap.Uint64("udp_amp_suppressed", amp-lastAmp),
 		}
 		if edState != nil {
-			fields = append(fields, zap.Duration("cert_remaining", time.Until(edState.Load().expiry)))
+			fields = append(fields, zap.Duration("cert_remaining", certRemaining(edState.Load().expiry)))
 		}
 		if pqState != nil {
-			fields = append(fields, zap.Duration("pq_cert_remaining", time.Until(pqState.Load().expiry)))
+			fields = append(fields, zap.Duration("pq_cert_remaining", certRemaining(pqState.Load().expiry)))
 		}
 		log.Info("stats", fields...)
 		lastReceived, lastResponded, lastDropped, lastPanics = r, s, d, p

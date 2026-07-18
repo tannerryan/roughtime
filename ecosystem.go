@@ -10,7 +10,10 @@ import (
 	"fmt"
 	mrand "math/rand/v2"
 	"net"
+	"net/netip"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/net/publicsuffix"
 )
@@ -44,6 +47,9 @@ type ecosystemAddress struct {
 // flexString decodes a JSON field that may be either a string or an integer.
 type flexString string
 
+// googleEcosystemVersion is the numeric Google-Roughtime label.
+const googleEcosystemVersion = "3000600613"
+
 // UnmarshalJSON accepts a JSON string or non-negative integer (uint32 range)
 // and stringifies integers.
 func (v *flexString) UnmarshalJSON(b []byte) error {
@@ -60,11 +66,25 @@ func (v *flexString) UnmarshalJSON(b []byte) error {
 	return fmt.Errorf("version must be a string or integer, got %s", SanitizeForDisplay(truncateForErr(string(b))))
 }
 
-// ParseEcosystem decodes a JSON server list into [Server] values with decoded
-// keys and sanitized strings.
+// MarshalJSON preserves numeric server-list versions as JSON integers while
+// retaining legacy textual labels used by existing ecosystem files.
+func (v flexString) MarshalJSON() ([]byte, error) {
+	s := string(v)
+	if n, err := strconv.ParseUint(s, 10, 32); err == nil && strconv.FormatUint(n, 10) == s {
+		return []byte(s), nil
+	}
+	return json.Marshal(s)
+}
+
+// ParseEcosystem decodes and validates a JSON server list. Semantic fields with
+// control, separator, or selected format characters are rejected rather than
+// rewritten.
 func ParseEcosystem(data []byte) ([]Server, error) {
 	if len(data) > MaxEcosystemBytes {
 		return nil, fmt.Errorf("roughtime: ecosystem is %d bytes (max %d)", len(data), MaxEcosystemBytes)
+	}
+	if !utf8.Valid(data) {
+		return nil, errors.New("roughtime: ecosystem is not valid UTF-8")
 	}
 	var f ecosystemFile
 	if err := json.Unmarshal(data, &f); err != nil {
@@ -78,6 +98,15 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 	}
 	out := make([]Server, 0, len(f.Servers))
 	for i, es := range f.Servers {
+		if err := validateSemanticField("name", es.Name); err != nil {
+			return nil, fmt.Errorf("roughtime: server %d: %w", i, err)
+		}
+		if err := validateSemanticField("version", string(es.Version)); err != nil {
+			return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(es.Name), err)
+		}
+		if err := validateSemanticField("publicKeyType", es.PublicKeyType); err != nil {
+			return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(es.Name), err)
+		}
 		pk, err := DecodePublicKey(es.PublicKey)
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(es.Name), err)
@@ -95,30 +124,33 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 		}
 		addrs := make([]Address, 0, len(es.Addresses))
 		for _, a := range es.Addresses {
+			if err := validateSemanticField("transport", a.Protocol); err != nil {
+				return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(es.Name), err)
+			}
 			t := strings.ToLower(a.Protocol)
 			if t != "udp" && t != "tcp" {
 				return nil, fmt.Errorf("roughtime: server %d (%s): unsupported transport %q", i, SanitizeForDisplay(es.Name), SanitizeForDisplay(a.Protocol))
 			}
-			addr := SanitizeForDisplay(a.Address)
-			if _, _, err := net.SplitHostPort(addr); err != nil {
-				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(es.Name), addr, err)
+			if err := validateEndpoint(a.Address); err != nil {
+				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(es.Name), SanitizeForDisplay(a.Address), err)
 			}
-			addrs = append(addrs, Address{Transport: t, Address: addr})
+			addrs = append(addrs, Address{Transport: t, Address: a.Address})
 		}
-		out = append(out, Server{
-			Name:      SanitizeForDisplay(es.Name),
-			Version:   SanitizeForDisplay(string(es.Version)),
+		s := Server{
+			Name:      es.Name,
+			Version:   string(es.Version),
 			PublicKey: pk,
 			Addresses: addrs,
-		})
+		}
+		out = append(out, s)
 	}
 	return out, nil
 }
 
-// SampleByOperator returns up to n servers, at most one per operator (grouped
-// by [OperatorKey]), so no operator can dominate the consensus median however
-// many entries it registers. Operators, and the server within each, are chosen
-// at random. Fewer than n are returned when operators are scarce.
+// SampleByOperator returns up to n servers, at most one per [OperatorKey].
+// OperatorKey is an endpoint-domain heuristic, not an authenticated ownership
+// identity, so callers must not treat this function alone as Sybil resistance.
+// Fewer than n are returned when endpoint-domain groups are scarce.
 func SampleByOperator(servers []Server, n int) []Server {
 	if n <= 0 {
 		return nil
@@ -133,7 +165,7 @@ func SampleByOperator(servers []Server, n int) []Server {
 		groups[k] = append(groups[k], s)
 	}
 	mrand.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
-	out := make([]Server, 0, n)
+	out := make([]Server, 0, min(n, len(order)))
 	for _, k := range order {
 		if len(out) == n {
 			break
@@ -144,18 +176,22 @@ func SampleByOperator(servers []Server, n int) []Server {
 	return out
 }
 
-// OperatorKey identifies a server's operator by the registered domain (eTLD+1)
-// of its primary address, falling back to the bare host for IP literals and
-// single-label names.
+// OperatorKey returns an endpoint-domain grouping key for s. It uses the
+// primary address's registered domain (eTLD+1), or its bare host for an IP
+// literal or single-label name. With no address it uses Name. The result is not
+// authenticated operator identity.
 func OperatorKey(s Server) string {
 	if len(s.Addresses) == 0 {
-		return s.Name
+		return strings.ToLower(strings.TrimSuffix(s.Name, "."))
 	}
 	host, _, err := net.SplitHostPort(s.Addresses[0].Address)
 	if err != nil {
 		host = s.Addresses[0].Address
 	}
-	host = strings.ToLower(host)
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.Unmap().String()
+	}
 	if reg, err := publicsuffix.EffectiveTLDPlusOne(host); err == nil {
 		return reg
 	}
@@ -172,6 +208,12 @@ func MarshalEcosystem(servers []Server) ([]byte, error) {
 	}
 	out := ecosystemFile{Servers: make([]ecosystemServer, 0, len(servers))}
 	for i, s := range servers {
+		if err := validateSemanticField("name", s.Name); err != nil {
+			return nil, fmt.Errorf("roughtime: server %d: %w", i, err)
+		}
+		if err := validateSemanticField("version", s.Version); err != nil {
+			return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(s.Name), err)
+		}
 		sch, err := SchemeOfKey(s.PublicKey)
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(s.Name), err)
@@ -181,25 +223,80 @@ func MarshalEcosystem(servers []Server) ([]byte, error) {
 		}
 		addrs := make([]ecosystemAddress, 0, len(s.Addresses))
 		for _, a := range s.Addresses {
+			if err := validateSemanticField("transport", a.Transport); err != nil {
+				return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(s.Name), err)
+			}
 			t := strings.ToLower(a.Transport)
 			if t != "udp" && t != "tcp" {
 				return nil, fmt.Errorf("roughtime: server %d (%s): unsupported transport %q", i, SanitizeForDisplay(s.Name), SanitizeForDisplay(a.Transport))
 			}
-			addr := SanitizeForDisplay(a.Address)
-			if _, _, err := net.SplitHostPort(addr); err != nil {
-				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(s.Name), addr, err)
+			if err := validateEndpoint(a.Address); err != nil {
+				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(s.Name), SanitizeForDisplay(a.Address), err)
 			}
-			addrs = append(addrs, ecosystemAddress{Protocol: t, Address: addr})
+			addrs = append(addrs, ecosystemAddress{Protocol: t, Address: a.Address})
 		}
 		out.Servers = append(out.Servers, ecosystemServer{
-			Name:          SanitizeForDisplay(s.Name),
-			Version:       flexString(SanitizeForDisplay(s.Version)),
+			Name:          s.Name,
+			Version:       flexString(s.Version),
 			PublicKeyType: publicKeyTypeFor(sch),
 			PublicKey:     base64.StdEncoding.EncodeToString(s.PublicKey),
 			Addresses:     addrs,
 		})
 	}
-	return json.MarshalIndent(out, "", "  ")
+	data, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxEcosystemBytes {
+		return nil, fmt.Errorf("roughtime: encoded ecosystem is %d bytes (max %d)", len(data), MaxEcosystemBytes)
+	}
+	return data, nil
+}
+
+// validateSemanticField rejects semantic strings that would change when made
+// safe for terminal display.
+func validateSemanticField(name, value string) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is not valid UTF-8", name)
+	}
+	if SanitizeForDisplay(value) != value {
+		return fmt.Errorf("%s contains control, separator, or disallowed format characters", name)
+	}
+	return nil
+}
+
+// validateEndpoint accepts a host and numeric TCP/UDP port.
+func validateEndpoint(endpoint string) error {
+	if err := validateSemanticField("address", endpoint); err != nil {
+		return err
+	}
+	if strings.TrimSpace(endpoint) != endpoint {
+		return errors.New("leading or trailing whitespace")
+	}
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return err
+	}
+	if host == "" {
+		return errors.New("empty host")
+	}
+	if strings.Contains(host, "%") {
+		return errors.New("IPv6 zone identifiers are not allowed")
+	}
+	if port == "" {
+		return errors.New("empty port")
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 0 || p > 65535 {
+		return fmt.Errorf("invalid numeric port %q", port)
+	}
+	return nil
+}
+
+// isGoogleEcosystemVersion recognizes both the legacy label and the numeric
+// pre-IETF version assigned by the server-list specification.
+func isGoogleEcosystemVersion(version string) bool {
+	return strings.EqualFold(version, VersionLabelGoogle) || version == googleEcosystemVersion
 }
 
 // publicKeyTypeFor returns the ecosystem-file label for sch.
@@ -212,8 +309,8 @@ func publicKeyTypeFor(sch Scheme) string {
 	}
 }
 
-// SanitizeForDisplay strips control characters and bidi format codes from
-// untrusted display strings.
+// SanitizeForDisplay strips control, separator, and selected format characters
+// from untrusted display strings.
 func SanitizeForDisplay(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch {

@@ -17,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -29,42 +30,113 @@ import (
 // Seed-file headers bind a seed to its scheme. Ed25519 still accepts legacy
 // bare hex while PQ files must carry the header.
 const (
+	// ed25519SeedHeader identifies an Ed25519 seed file.
 	ed25519SeedHeader = "roughtime-ed25519-seed-v1"
+	// mldsa44SeedHeader identifies an ML-DSA-44 seed file.
 	mldsa44SeedHeader = "roughtime-mldsa44-seed-v1"
 )
 
 // Certificate validity window relative to now.
 const (
+	// certStartOffset sets delegation validity before provisioning.
 	certStartOffset = -6 * time.Hour
-	certEndOffset   = 18 * time.Hour
+	// certEndOffset sets delegation expiry after provisioning.
+	certEndOffset = 18 * time.Hour
 )
 
-// Cert refresh tunables. A var so tests can shrink them.
-var (
+// Certificate refresh schedule.
+const (
 	// certRefreshThreshold is the remaining-validity window that triggers a
 	// refresh attempt.
 	certRefreshThreshold = 3 * time.Hour
 	// certCheckInterval is the cadence at which the refresh loop wakes to check
 	// expiry.
 	certCheckInterval = 15 * time.Minute
-	// refreshRetryCooldown is the minimum gap between successive refresh
-	// attempts after a failure.
-	refreshRetryCooldown = 5 * time.Minute
 )
 
 // certState holds the current online certificate, its expiry, and the
 // precomputed SRV hash of the long-term root key.
 type certState struct {
-	// cert is the active online delegation certificate.
-	cert *protocol.Certificate
-	// expiry is the wall-clock time at which cert ceases to be valid.
-	expiry time.Time
-	// srvHash is the precomputed SRV hash of the long-term root public key.
-	srvHash []byte
+	// mu prevents retirement from wiping cert while a response is signing.
+	mu        sync.RWMutex
+	retired   bool
+	cert      *protocol.Certificate
+	notBefore time.Time
+	expiry    time.Time
+	srvHash   []byte
 }
 
-// writeSeedFile writes header plus hex-encoded seed to path at mode 0600,
-// refusing existing files and symlink races.
+// acquire retains s for one signing operation. The caller must call release
+// after a successful acquire.
+func (s *certState) acquire() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	if s.retired {
+		s.mu.RUnlock()
+		return false
+	}
+	return true
+}
+
+// release ends a signing operation begun by acquire.
+func (s *certState) release() {
+	s.mu.RUnlock()
+}
+
+// acquireCurrent retains the certificate currently published in state. If a
+// rotation races the retain operation, it releases the replaced certificate
+// and retries the newly published state.
+func acquireCurrent(state *atomic.Pointer[certState]) *certState {
+	if state == nil {
+		return nil
+	}
+	for {
+		current := state.Load()
+		if current == nil {
+			return nil
+		}
+		if !current.acquire() {
+			if state.Load() != current {
+				continue
+			}
+			return nil
+		}
+		if state.Load() == current {
+			return current
+		}
+		current.release()
+	}
+}
+
+// retire prevents new signing operations and wipes the online signing key
+// after every operation already using the state has completed.
+func (s *certState) retire() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.retired {
+		return
+	}
+	s.retired = true
+	if s.cert != nil {
+		s.cert.Wipe()
+	}
+}
+
+// retireCurrent atomically detaches and retires the current certificate.
+func retireCurrent(state *atomic.Pointer[certState]) {
+	if state == nil {
+		return
+	}
+	state.Swap(nil).retire()
+}
+
+// writeSeedFile creates a seed file with permissions no broader than 0600 and
+// never replaces an existing path.
 func writeSeedFile(path, header string, seed []byte) error {
 	encoded := make([]byte, len(header)+2+hex.EncodedLen(len(seed)))
 	copy(encoded, header)
@@ -73,20 +145,31 @@ func writeSeedFile(path, header string, seed []byte) error {
 	encoded[len(encoded)-1] = '\n'
 	defer clear(encoded)
 
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+	path = filepath.Clean(path)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return fmt.Errorf("%s already exists (refusing to overwrite)", path)
 		}
 		return fmt.Errorf("creating seed file %s: %w", path, err)
 	}
-	if _, err := f.Write(encoded); err != nil {
+	failed := true
+	defer func() {
 		_ = f.Close()
-		return fmt.Errorf("writing seed to %s: %w", path, err)
+		if failed {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := f.Write(encoded); err != nil {
+		return fmt.Errorf("writing seed file %s: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("syncing seed file %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("closing seed file %s: %w", path, err)
 	}
+	failed = false
 	return nil
 }
 
@@ -106,10 +189,8 @@ func generateKeypair(path string) error {
 	if err := writeSeedFile(path, ed25519SeedHeader, seed); err != nil {
 		return err
 	}
-
-	fmt.Printf("Seed written to: %s\n", path)
-	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
-	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	fmt.Printf("Seed written to: %s\nPublic key (hex):    %s\nPublic key (base64): %s\n",
+		path, hex.EncodeToString(pk), base64.StdEncoding.EncodeToString(pk))
 	return nil
 }
 
@@ -127,10 +208,8 @@ func generateMLDSA44Keypair(path string) error {
 	if err := writeSeedFile(path, mldsa44SeedHeader, seed); err != nil {
 		return err
 	}
-
-	fmt.Printf("Seed written to: %s\n", path)
-	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
-	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	fmt.Printf("Seed written to: %s\nPublic key (hex):    %s\nPublic key (base64): %s\n",
+		path, hex.EncodeToString(pk), base64.StdEncoding.EncodeToString(pk))
 	return nil
 }
 
@@ -154,8 +233,8 @@ func derivePublicKey(path string) error {
 	defer clear(sk)
 	pk := sk.Public().(ed25519.PublicKey)
 
-	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
-	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	fmt.Printf("Public key (hex):    %s\nPublic key (base64): %s\n",
+		hex.EncodeToString(pk), base64.StdEncoding.EncodeToString(pk))
 	return nil
 }
 
@@ -181,13 +260,13 @@ func deriveMLDSA44PublicKey(path string) error {
 	}
 	pk := sk.PublicKey().Bytes()
 
-	fmt.Printf("Public key (hex):    %s\n", hex.EncodeToString(pk))
-	fmt.Printf("Public key (base64): %s\n", base64.StdEncoding.EncodeToString(pk))
+	fmt.Printf("Public key (hex):    %s\nPublic key (base64): %s\n",
+		hex.EncodeToString(pk), base64.StdEncoding.EncodeToString(pk))
 	return nil
 }
 
-// readPrivateKeyFile reads a 0600-or-stricter seed file under O_NOFOLLOW, using
-// role to label error messages.
+// readPrivateKeyFile reads a regular seed file with no group or other
+// permissions under O_NOFOLLOW.
 func readPrivateKeyFile(path, role string) ([]byte, error) {
 	// O_NOFOLLOW refuses a symlink, then validate the opened descriptor so the
 	// checks can't race a swap between stat and open
@@ -283,13 +362,15 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("generating online signing key: %w", err)
 	}
+	defer clear(onlineSK)
 
-	now := time.Now()
-	cert, err := protocol.NewCertificate(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
+	now := wallClockNow()
+	expiry := now.Add(certEndOffset)
+	cert, err := protocol.NewCertificate(now.Add(certStartOffset), expiry, onlineSK, rootSK)
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("generating online certificate: %w", err)
 	}
-	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
+	return cert, onlinePK, rootPK, expiry, nil
 }
 
 // provisionMLDSA44CertificateKey reads the ML-DSA-44 root seed and signs a
@@ -321,79 +402,117 @@ func provisionMLDSA44CertificateKey() (*protocol.Certificate, []byte, []byte, ti
 	}
 	onlinePK := onlineSK.PublicKey().Bytes()
 
-	now := time.Now()
-	cert, err := protocol.NewCertificateMLDSA44(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
+	now := wallClockNow()
+	expiry := now.Add(certEndOffset)
+	cert, err := protocol.NewCertificateMLDSA44(now.Add(certStartOffset), expiry, onlineSK, rootSK)
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("generating PQ online certificate: %w", err)
 	}
-	return cert, onlinePK, rootPK, now.Add(certEndOffset), nil
+	return cert, onlinePK, rootPK, expiry, nil
+}
+
+// wallClockNow deliberately strips the monotonic reading. Delegation validity
+// is expressed in UTC timestamps, so refresh decisions must follow civil-clock
+// corrections instead of measuring only process elapsed time.
+func wallClockNow() time.Time { return time.Now().Round(0) }
+
+// certRemaining returns wall-clock validity remaining for expiry.
+func certRemaining(expiry time.Time) time.Duration {
+	return expiry.Sub(wallClockNow())
+}
+
+// certNotBefore derives the delegation start generated alongside expiry.
+func certNotBefore(expiry time.Time) time.Time {
+	return expiry.Add(certStartOffset - certEndOffset)
+}
+
+// offlineExpiryCheckInterval rechecks the civil clock so a forward wall-clock
+// correction cannot leave read-once mode serving an expired delegation.
+const offlineExpiryCheckInterval = time.Second
+
+// monitorOfflineDelegation stops serving when offline delegation state is
+// unavailable or outside its validity window. Signing paths repeat the check
+// to cover scheduling jitter.
+func monitorOfflineDelegation(ctx context.Context, scheme string, state *atomic.Pointer[certState]) error {
+	ticker := time.NewTicker(offlineExpiryCheckInterval)
+	defer ticker.Stop()
+	for {
+		if state == nil {
+			return fmt.Errorf("%s offline delegation state unavailable", scheme)
+		}
+		current := state.Load()
+		if current == nil {
+			return fmt.Errorf("%s offline delegation state unavailable", scheme)
+		}
+		now := wallClockNow()
+		if now.Before(current.notBefore) {
+			return fmt.Errorf("%s offline delegation is not yet valid after a backward clock correction; restart with a fresh delegation", scheme)
+		}
+		if !now.Before(current.expiry) {
+			return fmt.Errorf("%s offline delegation expired; restart with a fresh delegation", scheme)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
 }
 
 // refreshLoop replaces the Ed25519 certificate near expiry, rejecting refresh
 // if the root key on disk has changed.
-func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK ed25519.PublicKey) {
-	runRefreshLoop(ctx, log, "Ed25519", schemeEd25519, initialRootPK, state, func() (*certState, []byte, error) {
+func refreshLoop(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK ed25519.PublicKey) error {
+	return runRefreshLoop(ctx, log, "Ed25519", schemeEd25519, initialRootPK, state, func() (*certState, []byte, error) {
 		return tryRefreshCert(initialRootPK)
 	})
 }
 
 // refreshLoopMLDSA44 is the ML-DSA-44 counterpart of refreshLoop, gated by the
 // encoded root public key captured at startup.
-func refreshLoopMLDSA44(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK []byte) {
-	runRefreshLoop(ctx, log, "ML-DSA-44", schemeMLDSA44, initialRootPK, state, func() (*certState, []byte, error) {
+func refreshLoopMLDSA44(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], initialRootPK []byte) error {
+	return runRefreshLoop(ctx, log, "ML-DSA-44", schemeMLDSA44, initialRootPK, state, func() (*certState, []byte, error) {
 		return tryRefreshCertMLDSA44(initialRootPK)
 	})
 }
 
 // runRefreshLoop is the scheme-agnostic refresh driver invoked by refreshLoop
 // and refreshLoopMLDSA44.
-func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetric string, rootPK []byte, state *atomic.Pointer[certState], refresh func() (*certState, []byte, error)) {
+func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetric string, rootPK []byte, state *atomic.Pointer[certState], refresh func() (*certState, []byte, error)) error {
 	ticker := time.NewTicker(certCheckInterval)
 	defer ticker.Stop()
-	var lastAttempt time.Time
-
 	log.Info("certificate refresh loop started",
 		zap.String("scheme", schemeName),
 		zap.Duration("check_interval", certCheckInterval),
 		zap.Duration("refresh_threshold", certRefreshThreshold),
-		zap.Duration("retry_cooldown", refreshRetryCooldown),
 	)
 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
 		}
 
 		cur := state.Load()
-		if time.Until(cur.expiry) > certRefreshThreshold {
+		now := wallClockNow()
+		if !now.Before(cur.notBefore) && cur.expiry.Sub(now) > certRefreshThreshold {
 			continue
 		}
-		now := time.Now()
-		if now.Sub(lastAttempt) < refreshRetryCooldown {
-			continue
-		}
-		lastAttempt = now
-
 		log.Info("attempting certificate refresh",
 			zap.String("scheme", schemeName),
 			zap.Time("current_expiry", cur.expiry),
-			zap.Duration("remaining", time.Until(cur.expiry)),
+			zap.Duration("remaining", certRemaining(cur.expiry)),
 		)
 		newState, newOnlinePK, err := refresh()
 		if err != nil {
-			remaining := time.Until(cur.expiry)
-			// below 2x cooldown the next attempt may miss expiry. Fail so the
-			// supervisor restarts rather than serving an expiring cert
-			if remaining < 2*refreshRetryCooldown {
-				log.Fatal("certificate refresh failed near expiry; restart required",
-					zap.String("scheme", schemeName),
-					zap.Error(err),
-					zap.Time("current_expiry", cur.expiry),
-					zap.Duration("remaining", remaining),
-					zap.Duration("retry_cooldown", refreshRetryCooldown),
-				)
+			remaining := certRemaining(cur.expiry)
+			if now.Before(cur.notBefore) {
+				return fmt.Errorf("%s certificate refresh failed while the current certificate is not yet valid: %w", schemeName, err)
+			}
+			// Leave one check interval plus retry margin. Otherwise the next
+			// scheduled attempt can begin at or after certificate expiry.
+			if refreshFailureTerminal(remaining) {
+				return fmt.Errorf("%s certificate refresh failed with %s remaining: %w", schemeName, remaining, err)
 			}
 			if ce := log.Check(zap.ErrorLevel, "certificate refresh failed"); ce != nil {
 				ce.Write(
@@ -401,22 +520,28 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetr
 					zap.Error(err),
 					zap.Time("current_expiry", cur.expiry),
 					zap.Duration("remaining", remaining),
-					zap.Duration("retry_cooldown", refreshRetryCooldown),
 				)
 			}
 			continue
 		}
-		state.Store(newState)
-		noteCertProvisioned(schemeMetric, newOnlinePK, rootPK, newState.expiry, time.Now())
+		retired := state.Swap(newState)
+		retired.retire()
+		noteCertProvisioned(schemeMetric, newOnlinePK, rootPK, newState.expiry, wallClockNow())
 		noteCertRotation(schemeMetric)
 		log.Info("certificate refreshed",
 			zap.String("scheme", schemeName),
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),
 			zap.Time("previous_expiry", cur.expiry),
 			zap.Time("expiry", newState.expiry),
-			zap.Duration("validity", time.Until(newState.expiry)),
+			zap.Duration("validity", certRemaining(newState.expiry)),
 		)
 	}
+}
+
+// refreshFailureTerminal reports whether another scheduled refresh plus a
+// one-minute retry margin would reach expiry.
+func refreshFailureTerminal(remaining time.Duration) bool {
+	return remaining <= certCheckInterval+time.Minute
 }
 
 // tryRefreshCert reads the Ed25519 root key, rejects any change against
@@ -427,10 +552,11 @@ func tryRefreshCert(initialRootPK ed25519.PublicKey) (*certState, ed25519.Public
 		return nil, nil, err
 	}
 	if !bytes.Equal(newRootPK, initialRootPK) {
+		newCert.Wipe()
 		return nil, nil, fmt.Errorf("root public key on disk has changed since startup (want %s, got %s); restart required",
 			hex.EncodeToString(initialRootPK), hex.EncodeToString(newRootPK))
 	}
-	return &certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
+	return &certState{cert: newCert, notBefore: certNotBefore(newExpiry), expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
 }
 
 // tryRefreshCertMLDSA44 reads the ML-DSA-44 root key, rejects any change
@@ -442,8 +568,9 @@ func tryRefreshCertMLDSA44(initialRootPK []byte) (*certState, []byte, error) {
 		return nil, nil, err
 	}
 	if !bytes.Equal(newRootPK, initialRootPK) {
+		newCert.Wipe()
 		return nil, nil, fmt.Errorf("PQ root public key on disk has changed since startup (want %s, got %s); restart required",
 			hex.EncodeToString(initialRootPK), hex.EncodeToString(newRootPK))
 	}
-	return &certState{cert: newCert, expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
+	return &certState{cert: newCert, notBefore: certNotBefore(newExpiry), expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
 }

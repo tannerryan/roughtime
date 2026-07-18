@@ -4,7 +4,9 @@
 .dockerignore
 Dockerfile
 README.md
-LICENSE
+
+# Locally generated private root keys
+/keys/
 
 # Built binaries (from `make build`)
 /roughtime
@@ -12,11 +14,6 @@ LICENSE
 /roughtime-debug
 /roughtime-bench
 /roughtime-stamp
-
-# Coverage artifacts
-/coverage.out
-/coverage.txt
-/coverage.html
 
 # Editor / OS cruft
 .idea

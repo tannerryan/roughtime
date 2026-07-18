@@ -21,14 +21,29 @@ import (
 type Request struct {
 	// Nonce is the request nonce.
 	Nonce []byte
-	// Versions lists the client's offered versions (empty for Google).
+	// Versions lists the client's offered versions. It is empty for Google and
+	// may be omitted on caller-built pre-draft-12 Request values passed directly
+	// to CreateReplies for backward compatibility.
 	Versions []Version
-	// SRV is the optional server-identifier tag (drafts 10+).
+	// SRV is the optional 32-byte server identifier (drafts 10+ and ML-DSA-44).
 	SRV []byte
-	// HasType reports whether the request carries a TYPE tag (drafts 14+).
+	// HasType reports whether the request carries TYPE=0.
 	HasType bool
-	// RawPacket is the framed or unframed request bytes.
+	// RawPacket is the framed or unframed request. CreateReplies requires it for
+	// drafts 12+ and ML-DSA-44; earlier nonce-leaf versions retain support for
+	// caller-built values.
 	RawPacket []byte
+}
+
+// RequestOptions controls request encoding and legacy packet sizing.
+type RequestOptions struct {
+	// OmitTYPE emits the draft-12/13 request form without TYPE. The default
+	// includes TYPE=0 for draft-14+ compatibility.
+	OmitTYPE bool
+	// LegacyPacketSize pads framed requests to a historical total size: 1024
+	// bytes, or 8192 for ML-DSA-44. The default pads the body to that size. Use
+	// this only for deployed legacy interoperability.
+	LegacyPacketSize bool
 }
 
 // ParseRequest auto-detects Google vs IETF framing and extracts request fields.
@@ -71,21 +86,23 @@ func ParseRequest(raw []byte) (*Request, error) {
 	}
 
 	maxVer := VersionGoogle
+	hasKnownVersion := false
 	for _, v := range req.Versions {
-		if v > maxVer {
+		if isRecognizedVersion(v) && v > maxVer {
 			maxVer = v
+			hasKnownVersion = true
 		}
 	}
 	maxGroup := wireGroupOf(maxVer, false)
 
 	// drafts 10-11 forbid duplicates, drafts 12+ require strictly ascending
-	if maxGroup >= groupD12 {
+	if hasKnownVersion && maxGroup >= groupD12 {
 		for i := 1; i < len(req.Versions); i++ {
 			if req.Versions[i] <= req.Versions[i-1] {
 				return nil, errors.New("protocol: VER list not strictly ascending")
 			}
 		}
-	} else if maxGroup >= groupD10 {
+	} else if hasKnownVersion && maxGroup >= groupD10 {
 		seen := make(map[Version]struct{}, len(req.Versions))
 		for _, v := range req.Versions {
 			if _, dup := seen[v]; dup {
@@ -95,15 +112,25 @@ func ParseRequest(raw []byte) (*Request, error) {
 		}
 	}
 
-	// mixed-version VER lists can span both nonce sizes (64 for drafts 01-04,
-	// 32 for 05+), so accept if the nonce matches any offered version
+	// Every recognized offered version must be compatible with the request's
+	// nonce size. Signature schemes may coexist because SRV selects the server
+	// identity and therefore the applicable scheme.
 	nonceOK := false
 	if len(req.Versions) == 0 {
 		nonceOK = len(req.Nonce) == nonceSize(groupGoogle)
-	} else {
+	} else if !hasKnownVersion {
+		// Preserve forward-compatible parsing. A server will ignore an offer
+		// containing no implemented version, but parsing must not guess an
+		// unknown version's nonce rules.
+		nonceOK = true
+	} else if hasKnownVersion {
+		nonceOK = true
 		for _, v := range req.Versions {
-			if len(req.Nonce) == nonceSize(wireGroupOf(v, false)) {
-				nonceOK = true
+			if !isRecognizedVersion(v) {
+				continue
+			}
+			if v == VersionGoogle || len(req.Nonce) != nonceSize(wireGroupOf(v, false)) {
+				nonceOK = false
 				break
 			}
 		}
@@ -112,9 +139,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, fmt.Errorf("protocol: nonce length %d matches no offered version", len(req.Nonce))
 	}
 
-	// drafts 10+ require SRV to be exactly 32 bytes. Older drafts MUST ignore
-	// it
-	if maxGroup >= groupD10 {
+	// Drafts 10+ require a present SRV to be 32 bytes. Older drafts ignore it.
+	if hasKnownVersion && maxGroup >= groupD10 {
 		if req.SRV != nil && len(req.SRV) != 32 {
 			return nil, fmt.Errorf("protocol: SRV length %d invalid for drafts 10+ (want 32)", len(req.SRV))
 		}
@@ -122,9 +148,9 @@ func ParseRequest(raw []byte) (*Request, error) {
 		req.SRV = nil
 	}
 
-	// drafts 10+ require ZZZZ to be zero. We enforce it only on drafts 12+ so
-	// non-conformant 10-11 peers still interop
-	if maxGroup >= groupD12 {
+	// Drafts 10+ require ZZZZ to contain only zero bytes. Drafts 08-09 merely
+	// recommend zero padding, so tolerate other contents for those versions.
+	if hasKnownVersion && maxGroup >= groupD10 {
 		if pad, ok := msg[TagZZZZ]; ok {
 			for _, b := range pad {
 				if b != 0 {
@@ -134,10 +160,25 @@ func ParseRequest(raw []byte) (*Request, error) {
 		}
 	}
 
+	// Draft 14 introduced TYPE under the shared draft-12 wire version. Ignore it
+	// for older and unknown versions.
+	if slices.Contains(req.Versions, VersionDraft12) || slices.Contains(req.Versions, VersionMLDSA44) {
+		if tb, ok := msg[TagTYPE]; ok {
+			if len(tb) != 4 {
+				return nil, errors.New("protocol: TYPE tag must be 4 bytes")
+			}
+			if v := binary.LittleEndian.Uint32(tb); v != 0 {
+				return nil, fmt.Errorf("protocol: TYPE=%d in request (must be 0)", v)
+			}
+			req.HasType = true
+		}
+	}
+
 	return req, nil
 }
 
-// parseOptionalTags extracts VER, SRV, and TYPE into req.
+// parseOptionalTags extracts VER and SRV into req. ParseRequest interprets
+// TYPE only after it knows whether an applicable version was offered.
 func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 	if vb, ok := msg[TagVER]; ok {
 		if len(vb) == 0 || len(vb)%4 != 0 {
@@ -155,20 +196,11 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 	if srv, ok := msg[TagSRV]; ok {
 		req.SRV = srv
 	}
-	if tb, ok := msg[TagTYPE]; ok {
-		if len(tb) != 4 {
-			return errors.New("protocol: TYPE tag must be 4 bytes")
-		}
-		if v := binary.LittleEndian.Uint32(tb); v != 0 {
-			return fmt.Errorf("protocol: TYPE=%d in request (must be 0)", v)
-		}
-		req.HasType = true
-	}
 	return nil
 }
 
 // ComputeSRV returns the SRV tag value, the first 32 bytes of SHA-512(0xff ||
-// rootPK). rootPK is an Ed25519 key or, for the PQ variant, an ML-DSA-44 key.
+// rootPK). rootPK must be an Ed25519 or ML-DSA-44 key; otherwise it returns nil.
 func ComputeSRV(rootPK []byte) []byte {
 	if len(rootPK) != ed25519.PublicKeySize && len(rootPK) != mldsa.MLDSA44PublicKeySize {
 		return nil
@@ -180,11 +212,23 @@ func ComputeSRV(rootPK []byte) []byte {
 }
 
 // CreateRequest builds a Roughtime request and returns the nonce needed to
-// verify the reply.
+// verify the reply. Versions whose nonce size is incompatible with the highest
+// preferred version are omitted from the encoded offer.
 func CreateRequest(versions []Version, entropy io.Reader, srv []byte) (nonce, request []byte, err error) {
-	_, g, err := clientVersionPreference(versions)
+	return CreateRequestWithOptions(versions, entropy, srv, RequestOptions{})
+}
+
+// CreateRequestWithOptions builds a request using opts.
+func CreateRequestWithOptions(versions []Version, entropy io.Reader, srv []byte, opts RequestOptions) (nonce, request []byte, err error) {
+	best, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, nil, err
+	}
+	if opts.OmitTYPE && best != VersionDraft12 {
+		return nil, nil, errors.New("protocol: OmitTYPE requires VersionDraft12 as the preferred version")
+	}
+	if entropy == nil {
+		return nil, nil, errors.New("protocol: nil entropy reader")
 	}
 
 	ns := nonceSize(g)
@@ -193,30 +237,42 @@ func CreateRequest(versions []Version, entropy io.Reader, srv []byte) (nonce, re
 		return nil, nil, fmt.Errorf("protocol: read entropy: %w", err)
 	}
 
-	request, err = createRequestFromNonce(g, versions, nonce, srv)
+	request, err = createRequestFromNonce(g, versions, nonce, srv, opts)
 	return nonce, request, err
 }
 
 // CreateRequestWithNonce builds a request with a caller-supplied nonce.
+// Versions incompatible with the nonce length are omitted.
 func CreateRequestWithNonce(versions []Version, nonce []byte, srv []byte) ([]byte, error) {
-	_, g, err := clientVersionPreference(versions)
+	return CreateRequestWithNonceOptions(versions, nonce, srv, RequestOptions{})
+}
+
+// CreateRequestWithNonceOptions builds a caller-nonce request using opts.
+func CreateRequestWithNonceOptions(versions []Version, nonce []byte, srv []byte, opts RequestOptions) ([]byte, error) {
+	best, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, err
+	}
+	if opts.OmitTYPE && best != VersionDraft12 {
+		return nil, errors.New("protocol: OmitTYPE requires VersionDraft12 as the preferred version")
 	}
 	if len(nonce) != nonceSize(g) {
 		return nil, fmt.Errorf("protocol: nonce length %d, want %d", len(nonce), nonceSize(g))
 	}
-	return createRequestFromNonce(g, versions, nonce, srv)
+	return createRequestFromNonce(g, versions, nonce, srv, opts)
 }
 
 // createRequestFromNonce assembles a request packet from a pre-built nonce.
-func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) ([]byte, error) {
+func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte, opts RequestOptions) ([]byte, error) {
+	if g >= groupD10 && len(srv) != 0 && len(srv) != 32 {
+		return nil, fmt.Errorf("protocol: SRV length %d invalid for drafts 10+ (want 32)", len(srv))
+	}
 	tags := map[uint32][]byte{TagNONC: nonce}
 
 	if g != groupGoogle {
 		sorted := make([]Version, 0, len(versions))
 		for _, v := range versions {
-			if v == VersionGoogle {
+			if v == VersionGoogle || nonceSize(wireGroupOf(v, true)) != nonceSize(g) {
 				continue
 			}
 			sorted = append(sorted, v)
@@ -232,7 +288,7 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		}
 		tags[TagVER] = vb
 
-		if g >= groupD14 {
+		if g >= groupD14 && !opts.OmitTYPE {
 			tags[TagTYPE] = make([]byte, 4)
 		}
 		if len(srv) > 0 && g >= groupD10 {
@@ -240,18 +296,15 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte) 
 		}
 	}
 
-	// IETF wire size is normally 1024 including the 12-byte header. ML-DSA-44
-	// replies are much larger, so any offer containing it is padded to the
-	// TCP/UDP request cap to preserve the no-amplification invariant.
+	// IETF request messages are padded to at least 1024 bytes; the ROUGHTIM
+	// framing header is additional. ML-DSA-44 replies are much larger, so an
+	// offer containing it uses the full 8192-byte request-body cap.
 	target := 1024
 	if pqOffered(versions) {
 		target = 8192
 	}
-	if usesRoughtimHeader(g) {
-		target = 1012
-		if pqOffered(versions) {
-			target = 8180
-		}
+	if opts.LegacyPacketSize && usesRoughtimHeader(g) {
+		target -= PacketHeaderSize
 	}
 
 	n := uint32(len(tags))

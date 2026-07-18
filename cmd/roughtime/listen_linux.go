@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -45,26 +44,13 @@ var reqBufPool = sync.Pool{
 	},
 }
 
-// statsWorkerExits counts worker returns before ctx cancellation.
-var statsWorkerExits atomic.Uint64
-
-// udpWorkerExits is registered here because non-Linux builds omit
-// statsWorkerExits.
-var udpWorkerExits = newCounterFn(
-	"roughtime_udp_worker_exits_total",
-	"UDP worker goroutines that exited unexpectedly. Linux only.",
-	func() uint64 { return statsWorkerExits.Load() },
-)
-
-func init() { addMetric(udpWorkerExits) }
-
 // listen starts one SO_REUSEPORT worker per GOMAXPROCS (cgroup-aware, unlike
 // NumCPU, so it won't oversubscribe in CPU-limited containers), each on its own
 // recvmmsg/sendmmsg loop.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
 	numWorkers := max(1, runtime.GOMAXPROCS(0))
-	addr := net.JoinHostPort("::", strconv.Itoa(*port))
+	addr := serverListenAddr()
 	maxSize := batchMaxSize
 	maxLatency := batchMaxLatency
 
@@ -87,6 +73,12 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		zap.String("addr", addr),
 		zap.Int("workers", numWorkers),
 	)
+	go func() {
+		<-ctx.Done()
+		for _, c := range conns {
+			_ = c.SetDeadline(time.Unix(1, 0))
+		}
+	}()
 
 	var wg sync.WaitGroup
 	for i, c := range conns {
@@ -126,12 +118,14 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 	}()
 
 	p := ipv6.NewPacketConn(conn)
-	msgs := makeMessages(maxSize, maxPacketSize)
+	// The extra byte makes oversize detection independent of MSG_TRUNC while
+	// still retaining the flag check for datagrams larger than this buffer.
+	msgs := makeMessages(maxSize, maxPacketSize+1)
 
 	for ctx.Err() == nil {
 		batch, hardErr := collectBatch(log, conn, p, msgs, maxSize, maxLatency, state)
 		if len(batch) > 0 {
-			respond(log, p, state.Load(), batch)
+			respond(ctx, log, conn, p, state, batch)
 		}
 		// throttle the loop on persistent non-deadline read errors so a wedged
 		// socket can't burn a core, ctx.Done preempts the sleep
@@ -182,6 +176,13 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]validatedRequest) {
 	for i := range msgs {
 		n := msgs[i].N
+		if msgs[i].Flags&unix.MSG_TRUNC != 0 || n > maxPacketSize {
+			incDropped(transportUDP, dropOversize)
+			if ce := log.Check(zap.DebugLevel, "dropped truncated UDP request"); ce != nil {
+				ce.Write(zap.Any("peer", msgs[i].Addr), zap.Int("reported_size", n), zap.Int("buffer_size", len(msgs[i].Buffers[0])))
+			}
+			continue
+		}
 		if n < minRequestSize {
 			incDropped(transportUDP, dropUndersize)
 			if ce := log.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
@@ -210,8 +211,7 @@ func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]valid
 }
 
 // respond groups items by (version, hasType), signs, and writes via sendmmsg.
-func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validatedRequest) {
-	defer recoverGoroutine(log, "respond")
+func respond(ctx context.Context, log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, state *atomic.Pointer[certState], items []validatedRequest) {
 	defer func() {
 		for i := range items {
 			if items[i].bufPtr != nil {
@@ -221,6 +221,7 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 		}
 	}()
 
+	// group holds requests sharing one signing operation.
 	type group struct {
 		ver   protocol.Version
 		items []validatedRequest
@@ -245,7 +246,7 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 
 	out := make([]ipv6.Message, 0, len(items))
 	for _, g := range groups {
-		for _, r := range signAndBuildReplies(log, st, g.ver, g.items) {
+		for _, r := range signAndBuildRepliesCurrent(log, state, g.ver, g.items) {
 			out = append(out, ipv6.Message{
 				Addr:    r.peer,
 				Buffers: [][]byte{r.bytes},
@@ -255,6 +256,13 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 
 	// sendmmsg may return a short count, so loop until the slice drains
 	for len(out) > 0 {
+		if ctx.Err() != nil {
+			for range out {
+				incDropped(transportUDP, dropWrite)
+			}
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
 		n, err := p.WriteBatch(out, 0)
 		if err != nil {
 			log.Warn("WriteBatch failed", zap.Error(err), zap.Int("dropped", len(out)))
@@ -276,8 +284,7 @@ func respond(log *zap.Logger, p *ipv6.PacketConn, st *certState, items []validat
 	}
 }
 
-// listenReusePort binds a dual-stack UDP socket with SO_REUSEPORT and
-// IPV6_V6ONLY=0.
+// listenReusePort binds with SO_REUSEPORT and disables IPV6_V6ONLY for udp6.
 func listenReusePort(network, address string) (net.PacketConn, error) {
 	lc := net.ListenConfig{
 		Control: func(ctrlNetwork, _ string, c syscall.RawConn) error {

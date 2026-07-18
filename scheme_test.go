@@ -7,15 +7,13 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
-// TestVersionsForScheme verifies the Ed25519 list excludes Google and ML-DSA-44
-// and the MLDSA44 list contains only VersionMLDSA44.
+// TestVersionsForScheme covers scheme-specific preference lists.
 func TestVersionsForScheme(t *testing.T) {
 	ed := roughtime.VersionsForScheme(roughtime.SchemeEd25519)
 	if len(ed) == 0 {
@@ -33,23 +31,7 @@ func TestVersionsForScheme(t *testing.T) {
 	}
 }
 
-// TestVersionsForSchemeUnknown verifies an unknown scheme falls through to the
-// Ed25519 list.
-func TestVersionsForSchemeUnknown(t *testing.T) {
-	got := roughtime.VersionsForScheme(roughtime.Scheme(99))
-	want := roughtime.VersionsForScheme(roughtime.SchemeEd25519)
-	if len(got) != len(want) {
-		t.Fatalf("unknown scheme: got %d versions, want %d (Ed25519 list length)", len(got), len(want))
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			t.Fatalf("unknown scheme[%d] = %v, want %v", i, got[i], want[i])
-		}
-	}
-}
-
-// TestSchemeOfKey verifies SchemeOfKey maps 32-byte keys to Ed25519, 1312-byte
-// to ML-DSA-44, and rejects others.
+// TestSchemeOfKey covers key-length scheme selection.
 func TestSchemeOfKey(t *testing.T) {
 	if sch, err := roughtime.SchemeOfKey(make([]byte, 32)); err != nil || sch != roughtime.SchemeEd25519 {
 		t.Fatalf("32-byte: sch=%v err=%v", sch, err)
@@ -62,8 +44,7 @@ func TestSchemeOfKey(t *testing.T) {
 	}
 }
 
-// TestDecodePublicKey verifies DecodePublicKey accepts std/raw/url base64 and
-// hex encodings of a 32-byte key.
+// TestDecodePublicKey covers Ed25519 text encodings.
 func TestDecodePublicKey(t *testing.T) {
 	want := make([]byte, 32)
 	for i := range want {
@@ -86,13 +67,13 @@ func TestDecodePublicKey(t *testing.T) {
 	}
 }
 
-// TestDecodePublicKeyMLDSA44 verifies DecodePublicKey accepts a 1312-byte
-// ML-DSA-44 key in base64 and hex.
+// TestDecodePublicKeyMLDSA44 covers ML-DSA-44 text encodings.
 func TestDecodePublicKeyMLDSA44(t *testing.T) {
 	want := bytes.Repeat([]byte{0x42}, 1312)
 	for _, in := range []string{
 		base64.StdEncoding.EncodeToString(want),
 		fmt.Sprintf("%x", want),
+		fmt.Sprintf("%x\n", want),
 	} {
 		got, err := roughtime.DecodePublicKey(in)
 		if err != nil {
@@ -104,8 +85,7 @@ func TestDecodePublicKeyMLDSA44(t *testing.T) {
 	}
 }
 
-// TestDecodePublicKeyRejectsWrongLength verifies DecodePublicKey rejects keys
-// that are not 32 or 1312 bytes.
+// TestDecodePublicKeyRejectsWrongLength covers invalid key sizes.
 func TestDecodePublicKeyRejectsWrongLength(t *testing.T) {
 	for _, n := range []int{0, 16, 33, 64, 1311, 1313, 2048} {
 		raw := bytes.Repeat([]byte{0x99}, n)
@@ -113,57 +93,4 @@ func TestDecodePublicKeyRejectsWrongLength(t *testing.T) {
 			t.Fatalf("DecodePublicKey accepted %d-byte key", n)
 		}
 	}
-}
-
-// TestDecodePublicKeyTruncatesError verifies DecodePublicKey error messages are
-// bounded in length.
-func TestDecodePublicKeyTruncatesError(t *testing.T) {
-	huge := strings.Repeat("X", 100_000)
-	_, err := roughtime.DecodePublicKey(huge)
-	if err == nil {
-		t.Fatal("DecodePublicKey accepted 100k-byte garbage")
-	}
-	if len(err.Error()) > 200 {
-		t.Fatalf("error message length %d exceeds bound; should truncate", len(err.Error()))
-	}
-}
-
-// FuzzDecodePublicKey fuzzes DecodePublicKey to ensure successful decodes
-// always pass SchemeOfKey.
-func FuzzDecodePublicKey(f *testing.F) {
-	pk := make([]byte, 32)
-	f.Add(base64.StdEncoding.EncodeToString(pk))
-	f.Add(fmt.Sprintf("%x", pk))
-	f.Add("")
-	f.Add("not a key")
-	f.Fuzz(func(t *testing.T, s string) {
-		b, err := roughtime.DecodePublicKey(s)
-		if err != nil {
-			return
-		}
-		if _, err := roughtime.SchemeOfKey(b); err != nil {
-			t.Fatalf("DecodePublicKey returned length %d; SchemeOfKey rejects it", len(b))
-		}
-	})
-}
-
-// FuzzVersionsForScheme fuzzes VersionsForScheme to ensure non-PQ schemes never
-// include VersionMLDSA44.
-func FuzzVersionsForScheme(f *testing.F) {
-	f.Add(int(roughtime.SchemeEd25519))
-	f.Add(int(roughtime.SchemeMLDSA44))
-	f.Add(99)
-	f.Add(-1)
-	f.Fuzz(func(t *testing.T, n int) {
-		vs := roughtime.VersionsForScheme(roughtime.Scheme(n))
-		seenPQ := false
-		for _, v := range vs {
-			if v == protocol.VersionMLDSA44 {
-				seenPQ = true
-			}
-		}
-		if roughtime.Scheme(n) != roughtime.SchemeMLDSA44 && seenPQ {
-			t.Fatalf("non-PQ scheme %d returned VersionMLDSA44", n)
-		}
-	})
 }

@@ -19,16 +19,25 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
-// recordLatency adds an RTT sample to out via Algorithm R reservoir sampling.
-func recordLatency(out *workerResult, rtt time.Duration) {
-	out.received++
-	if len(out.latencies) < reservoirSize {
-		out.latencies = append(out.latencies, rtt)
+// latencyReservoir holds a bounded random sample of RTTs.
+type latencyReservoir struct {
+	mu     sync.Mutex
+	values []time.Duration
+	seen   uint64
+}
+
+// record adds an RTT sample via Algorithm R reservoir sampling.
+func (r *latencyReservoir) record(rtt time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen++
+	if len(r.values) < reservoirSize {
+		r.values = append(r.values, rtt)
 		return
 	}
-	j := mrand.Uint64N(out.received)
+	j := mrand.Uint64N(r.seen)
 	if j < reservoirSize {
-		out.latencies[j] = rtt
+		r.values[j] = rtt
 	}
 }
 
@@ -39,7 +48,36 @@ func bumpAfter(start, collectAfter time.Time, c *uint64) {
 	}
 }
 
-// randomizeNonce fills n with non-cryptographic random bytes for distinctness.
+// recordLatency updates full-run latency aggregates.
+func recordLatency(out *workerResult, rtt time.Duration) {
+	if out.successes == 0 || rtt < out.latencyMin {
+		out.latencyMin = rtt
+	}
+	if rtt > out.latencyMax {
+		out.latencyMax = rtt
+	}
+	out.latencyTotal += float64(rtt)
+}
+
+// operationDeadline returns the earlier timeout or context deadline.
+func operationDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	deadline := time.Now().Add(timeout)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		return contextDeadline
+	}
+	return deadline
+}
+
+// contextStopped also recognizes a deadline before its cancellation propagates.
+func contextStopped(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	deadline, ok := ctx.Deadline()
+	return ok && !time.Now().Before(deadline)
+}
+
+// randomizeNonce fills n with non-cryptographic bytes for per-request variation.
 func randomizeNonce(n []byte) {
 	full := len(n) - len(n)%8
 	for i := 0; i < full; i += 8 {
@@ -68,7 +106,8 @@ func setTCPNoDelay(c net.Conn) {
 	}
 }
 
-// worker dispatches to the UDP or TCP driver.
+// worker dispatches to a transport driver and reports whether it ran until
+// cancellation.
 func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
 	if cfg.transport == "tcp" {
 		return workerTCP(ctx, cfg, out, collectAfter)
@@ -76,14 +115,10 @@ func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfte
 	return workerUDP(ctx, cfg, out, collectAfter)
 }
 
-// workerUDP runs the send/recv loop on one UDP socket and returns false if dial
-// fails.
+// workerUDP runs one UDP loop and returns false on initialization or reconnect
+// failure.
 func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
-	raddr, err := net.ResolveUDPAddr("udp", cfg.addr)
-	if err != nil {
-		return false
-	}
-	conn, err := net.DialUDP("udp", nil, raddr)
+	conn, err := net.DialUDP("udp", nil, cfg.udpAddr)
 	if err != nil {
 		return false
 	}
@@ -103,17 +138,20 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	timeout := cfg.timeout
 	verify := cfg.verify
 	buf := make([]byte, protocol.MaxUDPReply)
-	for ctx.Err() == nil {
+	for !contextStopped(ctx) {
 		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
 		// absolute deadline set before timing, so SetDeadline stays out of the
 		// RTT
-		deadline := time.Now().Add(timeout)
+		deadline := operationDeadline(ctx, timeout)
 		_ = conn.SetWriteDeadline(deadline)
 		_ = conn.SetReadDeadline(deadline)
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
+			if contextStopped(ctx) {
+				return true
+			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
@@ -121,16 +159,20 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			}
 			continue
 		}
+		bumpAfter(start, collectAfter, &out.sent)
 
 		n, err := conn.Read(buf)
 		rtt := time.Since(start)
 		if err != nil {
+			if contextStopped(ctx) {
+				return true
+			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 				_ = conn.Close()
-				conn, err = net.DialUDP("udp", nil, raddr)
+				conn, err = net.DialUDP("udp", nil, cfg.udpAddr)
 				if err != nil {
-					return true
+					return false
 				}
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
@@ -138,25 +180,37 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			continue
 		}
 
-		// record latency on RX completion so verify-failed replies (often fast
-		// grease) do not bias percentiles upward
-		if !start.Before(collectAfter) {
-			recordLatency(out, rtt)
+		collect := !start.Before(collectAfter)
+		if collect {
+			out.received++
+		}
+		if n > len(req) {
+			if collect {
+				out.errAmp++
+			}
+			continue
 		}
 
 		if verify {
 			if _, _, err := protocol.VerifyReply(cfg.versions, buf[:n], cfg.rootPK, nonce, req); err != nil {
 				// grease and genuine faults share this bucket
-				bumpAfter(start, collectAfter, &out.errVerify)
+				if collect {
+					out.errVerify++
+				}
 				continue
 			}
+		}
+		if collect {
+			recordLatency(out, rtt)
+			out.successes++
+			cfg.latencies.record(rtt)
 		}
 	}
 	return true
 }
 
-// workerTCP runs the send/recv loop on a TCP connection and redials on
-// transport or framing errors.
+// workerTCP runs the TCP loop and returns false on initialization or reconnect
+// failure.
 func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
 	timeout := cfg.timeout
 	verify := cfg.verify
@@ -192,37 +246,44 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	}
 
 	replyBuf := make([]byte, protocol.PacketHeaderSize+protocol.MaxTCPReplyBody)
-	for ctx.Err() == nil {
+	for !contextStopped(ctx) {
 		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
 		// one absolute deadline covers both reads and stays out of the measured
 		// RTT
-		deadline := time.Now().Add(timeout)
+		deadline := operationDeadline(ctx, timeout)
 		_ = conn.SetWriteDeadline(deadline)
 		_ = conn.SetReadDeadline(deadline)
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
+			if contextStopped(ctx) {
+				return true
+			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
 				bumpAfter(start, collectAfter, &out.errWrite)
 			}
 			if !reconnect() {
-				return true
+				return false
 			}
 			continue
 		}
+		bumpAfter(start, collectAfter, &out.sent)
 
 		hdr := replyBuf[:protocol.PacketHeaderSize]
 		if _, err := io.ReadFull(conn, hdr); err != nil {
+			if contextStopped(ctx) {
+				return true
+			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
 			}
 			if !reconnect() {
-				return true
+				return false
 			}
 			continue
 		}
@@ -230,35 +291,50 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		if err != nil || bodyLen == 0 || bodyLen > protocol.MaxTCPReplyBody {
 			bumpAfter(start, collectAfter, &out.errRead)
 			if !reconnect() {
-				return true
+				return false
 			}
 			continue
 		}
 		pkt := replyBuf[:protocol.PacketHeaderSize+int(bodyLen)]
 		if _, err := io.ReadFull(conn, pkt[protocol.PacketHeaderSize:]); err != nil {
+			if contextStopped(ctx) {
+				return true
+			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
 			}
 			if !reconnect() {
-				return true
+				return false
 			}
 			continue
 		}
 		rtt := time.Since(start)
 
-		// record latency on RX completion so verify-failed replies (often fast
-		// grease) do not bias percentiles upward
-		if !start.Before(collectAfter) {
-			recordLatency(out, rtt)
+		collect := !start.Before(collectAfter)
+		if collect {
+			out.received++
+		}
+		if len(pkt) > len(req) {
+			if collect {
+				out.errAmp++
+			}
+			continue
 		}
 
 		if verify {
 			if _, _, err := protocol.VerifyReply(cfg.versions, pkt, cfg.rootPK, nonce, req); err != nil {
-				bumpAfter(start, collectAfter, &out.errVerify)
+				if collect {
+					out.errVerify++
+				}
 				continue
 			}
+		}
+		if collect {
+			recordLatency(out, rtt)
+			out.successes++
+			cfg.latencies.record(rtt)
 		}
 	}
 	return true

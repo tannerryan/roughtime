@@ -12,7 +12,7 @@ import (
 	"slices"
 )
 
-// Wire-format limits.
+// Parsing and encoding limits.
 const (
 	// maxMessageSize is the largest accepted Roughtime message in bytes.
 	maxMessageSize = 65535
@@ -209,8 +209,12 @@ func unwrapPacket(pkt []byte) ([]byte, error) {
 		return nil, errors.New("protocol: bad magic")
 	}
 	mlen := binary.LittleEndian.Uint32(pkt[len(packetMagic):PacketHeaderSize])
-	if uint32(len(pkt)-PacketHeaderSize) < mlen {
+	bodyLen := uint32(len(pkt) - PacketHeaderSize)
+	if bodyLen < mlen {
 		return nil, errors.New("protocol: truncated message")
+	}
+	if bodyLen > mlen {
+		return nil, errors.New("protocol: trailing data after framed message")
 	}
 	return pkt[PacketHeaderSize : PacketHeaderSize+mlen], nil
 }
@@ -224,7 +228,9 @@ func unwrapRequest(raw []byte) ([]byte, error) {
 }
 
 // NonceOffsetInRequest returns the byte offset of a 32- or 64-byte NONC value
-// in a raw request. It does not fully validate the request structure.
+// in a raw request. Framing is validated, but the inner message is only
+// inspected enough to locate NONC; callers that accept untrusted requests
+// should use [ParseRequest] for full validation.
 func NonceOffsetInRequest(request []byte) (int, error) {
 	msg, err := unwrapRequest(request)
 	if err != nil {
