@@ -73,8 +73,6 @@ const (
 	// maxPacketSize is the UDP payload limit for a 1500-byte IPv4 MTU. Receive
 	// buffers reserve one extra byte to detect larger datagrams.
 	maxPacketSize = 1472
-	// socketRecvBuffer is the requested receive-buffer size for each UDP socket.
-	socketRecvBuffer = 8 * 1024 * 1024
 )
 
 // Fixed batching parameters keep signing throughput predictable.

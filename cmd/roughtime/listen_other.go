@@ -39,9 +39,9 @@ var bufPool = sync.Pool{
 	},
 }
 
-// listen runs a single-socket UDP server with inline validation and a
+// listenPortable runs a single-socket UDP server with inline validation and a
 // channel-fed batcher.
-func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
+func listenPortable(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
 	maxSize := batchMaxSize
 	maxLatency := batchMaxLatency
@@ -63,7 +63,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	// per-iteration recovery lives inside batcher so batches persist and
 	// close(batchCh) on shutdown isn't raced by a restart
 	batcherWg.Go(func() {
-		batcher(ctx, batcherLog, conn, state, batchCh, maxSize, maxLatency)
+		batcher(ctx, batcherLog, udpConnReplyWriter{conn: conn}, state, batchCh, maxSize, maxLatency)
 	})
 
 	listenLog.Info("listening",
@@ -161,7 +161,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 
 // batcher groups validated requests by (version, hasType) and flushes on size
 // or latency triggers.
-func batcher(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], incoming <-chan validatedRequest, maxSize int, maxLatency time.Duration) {
+func batcher(ctx context.Context, log *zap.Logger, writer udpReplyWriter, state *atomic.Pointer[certState], incoming <-chan validatedRequest, maxSize int, maxLatency time.Duration) {
 	// pending holds one keyed batch and its first-arrival time.
 	type pending struct {
 		items []validatedRequest
@@ -200,7 +200,7 @@ func batcher(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *ato
 			return
 		}
 		delete(batches, key)
-		flushBatch(ctx, log, conn, state, key.version, b.items)
+		flushBatch(ctx, log, writer, state, key.version, b.items)
 	}
 
 	// step runs one select iteration and returns true after incoming closes and
@@ -248,7 +248,7 @@ func batcher(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *ato
 
 // flushBatch signs a batch, writes responses, and returns pooled read buffers
 // regardless of outcome.
-func flushBatch(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) {
+func flushBatch(ctx context.Context, log *zap.Logger, writer udpReplyWriter, state *atomic.Pointer[certState], ver protocol.Version, items []validatedRequest) {
 	defer func() {
 		for i := range items {
 			if items[i].bufPtr != nil {
@@ -258,6 +258,20 @@ func flushBatch(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *
 		}
 	}()
 	replies := signAndBuildRepliesCurrent(log, state, ver, items)
+	writer.writeReplies(ctx, log, ver, replies)
+}
+
+// udpReplyWriter sends a group of already-built UDP replies.
+type udpReplyWriter interface {
+	writeReplies(context.Context, *zap.Logger, protocol.Version, []readyReply)
+}
+
+// udpConnReplyWriter is the portable one-datagram-at-a-time writer.
+type udpConnReplyWriter struct {
+	conn *net.UDPConn
+}
+
+func (w udpConnReplyWriter) writeReplies(ctx context.Context, log *zap.Logger, ver protocol.Version, replies []readyReply) {
 	for i, r := range replies {
 		if ctx.Err() != nil {
 			for range replies[i:] {
@@ -265,8 +279,8 @@ func flushBatch(ctx context.Context, log *zap.Logger, conn *net.UDPConn, state *
 			}
 			return
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
-		if _, err := conn.WriteToUDP(r.bytes, r.peer); err != nil {
+		_ = w.conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
+		if _, err := w.conn.WriteToUDP(r.bytes, r.peer); err != nil {
 			log.Warn("UDP write failed", zap.Stringer("peer", r.peer), zap.Error(err))
 			incDropped(transportUDP, dropWrite)
 			continue

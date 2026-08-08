@@ -40,9 +40,9 @@ its complete flag list.
 
 The server accepts IETF Ed25519 requests over UDP and TCP and Google-Roughtime
 over UDP. The experimental ML-DSA-44 suite uses TCP only. The Linux UDP path
-uses one `SO_REUSEPORT` socket per `GOMAXPROCS` worker and
-batched I/O; other Unix systems use a portable socket loop. Windows is not
-supported.
+uses one `SO_REUSEPORT` socket per `GOMAXPROCS` worker and batched I/O. OpenBSD
+uses batched I/O on one socket; other Unix systems use a portable socket loop.
+Windows is not supported.
 
 Generate a root key and start the server:
 

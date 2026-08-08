@@ -27,6 +27,9 @@ import (
 // promptly.
 const idleReadTimeout = 500 * time.Millisecond
 
+// socketRecvBuffer is the requested receive-buffer size for each UDP socket.
+const socketRecvBuffer = 8 * 1024 * 1024
+
 // udpHasQueue is false: the SO_REUSEPORT fast path processes batches inline, so
 // dropQueue can't fire and the series is not registered.
 const udpHasQueue = false

@@ -34,6 +34,7 @@ jobs:
         target:
           - { goos: linux, goarch: amd64 }
           - { goos: freebsd, goarch: amd64 }
+          - { goos: openbsd, goarch: amd64 }
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
