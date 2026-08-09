@@ -24,6 +24,8 @@ jobs:
       - run: make verify verify-tidy verify-vendor
       - run: make fmt && git diff --exit-code
       - run: make lint
+      - run: make lint GOOS=openbsd
+      - run: make lint GOOS=freebsd
       - run: make vuln
       - run: make test-race
 

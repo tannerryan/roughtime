@@ -342,3 +342,42 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 		t.Fatal("listenTCP did not exit after cancel")
 	}
 }
+
+// TestListenTCPPerFamily covers the OpenBSD layout that binds one listener per
+// address family.
+func TestListenTCPPerFamily(t *testing.T) {
+	disableGrease(t)
+	prev := listenNetworks
+	listenNetworks = func(network, _ string) []string {
+		return []string{network + "4", network + "6"}
+	}
+	t.Cleanup(func() { listenNetworks = prev })
+
+	rootPK, edState := newCertState(t)
+	p, done, cancel := startListenTCP(t, edState, nil)
+	srv := protocol.ComputeSRV(rootPK)
+
+	// both families must answer, not just the one a wildcard bind would pick
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+		if err != nil {
+			t.Fatalf("CreateRequest: %v", err)
+		}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(p)), time.Second)
+		if err != nil {
+			t.Fatalf("dial %s: %v", host, err)
+		}
+		reply := tcpRoundTrip(t, conn, req)
+		_ = conn.Close()
+		if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req); err != nil {
+			t.Fatalf("VerifyReply %s: %v", host, err)
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("listenTCP did not exit after cancel")
+	}
+}

@@ -46,9 +46,9 @@ type openBSDMmsgConn struct {
 	writeHeaders []openBSDMmsghdr
 	writeIovecs  []unix.Iovec
 	writeAddrs   []unix.RawSockaddrAny
-	writePeers   []*net.UDPAddr
 }
 
+// newOpenBSDMmsgConn prepares reusable recvmmsg and sendmmsg vectors for conn.
 func newOpenBSDMmsgConn(conn *net.UDPConn, batchSize int) (*openBSDMmsgConn, error) {
 	raw, err := conn.SyscallConn()
 	if err != nil {
@@ -64,7 +64,6 @@ func newOpenBSDMmsgConn(conn *net.UDPConn, batchSize int) (*openBSDMmsgConn, err
 		writeHeaders: make([]openBSDMmsghdr, batchSize),
 		writeIovecs:  make([]unix.Iovec, batchSize),
 		writeAddrs:   make([]unix.RawSockaddrAny, batchSize),
-		writePeers:   make([]*net.UDPAddr, batchSize),
 	}
 	for i := range c.readBuffers {
 		c.replaceReadBuffer(i)
@@ -72,6 +71,7 @@ func newOpenBSDMmsgConn(conn *net.UDPConn, batchSize int) (*openBSDMmsgConn, err
 	return c, nil
 }
 
+// replaceReadBuffer assigns a fresh pooled packet buffer to read slot i.
 func (c *openBSDMmsgConn) replaceReadBuffer(i int) {
 	bufPtr := bufPool.Get().(*[]byte)
 	c.readBuffers[i] = bufPtr
@@ -81,6 +81,7 @@ func (c *openBSDMmsgConn) replaceReadBuffer(i int) {
 	c.readHeaders[i].header.SetIovlen(1)
 }
 
+// readBatch receives packets into the connection's reusable read vectors.
 func (c *openBSDMmsgConn) readBatch() (int, error) {
 	for i := range c.readHeaders {
 		c.readHeaders[i].length = 0
@@ -104,6 +105,7 @@ func (c *openBSDMmsgConn) readBatch() (int, error) {
 	return n, opErr
 }
 
+// writeReplies packs and sends replies, isolating destination-specific errors.
 func (c *openBSDMmsgConn) writeReplies(ctx context.Context, log *zap.Logger, ver protocol.Version, replies []readyReply) {
 	count := 0
 	for _, reply := range replies {
@@ -119,42 +121,53 @@ func (c *openBSDMmsgConn) writeReplies(ctx context.Context, log *zap.Logger, ver
 		c.writeHeaders[count].header.Namelen = uint32(c.writeAddrs[count].Addr.Len)
 		c.writeHeaders[count].header.Iov = &c.writeIovecs[count]
 		c.writeHeaders[count].header.SetIovlen(1)
-		c.writePeers[count] = reply.peer
 		count++
 	}
 
-	for sent := 0; sent < count; {
+	sent := 0
+	for sent < count {
 		if ctx.Err() != nil {
-			for range count - sent {
-				incDropped(transportUDP, dropWrite)
-			}
-			return
+			break
 		}
 		_ = c.conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
 		n, err := c.writeBatch(c.writeHeaders[sent:count])
-		if err != nil || n <= 0 || n > count-sent {
+		if n > 0 && n <= count-sent {
+			udpRespondedEd.Add(uint64(n))
+			if ce := log.Check(zap.DebugLevel, "sent response batch"); ce != nil {
+				ce.Write(
+					zap.Int("batch_size", n),
+					zap.Stringer("version", ver),
+				)
+			}
+			sent += n
+			continue
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		// sendmmsg hides a per-datagram error behind the short count of the
+		// messages before it, so skip that one datagram rather than the whole
+		// tail. Deadline and socket-wide failures still abandon the rest
+		errno, ok := errors.AsType[syscall.Errno](err)
+		if !ok || !dropsOneDatagram(errno) {
 			log.Warn("sendmmsg failed",
 				zap.Error(err),
 				zap.Int("written", n),
 				zap.Int("dropped", count-sent),
 			)
-			for range count - sent {
-				incDropped(transportUDP, dropWrite)
-			}
-			return
+			break
 		}
-		udpRespondedEd.Add(uint64(n))
-		if ce := log.Check(zap.DebugLevel, "sent response batch"); ce != nil {
-			ce.Write(
-				zap.Int("batch_size", n),
-				zap.Stringer("version", ver),
-			)
-		}
-		sent += n
+		log.Warn("sendmmsg dropped datagram", zap.Error(err))
+		incDropped(transportUDP, dropWrite)
+		sent++
+	}
+	for range count - sent {
+		incDropped(transportUDP, dropWrite)
 	}
 	runtime.KeepAlive(replies)
 }
 
+// writeBatch sends the supplied message headers through the socket's RawConn.
 func (c *openBSDMmsgConn) writeBatch(headers []openBSDMmsghdr) (int, error) {
 	var (
 		n     int
@@ -171,33 +184,49 @@ func (c *openBSDMmsgConn) writeBatch(headers []openBSDMmsghdr) (int, error) {
 	return n, opErr
 }
 
-// listen uses OpenBSD's recvmmsg/sendmmsg syscalls on one UDP socket.
+// udpSocket pairs a bound socket with its batched I/O vectors.
+type udpSocket struct {
+	network string
+	conn    *net.UDPConn
+	mmsg    *openBSDMmsgConn
+}
+
+// listen uses OpenBSD's recvmmsg/sendmmsg on one socket per address family.
 func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	listenLog := logger.Named("listener")
-	addr, err := net.ResolveUDPAddr("udp", serverListenAddr())
-	if err != nil {
-		return fmt.Errorf("resolving UDP listen address: %w", err)
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return fmt.Errorf("starting UDP server: %w", err)
-	}
-	applyReadBuffer(listenLog, conn)
+	addr := serverListenAddr()
+	networks := listenNetworks("udp", addr)
 
-	mmsg, err := newOpenBSDMmsgConn(conn, batchMaxSize)
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("preparing batched UDP socket: %w", err)
+	socks := make([]udpSocket, 0, len(networks))
+	closeAll := func() {
+		for _, s := range socks {
+			_ = s.conn.Close()
+		}
 	}
-	batchCh := make(chan validatedRequest, batchQueueSize)
-
-	var batcherWg sync.WaitGroup
-	batcherWg.Go(func() {
-		batcher(ctx, logger.Named("batcher"), mmsg, state, batchCh, batchMaxSize, batchMaxLatency)
-	})
+	for _, network := range networks {
+		udpAddr, err := net.ResolveUDPAddr(network, addr)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("resolving %s listen address: %w", network, err)
+		}
+		conn, err := net.ListenUDP(network, udpAddr)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("starting %s server: %w", network, err)
+		}
+		applyReadBuffer(listenLog.With(zap.String("network", network)), conn)
+		mmsg, err := newOpenBSDMmsgConn(conn, batchMaxSize)
+		if err != nil {
+			_ = conn.Close()
+			closeAll()
+			return fmt.Errorf("preparing batched %s socket: %w", network, err)
+		}
+		socks = append(socks, udpSocket{network: network, conn: conn, mmsg: mmsg})
+	}
 
 	listenLog.Info("listening",
-		zap.String("addr", conn.LocalAddr().String()),
+		zap.String("addr", addr),
+		zap.Strings("networks", networks),
 		zap.Int("port", *port),
 		zap.Int("queue_size", batchQueueSize),
 		zap.String("io", "recvmmsg/sendmmsg"),
@@ -205,18 +234,55 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	go func() {
 		<-ctx.Done()
 		listenLog.Info("shutdown initiated, unblocking reads")
-		_ = conn.SetDeadline(time.Unix(1, 0))
+		for _, s := range socks {
+			_ = s.conn.SetDeadline(time.Unix(1, 0))
+		}
 	}()
 
+	var wg sync.WaitGroup
+	for _, s := range socks {
+		wg.Go(func() {
+			serveUDP(ctx, listenLog.With(zap.String("network", s.network)), state, s.mmsg)
+		})
+	}
+
+	// reads only stop once cancellation trips the deadline
+	<-ctx.Done()
+	drainStart := time.Now()
+	wg.Wait()
+	closeAll()
+	listenLog.Info("shutdown complete",
+		zap.Uint64("received_total", requestsReceived.total()),
+		zap.Uint64("responded_total", requestsResponded.total()),
+		zap.Uint64("dropped_total", requestsDropped.total()),
+		zap.Uint64("amp_suppressed_total", statsAmpDropped.Load()),
+		zap.Uint64("panics_total", statsPanics.Load()),
+		zap.Uint64("batches_total", statsBatches.Load()),
+		zap.Uint64("batched_reqs_total", statsBatchedReqs.Load()),
+		zap.Uint64("batch_errs_total", statsBatchErrs.Load()),
+		zap.Duration("drain_duration", time.Since(drainStart)),
+	)
+	return nil
+}
+
+// serveUDP feeds one socket's batcher until ctx is done, then drains it.
+func serveUDP(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], mmsg *openBSDMmsgConn) {
+	batchCh := make(chan validatedRequest, batchQueueSize)
+
+	var batcherWg sync.WaitGroup
+	batcherWg.Go(func() {
+		batcher(ctx, log.Named("batcher"), mmsg, state, batchCh, batchMaxSize, batchMaxLatency)
+	})
+
 	readOneBatch := func() bool {
-		defer recoverGoroutine(listenLog, "listen")
+		defer recoverGoroutine(log, "listen")
 
 		n, err := mmsg.readBatch()
 		if err != nil {
 			if ctx.Err() != nil {
 				return true
 			}
-			listenLog.Warn("recvmmsg failed", zap.Error(err))
+			log.Warn("recvmmsg failed", zap.Error(err))
 			select {
 			case <-ctx.Done():
 				return true
@@ -232,14 +298,14 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			reqLen := int(header.length)
 			if header.header.Flags&unix.MSG_TRUNC != 0 || reqLen > maxPacketSize {
 				incDropped(transportUDP, dropOversize)
-				if ce := listenLog.Check(zap.DebugLevel, "dropped truncated UDP request"); ce != nil {
+				if ce := log.Check(zap.DebugLevel, "dropped truncated UDP request"); ce != nil {
 					ce.Write(zap.Int("reported_size", reqLen), zap.Int("buffer_size", len(*bufPtr)))
 				}
 				continue
 			}
 			if reqLen < minRequestSize {
 				incDropped(transportUDP, dropUndersize)
-				if ce := listenLog.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
+				if ce := log.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
 					ce.Write(zap.Int("size", reqLen))
 				}
 				continue
@@ -249,7 +315,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 				incDropped(transportUDP, dropParse)
 				continue
 			}
-			vr, reason, ok := validateRequest(listenLog, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, st)
+			vr, reason, ok := validateRequest(log, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, st)
 			if !ok {
 				incDropped(transportUDP, reason)
 				continue
@@ -260,7 +326,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 				mmsg.replaceReadBuffer(i)
 			default:
 				incDropped(transportUDP, dropQueue)
-				if ce := listenLog.Check(zap.DebugLevel, "dropped request: batcher queue full"); ce != nil {
+				if ce := log.Check(zap.DebugLevel, "dropped request: batcher queue full"); ce != nil {
 					ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen), zap.Int("queue_size", batchQueueSize))
 				}
 			}
@@ -270,27 +336,14 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	for !readOneBatch() {
 	}
 
-	drainStart := time.Now()
 	close(batchCh)
 	batcherWg.Wait()
 	for _, bufPtr := range mmsg.readBuffers {
 		bufPool.Put(bufPtr)
 	}
-	_ = conn.Close()
-	listenLog.Info("shutdown complete",
-		zap.Uint64("received_total", requestsReceived.total()),
-		zap.Uint64("responded_total", requestsResponded.total()),
-		zap.Uint64("dropped_total", requestsDropped.total()),
-		zap.Uint64("amp_suppressed_total", statsAmpDropped.Load()),
-		zap.Uint64("panics_total", statsPanics.Load()),
-		zap.Uint64("batches_total", statsBatches.Load()),
-		zap.Uint64("batched_reqs_total", statsBatchedReqs.Load()),
-		zap.Uint64("batch_errs_total", statsBatchErrs.Load()),
-		zap.Duration("drain_duration", time.Since(drainStart)),
-	)
-	return nil
 }
 
+// openBSDUDPAddr decodes an OpenBSD sockaddr into a UDP address.
 func openBSDUDPAddr(raw *unix.RawSockaddrAny, namelen uint32) (*net.UDPAddr, error) {
 	switch raw.Addr.Family {
 	case unix.AF_INET:
@@ -314,6 +367,7 @@ func openBSDUDPAddr(raw *unix.RawSockaddrAny, namelen uint32) (*net.UDPAddr, err
 	}
 }
 
+// udpAddrToOpenBSD encodes a UDP address as an OpenBSD sockaddr.
 func udpAddrToOpenBSD(raw *unix.RawSockaddrAny, addr *net.UDPAddr) error {
 	if addr == nil || addr.Port < 0 || addr.Port > 65535 {
 		return syscall.EINVAL
@@ -350,11 +404,13 @@ func udpAddrToOpenBSD(raw *unix.RawSockaddrAny, addr *net.UDPAddr) error {
 	return nil
 }
 
+// rawPort decodes a port stored in network byte order.
 func rawPort(port uint16) int {
 	b := (*[2]byte)(unsafe.Pointer(&port))
 	return int(b[0])<<8 | int(b[1])
 }
 
+// setRawPort stores port in network byte order.
 func setRawPort(raw *uint16, port int) {
 	b := (*[2]byte)(unsafe.Pointer(raw))
 	b[0] = byte(port >> 8)

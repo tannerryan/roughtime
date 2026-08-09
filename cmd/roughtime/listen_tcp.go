@@ -125,10 +125,19 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 
 	tcpLog := logger.Named("tcp")
 	addr := serverListenAddr()
+	networks := listenNetworks("tcp", addr)
+
 	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", addr)
-	if err != nil {
-		return fmt.Errorf("binding TCP: %w", err)
+	lns := make([]net.Listener, 0, len(networks))
+	for _, network := range networks {
+		ln, err := lc.Listen(ctx, network, addr)
+		if err != nil {
+			for _, prev := range lns {
+				_ = prev.Close()
+			}
+			return fmt.Errorf("binding %s: %w", network, err)
+		}
+		lns = append(lns, ln)
 	}
 
 	var (
@@ -156,6 +165,7 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 
 	tcpLog.Info("listening TCP",
 		zap.String("addr", addr),
+		zap.Strings("networks", networks),
 		zap.Int32("max_conns", maxTCPConnections),
 		zap.Uint32("max_request_bytes", maxTCPRequestSize),
 		zap.Duration("idle_timeout", tcpIdleTimeout),
@@ -167,55 +177,70 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 		zap.Strings("offered_versions", versionNames(prefs)),
 	)
 
-	// close listener on shutdown to unblock Accept
+	// close listeners on shutdown to unblock Accept
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
+		for _, ln := range lns {
+			_ = ln.Close()
+		}
 	}()
 
 	var live activeConnSet
 	var active atomic.Int32
 	var wg sync.WaitGroup
 
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				break
+	// accept serves one listener until ctx is done or it stops accepting.
+	accept := func(ln net.Listener) {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				tcpLog.Warn("Accept failed", zap.Error(err))
+				// backoff to avoid hot spin, and observe ctx.Done so shutdown
+				// isn't held
+				select {
+				case <-time.After(acceptErrorBackoff):
+				case <-ctx.Done():
+				}
+				continue
 			}
-			tcpLog.Warn("Accept failed", zap.Error(err))
-			// backoff to avoid hot spin, and observe ctx.Done so shutdown isn't
-			// held
-			select {
-			case <-time.After(acceptErrorBackoff):
-			case <-ctx.Done():
-			}
-			continue
-		}
-		statsTCPAccepted.Add(1)
-		if active.Load() >= maxTCPConnections {
-			_ = c.Close()
-			statsTCPRejected.Add(1)
-			if ce := tcpLog.Check(zap.DebugLevel, "rejected: max_conns reached"); ce != nil {
-				ce.Write(zap.Stringer("peer", c.RemoteAddr()))
-			}
-			continue
-		}
-		if tcp, ok := c.(*net.TCPConn); ok {
-			_ = tcp.SetNoDelay(true)
-		}
-		active.Add(1)
-		live.add(c)
-		wg.Go(func() {
-			defer func() {
-				live.remove(c)
+			statsTCPAccepted.Add(1)
+			// reserve the slot before checking so concurrent accept loops can't
+			// both admit the last connection
+			if active.Add(1) > maxTCPConnections {
 				active.Add(-1)
 				_ = c.Close()
-			}()
-			defer recoverGoroutine(tcpLog, "tcp conn")
-			handleTCPConn(ctx, tcpLog, c, edState, pqState, edBatchCh, pqBatchCh, prefs)
+				statsTCPRejected.Add(1)
+				if ce := tcpLog.Check(zap.DebugLevel, "rejected: max_conns reached"); ce != nil {
+					ce.Write(zap.Stringer("peer", c.RemoteAddr()))
+				}
+				continue
+			}
+			if tcp, ok := c.(*net.TCPConn); ok {
+				_ = tcp.SetNoDelay(true)
+			}
+			live.add(c)
+			wg.Go(func() {
+				defer func() {
+					live.remove(c)
+					active.Add(-1)
+					_ = c.Close()
+				}()
+				defer recoverGoroutine(tcpLog, "tcp conn")
+				handleTCPConn(ctx, tcpLog, c, edState, pqState, edBatchCh, pqBatchCh, prefs)
+			})
+		}
+	}
+
+	var acceptWg sync.WaitGroup
+	for _, ln := range lns {
+		acceptWg.Go(func() {
+			accept(ln)
 		})
 	}
+	acceptWg.Wait()
 
 	// graceful drain: wait up to tcpShutdownGrace, then force-close
 	drainStart := time.Now()
@@ -569,8 +594,8 @@ func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-ch
 	}
 }
 
-// flushTCPBatchCurrent signs with the currently published certificate,
-// retrying a concurrent rotation before beginning the operation.
+// flushTCPBatchCurrent signs with the currently published certificate, retrying
+// a concurrent rotation before beginning the operation.
 func flushTCPBatchCurrent(log *zap.Logger, state *atomic.Pointer[certState], ver protocol.Version, items []tcpBatchItem) {
 	st := acquireCurrent(state)
 	if st == nil {

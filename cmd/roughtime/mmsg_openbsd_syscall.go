@@ -10,6 +10,9 @@ import (
 	"unsafe"
 )
 
+// openBSDSyscall6 calls a dynamically imported libc function with six
+// arguments.
+//
 //go:linkname openBSDSyscall6 syscall.syscall6
 func openBSDSyscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)
 
@@ -21,6 +24,7 @@ var libcSendmmsgTrampolineAddr uintptr
 
 //go:cgo_import_dynamic libc_sendmmsg sendmmsg "libc.so"
 
+// openBSDRecvMmsg invokes libc recvmmsg for the supplied message headers.
 func openBSDRecvMmsg(fd uintptr, headers []openBSDMmsghdr, flags int) (int, error) {
 	if len(headers) == 0 {
 		return 0, nil
@@ -40,6 +44,7 @@ func openBSDRecvMmsg(fd uintptr, headers []openBSDMmsghdr, flags int) (int, erro
 	return int(r0), nil
 }
 
+// openBSDSendMmsg invokes libc sendmmsg for the supplied message headers.
 func openBSDSendMmsg(fd uintptr, headers []openBSDMmsghdr, flags int) (int, error) {
 	if len(headers) == 0 {
 		return 0, nil

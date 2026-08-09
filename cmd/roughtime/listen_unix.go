@@ -18,6 +18,20 @@ import (
 // shutdown.
 const udpWriteTimeout = 2 * time.Second
 
+// listenNetworks returns the networks to bind. OpenBSD lacks IPv4-mapped IPv6,
+// so a wildcard needs one socket per family. It is a variable so tests can
+// force the split off OpenBSD.
+var listenNetworks = func(network, addr string) []string {
+	if runtime.GOOS != "openbsd" {
+		return []string{network}
+	}
+	// an explicit host already pins the family
+	if host, _, err := net.SplitHostPort(addr); err != nil || host != "" {
+		return []string{network}
+	}
+	return []string{network + "4", network + "6"}
+}
+
 // applyReadBuffer sets SO_RCVBUF and logs if the kernel clamps its size.
 func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 	if err := conn.SetReadBuffer(socketRecvBuffer); err != nil {

@@ -260,30 +260,32 @@ func respond(ctx context.Context, log *zap.Logger, conn net.PacketConn, p *ipv6.
 	// sendmmsg may return a short count, so loop until the slice drains
 	for len(out) > 0 {
 		if ctx.Err() != nil {
-			for range out {
-				incDropped(transportUDP, dropWrite)
-			}
-			return
+			break
 		}
 		_ = conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
 		n, err := p.WriteBatch(out, 0)
-		if err != nil {
-			log.Warn("WriteBatch failed", zap.Error(err), zap.Int("dropped", len(out)))
-			for range out {
-				incDropped(transportUDP, dropWrite)
-			}
-			return
+		if n > 0 && n <= len(out) {
+			udpRespondedEd.Add(uint64(n))
+			out = out[n:]
+			continue
 		}
-		if n <= 0 {
-			// guard against infinite loop on degenerate returns
-			log.Warn("WriteBatch wrote 0", zap.Int("dropped", len(out)))
-			for range out {
-				incDropped(transportUDP, dropWrite)
-			}
-			return
+		if errors.Is(err, syscall.EINTR) {
+			continue
 		}
-		udpRespondedEd.Add(uint64(n))
-		out = out[n:]
+		// sendmmsg hides a per-datagram error behind the short count of the
+		// messages before it, so skip that one datagram rather than the whole
+		// tail. Deadline and socket-wide failures still abandon the rest
+		errno, ok := errors.AsType[syscall.Errno](err)
+		if !ok || !dropsOneDatagram(errno) {
+			log.Warn("WriteBatch failed", zap.Error(err), zap.Int("written", n), zap.Int("dropped", len(out)))
+			break
+		}
+		log.Warn("WriteBatch dropped datagram", zap.Error(err))
+		incDropped(transportUDP, dropWrite)
+		out = out[1:]
+	}
+	for range out {
+		incDropped(transportUDP, dropWrite)
 	}
 }
 
