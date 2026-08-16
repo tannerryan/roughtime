@@ -1,6 +1,6 @@
 module github.com/tannerryan/roughtime
 
-go 1.26.5
+go 1.26.6
 
 require (
 	filippo.io/mldsa v0.0.0-20260711112038-ff3f469cee29
