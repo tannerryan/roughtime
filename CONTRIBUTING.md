@@ -8,7 +8,7 @@ in an implementation.
 
 ## Development setup
 
-The project requires Go 1.26 or newer and Make. Install the tools once,
+The project requires Go 1.27 or newer and Make. Install the tools once,
 then run the tests:
 
 ```sh

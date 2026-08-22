@@ -82,7 +82,8 @@ func usesRoughtimHeader(g wireGroup) bool { return g >= groupD01 }
 // usesMJDMicroseconds reports whether timestamps use MJD-µs encoding.
 func usesMJDMicroseconds(g wireGroup) bool { return g >= groupD01 && g <= groupD07 }
 
-// usesFullPacketLeaf reports whether the Merkle leaf is the full request packet.
+// usesFullPacketLeaf reports whether the Merkle leaf is the full request
+// packet.
 func usesFullPacketLeaf(g wireGroup) bool { return g >= groupD12 }
 
 // noncInSREP reports whether NONC sits inside SREP (drafts 01-02).

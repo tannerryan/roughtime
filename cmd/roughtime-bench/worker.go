@@ -77,7 +77,8 @@ func contextStopped(ctx context.Context) bool {
 	return ok && !time.Now().Before(deadline)
 }
 
-// randomizeNonce fills n with non-cryptographic bytes for per-request variation.
+// randomizeNonce fills n with non-cryptographic bytes for per-request
+// variation.
 func randomizeNonce(n []byte) {
 	full := len(n) - len(n)%8
 	for i := 0; i < full; i += 8 {

@@ -6,14 +6,13 @@ package protocol
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
-
-	"filippo.io/mldsa"
 )
 
 // Request holds the parsed fields of a client request. Sub-slices alias
@@ -22,16 +21,16 @@ type Request struct {
 	// Nonce is the request nonce.
 	Nonce []byte
 	// Versions lists the client's offered versions. It is empty for Google and
-	// may be omitted on caller-built pre-draft-12 Request values passed directly
-	// to CreateReplies for backward compatibility.
+	// may be omitted on caller-built pre-draft-12 Request values passed
+	// directly to CreateReplies for backward compatibility.
 	Versions []Version
 	// SRV is the optional 32-byte server identifier (drafts 10+ and ML-DSA-44).
 	SRV []byte
 	// HasType reports whether the request carries TYPE=0.
 	HasType bool
-	// RawPacket is the framed or unframed request. CreateReplies requires it for
-	// drafts 12+ and ML-DSA-44; earlier nonce-leaf versions retain support for
-	// caller-built values.
+	// RawPacket is the framed or unframed request. CreateReplies requires it
+	// for drafts 12+ and ML-DSA-44; earlier nonce-leaf versions retain support
+	// for caller-built values.
 	RawPacket []byte
 }
 
@@ -160,8 +159,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 		}
 	}
 
-	// Draft 14 introduced TYPE under the shared draft-12 wire version. Ignore it
-	// for older and unknown versions.
+	// Draft 14 introduced TYPE under the shared draft-12 wire version. Ignore
+	// it for older and unknown versions.
 	if slices.Contains(req.Versions, VersionDraft12) || slices.Contains(req.Versions, VersionMLDSA44) {
 		if tb, ok := msg[TagTYPE]; ok {
 			if len(tb) != 4 {
@@ -177,8 +176,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 	return req, nil
 }
 
-// parseOptionalTags extracts VER and SRV into req. ParseRequest interprets
-// TYPE only after it knows whether an applicable version was offered.
+// parseOptionalTags extracts VER and SRV into req. ParseRequest interprets TYPE
+// only after it knows whether an applicable version was offered.
 func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 	if vb, ok := msg[TagVER]; ok {
 		if len(vb) == 0 || len(vb)%4 != 0 {
@@ -200,7 +199,8 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 }
 
 // ComputeSRV returns the SRV tag value, the first 32 bytes of SHA-512(0xff ||
-// rootPK). rootPK must be an Ed25519 or ML-DSA-44 key; otherwise it returns nil.
+// rootPK). rootPK must be an Ed25519 or ML-DSA-44 key; otherwise it returns
+// nil.
 func ComputeSRV(rootPK []byte) []byte {
 	if len(rootPK) != ed25519.PublicKeySize && len(rootPK) != mldsa.MLDSA44PublicKeySize {
 		return nil

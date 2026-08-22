@@ -1,5 +1,5 @@
 # Builder: vendored dependencies, static binary, stripped symbols.
-FROM golang:1.26 AS build
+FROM golang:1.27 AS build
 ARG COMMIT=""
 ARG BUILD_DATE=""
 WORKDIR /src

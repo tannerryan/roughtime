@@ -26,7 +26,7 @@ go run ./cmd/roughtime-client -addr time.txryan.com:2002 \
 
 ## Build
 
-Go 1.26 or newer is required.
+Go 1.27 or newer is required.
 
 ```sh
 make build

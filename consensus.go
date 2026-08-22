@@ -24,8 +24,8 @@ type ConsensusReport struct {
 // Consensus computes drift statistics across the successful entries in results.
 // It is a summary, not an agreement algorithm, and does not reject
 // falsetickers. For any sample count of at least three, fewer than half of the
-// contributing results cannot move the selected middle value outside the
-// honest results' range.
+// contributing results cannot move the selected middle value outside the honest
+// results' range.
 func Consensus(results []Result) ConsensusReport {
 	drifts := make([]time.Duration, 0, len(results))
 	for _, r := range results {

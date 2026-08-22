@@ -182,9 +182,9 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 	return best, wireGroupOf(best, true), nil
 }
 
-// isRecognizedVersion reports whether v has wire semantics implemented by
-// this package. Unknown versions can still be parsed from peer offers, but
-// builders and verifiers must not guess their wire format.
+// isRecognizedVersion reports whether v has wire semantics implemented by this
+// package. Unknown versions can still be parsed from peer offers, but builders
+// and verifiers must not guess their wire format.
 func isRecognizedVersion(v Version) bool {
 	return v == VersionGoogle ||
 		(v >= VersionDraft01 && v <= VersionDraft12) ||

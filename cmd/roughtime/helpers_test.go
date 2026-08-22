@@ -7,13 +7,13 @@ package main
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"filippo.io/mldsa"
 	"github.com/tannerryan/roughtime/protocol"
 )
 

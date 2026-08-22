@@ -6,12 +6,11 @@ package protocol
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
-
-	"filippo.io/mldsa"
 )
 
 // ErrDelegationWindow is returned by [VerifyReply] when the midpoint falls
@@ -240,8 +239,8 @@ func ExtractVersion(reply []byte) (Version, bool) {
 	return extractResponseVER(resp, srep)
 }
 
-// unwrapReply strips the ROUGHTIM header from framed replies and rejects it
-// for Google.
+// unwrapReply strips the ROUGHTIM header from framed replies and rejects it for
+// Google.
 func unwrapReply(reply []byte, g wireGroup) ([]byte, error) {
 	if usesRoughtimHeader(g) {
 		return unwrapPacket(reply)

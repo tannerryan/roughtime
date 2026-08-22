@@ -65,8 +65,8 @@ func validateTimestampEncoding(t time.Time, g wireGroup) error {
 		}
 	case usesMJDMicroseconds(g):
 		v := timeToMJDMicro(t)
-		// Detect a negative/pre-MJD time or overflow of the 24-bit day field
-		// by round-tripping the encoding.
+		// Detect a negative/pre-MJD time or overflow of the 24-bit day field by
+		// round-tripping the encoding.
 		decoded, err := mjdMicroToTime(v)
 		if err != nil || !decoded.Equal(t.Truncate(time.Microsecond)) {
 			return errors.New("protocol: timestamp outside 24-bit MJD microsecond range")
@@ -79,7 +79,8 @@ func validateTimestampEncoding(t time.Time, g wireGroup) error {
 	return nil
 }
 
-// radiMicroseconds encodes RADI in µs, rounding up with a one-microsecond floor.
+// radiMicroseconds encodes RADI in µs, rounding up with a one-microsecond
+// floor.
 func radiMicroseconds(d time.Duration) (uint32, error) {
 	units := ceilDurationUnits(d, time.Microsecond)
 	units = max(units, 1)

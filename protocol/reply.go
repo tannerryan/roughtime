@@ -206,7 +206,8 @@ func validateRequestForReply(ver Version, req Request, cert *Certificate) error 
 	if len(req.RawPacket) == 0 {
 		// Before draft 12 the Merkle leaf is the nonce, so the historical API
 		// permitted callers to construct Request values without retaining the
-		// encoded packet. Drafts 12+ authenticate the full packet and must have it.
+		// encoded packet. Drafts 12+ authenticate the full packet and must have
+		// it.
 		if usesFullPacketLeaf(wireGroupOf(ver, req.HasType)) {
 			return errors.New("missing RawPacket for full-packet Merkle leaf")
 		}

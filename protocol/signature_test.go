@@ -5,10 +5,9 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"testing"
-
-	"filippo.io/mldsa"
 )
 
 // TestSchemeOfGroupSweep covers every wire group's signature scheme.

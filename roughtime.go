@@ -29,8 +29,8 @@ var errChainAborted = errors.New("roughtime: chained request aborted")
 // package-level convenience queries.
 var defaultClient Client
 
-// retryInitMu serializes lazy tracker installation without making Client
-// values themselves non-copyable.
+// retryInitMu serializes lazy tracker installation without making Client values
+// themselves non-copyable.
 var retryInitMu sync.Mutex
 
 // Server describes one Roughtime server with a trust root and one or more
@@ -103,7 +103,8 @@ type Client struct {
 	Timeout time.Duration
 	// MaxAttempts caps attempts per query. Backoff starts at 1s, grows by 1.5,
 	// persists by root key across calls, and resets after a verified response.
-	// Zero tries each configured endpoint once; negative values mean one attempt.
+	// Zero tries each configured endpoint once; negative values mean one
+	// attempt.
 	MaxAttempts int
 	// Concurrency caps in-flight queries in [Client.QueryAll] and defaults to
 	// [MaxQueryAllConcurrency] when non-positive.
@@ -301,8 +302,9 @@ func (c *Client) QueryChain(ctx context.Context, servers []Server) (*ChainResult
 
 // QueryChainWithNonce is [Client.QueryChain] with the first successful link's
 // nonce set to seed for document timestamping. The seed must be 32 bytes for
-// IETF versions or 64 bytes for Google-Roughtime. Before that link, an otherwise
-// usable server incompatible with the seed aborts the remaining chain.
+// IETF versions or 64 bytes for Google-Roughtime. Before that link, an
+// otherwise usable server incompatible with the seed aborts the remaining
+// chain.
 func (c *Client) QueryChainWithNonce(ctx context.Context, servers []Server, seed []byte) (*ChainResult, error) {
 	if len(seed) == 0 {
 		return nil, errors.New("roughtime: chain seed nonce is empty")

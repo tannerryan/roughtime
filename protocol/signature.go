@@ -5,10 +5,9 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"errors"
 	"fmt"
-
-	"filippo.io/mldsa"
 )
 
 // MLDSA44PublicKeySize is the on-wire public-key length for ML-DSA-44.

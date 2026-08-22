@@ -95,7 +95,8 @@ func TestServeDualStack(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx) }()
 
-	// Poll until the TCP listener is bound so cancellation does not race startup.
+	// Poll until the TCP listener is bound so cancellation does not race
+	// startup.
 	waitForTCPReady(t, *port, 2*time.Second)
 	// Cases cover both configured signing schemes.
 	for _, test := range []struct {

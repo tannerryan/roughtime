@@ -33,8 +33,8 @@ type malfeasanceReportLegacy struct {
 	Responses []string `json:"responses"`
 }
 
-// malfeasanceLinkEarly is the drafts 01-03 array-entry format. Blind belongs
-// to the response that precedes the request derived from it.
+// malfeasanceLinkEarly is the drafts 01-03 array-entry format. Blind belongs to
+// the response that precedes the request derived from it.
 type malfeasanceLinkEarly struct {
 	Blind          string `json:"blind,omitempty"`
 	ResponsePacket string `json:"response_packet"`
@@ -143,8 +143,8 @@ func (c *Chain) inferMalfeasanceFormat() malfeasanceFormat {
 }
 
 // marshalEarlyReport serializes the drafts 01-03 array format. ChainLink.Rand
-// belongs to the current request, while the historical "blind" field belongs
-// to the preceding response, hence the one-position shift.
+// belongs to the current request, while the historical "blind" field belongs to
+// the preceding response, hence the one-position shift.
 func (c *Chain) marshalEarlyReport() ([]byte, error) {
 	report := make([]malfeasanceLinkEarly, len(c.Links))
 	for i, link := range c.Links {

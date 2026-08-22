@@ -5,13 +5,13 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"encoding/binary"
 	"maps"
 	"testing"
 	"time"
 
-	"filippo.io/mldsa"
 	"go.uber.org/goleak"
 )
 

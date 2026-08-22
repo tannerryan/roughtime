@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"encoding/hex"
 	"os"
@@ -16,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	"filippo.io/mldsa"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
@@ -29,7 +29,7 @@ func withSeedFile(t *testing.T) (string, ed25519.PublicKey) {
 	}
 	seed := sk.Seed()
 	path := filepath.Join(t.TempDir(), "seed.hex")
-	if err := os.WriteFile(path, []byte(hex.EncodeToString(seed)+"\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(hex.EncodeToString(seed)+"\n"), 0o600); err != nil {
 		t.Fatalf("write seed: %v", err)
 	}
 	return path, pk
@@ -45,7 +45,7 @@ func withPQSeedFile(t *testing.T) (string, []byte) {
 	}
 	path := filepath.Join(t.TempDir(), "pq.hex")
 	raw := []byte(mldsa44SeedHeader + "\n" + hex.EncodeToString(sk.Bytes()) + "\n")
-	if err := os.WriteFile(path, raw, 0600); err != nil {
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
 		t.Fatalf("write PQ seed: %v", err)
 	}
 	return path, sk.PublicKey().Bytes()
@@ -145,7 +145,7 @@ func TestGenerateKeypairSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if mode := info.Mode().Perm(); mode != 0600 {
+	if mode := info.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("mode=%#o want 0600", mode)
 	}
 	raw, _ := os.ReadFile(path)
@@ -165,7 +165,7 @@ func TestGenerateKeypairSuccess(t *testing.T) {
 // TestGenerateKeypairRefusesOverwrite covers existing seed paths.
 func TestGenerateKeypairRefusesOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "exists.hex")
-	if err := os.WriteFile(path, []byte("placeholder"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte("placeholder"), 0o600); err != nil {
 		t.Fatalf("pre-write: %v", err)
 	}
 	err := generateKeypair(path)
@@ -184,7 +184,7 @@ func TestGeneratePQKeypairSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if mode := info.Mode().Perm(); mode != 0600 {
+	if mode := info.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("mode=%#o want 0600", mode)
 	}
 	raw, _ := os.ReadFile(path)
@@ -212,7 +212,7 @@ func TestDerivePublicKeySuccess(t *testing.T) {
 // TestDerivePublicKeyRejectsInsecureMode covers group/world-readable seeds.
 func TestDerivePublicKeyRejectsInsecureMode(t *testing.T) {
 	path, _ := withSeedFile(t)
-	if err := os.Chmod(path, 0644); err != nil {
+	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
 	err := derivePublicKey(path)

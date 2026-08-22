@@ -5,19 +5,18 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
 	"time"
-
-	"filippo.io/mldsa"
 )
 
 // Certificate holds a pre-signed online delegation, with CERT bytes cached per
-// distinct encoding. CreateReplies calls may run concurrently, but
-// Wipe must run only after callers have stopped using the certificate.
+// distinct encoding. CreateReplies calls may run concurrently, but Wipe must
+// run only after callers have stopped using the certificate.
 type Certificate struct {
 	scheme sigScheme
 	mint   time.Time

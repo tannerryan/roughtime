@@ -5,13 +5,12 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"encoding/binary"
 	"strings"
 	"testing"
 	"time"
-
-	"filippo.io/mldsa"
 )
 
 // TestVerifyReplyAllVersions covers Google and recognized Ed25519 versions.

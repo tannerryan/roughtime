@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -22,7 +23,6 @@ import (
 	"syscall"
 	"time"
 
-	"filippo.io/mldsa"
 	"github.com/tannerryan/roughtime/protocol"
 	"go.uber.org/zap"
 )
@@ -86,8 +86,8 @@ func (s *certState) release() {
 }
 
 // acquireCurrent retains the certificate currently published in state. If a
-// rotation races the retain operation, it releases the replaced certificate
-// and retries the newly published state.
+// rotation races the retain operation, it releases the replaced certificate and
+// retries the newly published state.
 func acquireCurrent(state *atomic.Pointer[certState]) *certState {
 	if state == nil {
 		return nil
@@ -110,8 +110,8 @@ func acquireCurrent(state *atomic.Pointer[certState]) *certState {
 	}
 }
 
-// retire prevents new signing operations and wipes the online signing key
-// after every operation already using the state has completed.
+// retire prevents new signing operations and wipes the online signing key after
+// every operation already using the state has completed.
 func (s *certState) retire() {
 	if s == nil {
 		return
@@ -431,8 +431,8 @@ func certNotBefore(expiry time.Time) time.Time {
 const offlineExpiryCheckInterval = time.Second
 
 // monitorOfflineDelegation stops serving when offline delegation state is
-// unavailable or outside its validity window. Signing paths repeat the check
-// to cover scheduling jitter.
+// unavailable or outside its validity window. Signing paths repeat the check to
+// cover scheduling jitter.
 func monitorOfflineDelegation(ctx context.Context, scheme string, state *atomic.Pointer[certState]) error {
 	ticker := time.NewTicker(offlineExpiryCheckInterval)
 	defer ticker.Stop()
