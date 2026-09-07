@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -126,9 +127,46 @@ func TestParseRequestVERVersionRules(t *testing.T) {
 	}
 }
 
+// TestParseRequestVersionListCompatibility covers the draft-12/13 shared-ID
+// policy: untyped historical lists are tolerated, while TYPE makes the modern
+// 32-entry limit enforceable.
+func TestParseRequestVersionListCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		version    Version
+		count      int
+		withType   bool
+		wantReject bool
+	}{
+		{"draft 01 untyped 33", VersionDraft01, 33, false, false},
+		{"draft 10 untyped 33", VersionDraft10, 33, false, false},
+		{"draft 12 untyped 32", VersionDraft12, 32, false, false},
+		{"draft 12 untyped 33", VersionDraft12, 33, false, false},
+		{"draft 12 typed 32", VersionDraft12, 32, true, false},
+		{"draft 12 typed 33", VersionDraft12, 33, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nonce := randBytes(t, nonceSize(wireGroupOf(tc.version, false)))
+			raw := buildIETFRequest(nonce, longVersionList(tc.version, tc.count), tc.withType)
+			parsed, err := ParseRequest(raw)
+			if tc.wantReject {
+				if err == nil || !strings.Contains(err.Error(), "max 32") {
+					t.Fatalf("ParseRequest error = %v, want 32-entry limit", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseRequest: %v", err)
+			}
+			if len(parsed.Versions) != tc.count {
+				t.Fatalf("parsed %d versions, want %d", len(parsed.Versions), tc.count)
+			}
+		})
+	}
+}
+
 // TestParseRequestPaddingStrictness covers version-specific padding tags.
 func TestParseRequestPaddingStrictness(t *testing.T) {
-	// Cases cover padding rules across protocol generations.
 	cases := []struct {
 		name       string
 		padTag     uint32
@@ -231,19 +269,45 @@ func TestCreateRequestMLDSA44PadsToAmplificationBudget(t *testing.T) {
 
 // FuzzParseRequest exercises arbitrary request packets.
 func FuzzParseRequest(f *testing.F) {
-	_, googleReq, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
-	f.Add(googleReq)
-
-	_, ietfReq, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	f.Add(ietfReq)
-
-	_, d01Req, _ := CreateRequest([]Version{VersionDraft01}, rand.Reader, nil)
-	f.Add(d01Req)
+	for _, ver := range []Version{
+		VersionGoogle,
+		VersionDraft01,
+		VersionDraft02,
+		VersionDraft03,
+		VersionDraft05,
+		VersionDraft07,
+		VersionDraft08,
+		VersionDraft10,
+		VersionDraft12,
+		VersionMLDSA44,
+	} {
+		_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(req)
+	}
+	_, untyped, err := CreateRequestWithOptions(
+		[]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{OmitTYPE: true})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(untyped)
 
 	f.Add([]byte{})
 	f.Add([]byte{0x00})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		ParseRequest(data) //nolint:errcheck // fuzz target tests for panics
+		parsed, err := ParseRequest(data)
+		if err != nil {
+			return
+		}
+		off, err := NonceOffsetInRequest(data)
+		if err != nil {
+			t.Fatalf("valid request has no nonce offset: %v", err)
+		}
+		if end := off + len(parsed.Nonce); off < 0 || end > len(data) || !bytes.Equal(data[off:end], parsed.Nonce) {
+			t.Fatal("NonceOffsetInRequest does not locate parsed NONC")
+		}
 	})
 }

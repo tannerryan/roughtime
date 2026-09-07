@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -22,34 +23,81 @@ const MaxTCPReplyBody = 16 * 1024
 // before writing any reply.
 var ErrPeerClosedNoReply = errors.New("peer closed connection with no reply (server may not support the requested version, scheme, or transport)")
 
+// udpAddressResolver is the context-aware subset of net.Resolver needed to
+// preserve ResolveUDPAddr's address selection while bounding DNS work.
+type udpAddressResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+	LookupPort(context.Context, string, string) (int, error)
+}
+
+// resolveUDPAddr is the context-aware equivalent of ResolveUDPAddr("udp",
+// address). Like the standard library's addrList.forResolve, it prefers IPv4
+// for hostnames and IPv6 for bracketed IPv6 literals, falling back to the first
+// result when the preferred family is absent.
+func resolveUDPAddr(ctx context.Context, resolver udpAddressResolver, address string) (*net.UDPAddr, error) {
+	if address == "" {
+		return &net.UDPAddr{}, nil
+	}
+	host, service, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	port, err := resolver.LookupPort(ctx, "udp", service)
+	if err != nil {
+		return nil, err
+	}
+	if host == "" {
+		return &net.UDPAddr{Port: port}, nil
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, &net.DNSError{Err: "no suitable address", Name: host}
+	}
+
+	selected := ips[0]
+	wantIPv6 := strings.Contains(address, "[")
+	for _, ip := range ips {
+		isIPv4 := ip.IP.To4() != nil
+		if isIPv4 != wantIPv6 {
+			selected = ip
+			break
+		}
+	}
+	return &net.UDPAddr{IP: selected.IP, Port: port, Zone: selected.Zone}, nil
+}
+
 // RoundTripUDP sends one Roughtime request over UDP and returns the reply, RTT,
-// and receipt time.
+// and receipt time. timeout bounds name resolution, dialing, and I/O together.
 func RoundTripUDP(ctx context.Context, address string, request []byte, timeout time.Duration) (reply []byte, rtt time.Duration, localNow time.Time, err error) {
-	raddr, err := net.ResolveUDPAddr("udp", address)
+	deadline := time.Now().Add(timeout)
+	dialCtx, dialCancel := context.WithDeadline(ctx, deadline)
+	defer dialCancel()
+	raddr, err := resolveUDPAddr(dialCtx, net.DefaultResolver, address)
 	if err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("resolving %s: %w", address, err)
 	}
-	conn, err := net.DialUDP("udp", nil, raddr)
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(dialCtx, "udp", raddr.String())
 	if err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("dialing %s: %w", address, err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
 
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, 0, time.Time{}, fmt.Errorf("set deadline: %w", err)
 	}
 	start := time.Now()
-	if _, err := conn.Write(request); err != nil {
+	n, err := conn.Write(request)
+	if err == nil && n != len(request) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr
 		}
@@ -57,7 +105,7 @@ func RoundTripUDP(ctx context.Context, address string, request []byte, timeout t
 	}
 
 	buf := make([]byte, MaxUDPReply)
-	n, err := conn.Read(buf)
+	n, err = conn.Read(buf)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr

@@ -63,7 +63,7 @@ func (l ProofLink) Window() (lower, upper time.Time) {
 }
 
 // ParseProof loads a stored proof from gzipped or raw malfeasance-report JSON.
-// It validates bounds and syntax only; callers must use [Proof.Verify] and
+// It validates bounds and syntax only. Callers must use [Proof.Verify] and
 // [Proof.Trust] before relying on its contents.
 func ParseProof(data []byte) (*Proof, error) {
 	if len(data) > MaxProofBytes {
@@ -231,7 +231,7 @@ func (p *Proof) Trust(trusted []Server) error {
 }
 
 // SeedNonce parses and returns the first request's nonce. It does not
-// authenticate the request or proof; call [Proof.Verify] first when the value
+// authenticate the request or proof. Call [Proof.Verify] first when the value
 // will be trusted as a timestamp binding.
 func (p *Proof) SeedNonce() ([]byte, error) {
 	if p == nil || p.chain == nil {
@@ -247,9 +247,10 @@ func (p *Proof) SeedNonce() ([]byte, error) {
 	return append([]byte(nil), req.Nonce...), nil
 }
 
-// AttestationBound verifies the full chain, then returns the interval it proves
-// for the seed: the seed existed no later than latest. earliest is the start of
-// link 0's window, not a proven lower bound on the seed's age.
+// AttestationBound verifies the full chain. latest proves that the seed existed
+// by that time. earliest is the start of link 0's window, not a proven lower
+// bound on when the seed existed. Callers must also check witness trust with
+// [Proof.Trust] before accepting the result.
 func (p *Proof) AttestationBound() (earliest, latest time.Time, err error) {
 	if p == nil || p.chain == nil {
 		return time.Time{}, time.Time{}, errors.New("roughtime: nil proof")

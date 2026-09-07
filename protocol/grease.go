@@ -9,7 +9,7 @@ import (
 )
 
 // Grease attempts a random transformation of a signed reply. Malformed input
-// may be unchanged; other results may modify reply in place, so callers must
+// may be unchanged. Other results may modify reply in place, so callers must
 // own the buffer.
 func Grease(reply []byte, ver Version) []byte {
 	mode := mrand.IntN(4)

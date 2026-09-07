@@ -76,9 +76,10 @@ func (v flexString) MarshalJSON() ([]byte, error) {
 	return json.Marshal(s)
 }
 
-// ParseEcosystem decodes and validates a JSON server list. Semantic fields with
-// control, separator, or selected format characters are rejected rather than
-// rewritten.
+// ParseEcosystem decodes and structurally validates a JSON server list. Use
+// [NormalizeServer] to check client compatibility and order endpoints. Semantic
+// fields containing characters removed by [SanitizeForDisplay] are rejected
+// rather than rewritten.
 func ParseEcosystem(data []byte) ([]Server, error) {
 	if len(data) > MaxEcosystemBytes {
 		return nil, fmt.Errorf("roughtime: ecosystem is %d bytes (max %d)", len(data), MaxEcosystemBytes)
@@ -260,7 +261,7 @@ func validateSemanticField(name, value string) error {
 		return fmt.Errorf("%s is not valid UTF-8", name)
 	}
 	if SanitizeForDisplay(value) != value {
-		return fmt.Errorf("%s contains control, separator, or disallowed format characters", name)
+		return fmt.Errorf("%s contains control, line/paragraph separator, or disallowed format characters", name)
 	}
 	return nil
 }
@@ -309,8 +310,10 @@ func publicKeyTypeFor(sch Scheme) string {
 	}
 }
 
-// SanitizeForDisplay strips control, separator, and selected format characters
-// from untrusted display strings.
+// SanitizeForDisplay strips ASCII and C1 controls, Unicode line and paragraph
+// separators, and selected bidi or zero-width format characters from untrusted
+// display strings. It preserves ordinary Unicode spaces, including nonbreaking
+// spaces.
 func SanitizeForDisplay(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch {

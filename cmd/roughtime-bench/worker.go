@@ -107,38 +107,68 @@ func setTCPNoDelay(c net.Conn) {
 	}
 }
 
-// worker dispatches to a transport driver and reports whether it ran until
-// cancellation.
-func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
+// closeOnCancel closes this specific connection when ctx stops. The returned
+// function detaches the hook before a deliberate close or replacement.
+func closeOnCancel(ctx context.Context, conn net.Conn) func() {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return func() { _ = stop() }
+}
+
+// worker dispatches to a transport driver. Cancellation is not an error.
+func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) error {
 	if cfg.transport == "tcp" {
 		return workerTCP(ctx, cfg, out, collectAfter)
 	}
 	return workerUDP(ctx, cfg, out, collectAfter)
 }
 
-// workerUDP runs one UDP loop and returns false on initialization or reconnect
-// failure.
-func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
+// workerUDP runs one UDP loop until cancellation or a fatal initialization or
+// reconnect failure.
+func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) error {
 	conn, err := net.DialUDP("udp", nil, cfg.udpAddr)
 	if err != nil {
-		return false
+		if contextStopped(ctx) {
+			return nil
+		}
+		return fmt.Errorf("dial UDP: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	stopClose := closeOnCancel(ctx, conn)
+	defer func() {
+		stopClose()
+		_ = conn.Close()
+	}()
 
 	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
 	if err != nil {
-		return false
+		return fmt.Errorf("create UDP request: %w", err)
 	}
 	// bytes.Index would be unsafe: a random nonce can collide with header or
 	// SRV bytes
 	nonceOff, err := protocol.NonceOffsetInRequest(req)
 	if err != nil {
-		return false
+		return fmt.Errorf("locate UDP request nonce: %w", err)
+	}
+	reconnect := func() error {
+		stopClose()
+		_ = conn.Close()
+		c, err := net.DialUDP("udp", nil, cfg.udpAddr)
+		if err != nil {
+			if contextStopped(ctx) {
+				return nil
+			}
+			return fmt.Errorf("redial UDP: %w", err)
+		}
+		conn = c
+		stopClose = closeOnCancel(ctx, c)
+		return nil
 	}
 
 	timeout := cfg.timeout
 	verify := cfg.verify
-	buf := make([]byte, protocol.MaxUDPReply)
+	// One byte beyond the request distinguishes allowed replies from oversized
+	// datagrams. Any remainder of a much larger datagram is intentionally
+	// discarded by UDP semantics.
+	buf := make([]byte, len(req)+1)
 	for !contextStopped(ctx) {
 		randomizeNonce(nonce)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
@@ -151,7 +181,7 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
 			if contextStopped(ctx) {
-				return true
+				return nil
 			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
@@ -166,14 +196,12 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		rtt := time.Since(start)
 		if err != nil {
 			if contextStopped(ctx) {
-				return true
+				return nil
 			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
-				_ = conn.Close()
-				conn, err = net.DialUDP("udp", nil, cfg.udpAddr)
-				if err != nil {
-					return false
+				if err := reconnect(); err != nil || contextStopped(ctx) {
+					return err
 				}
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
@@ -207,43 +235,56 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			cfg.latencies.record(rtt)
 		}
 	}
-	return true
+	return nil
 }
 
-// workerTCP runs the TCP loop and returns false on initialization or reconnect
-// failure.
-func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) bool {
+// workerTCP runs the TCP loop until cancellation or a fatal initialization or
+// reconnect failure.
+func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) error {
 	timeout := cfg.timeout
 	verify := cfg.verify
 	dialer := net.Dialer{Timeout: timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", cfg.addr)
 	if err != nil {
-		return false
+		if contextStopped(ctx) {
+			return nil
+		}
+		return fmt.Errorf("dial TCP: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	stopClose := closeOnCancel(ctx, conn)
+	defer func() {
+		stopClose()
+		_ = conn.Close()
+	}()
 	setTCPNoDelay(conn)
 
 	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
 	if err != nil {
-		return false
+		return fmt.Errorf("create TCP request: %w", err)
 	}
 	nonceOff, err := protocol.NonceOffsetInRequest(req)
 	if err != nil {
-		return false
+		return fmt.Errorf("locate TCP request nonce: %w", err)
 	}
 
-	// reconnect closes conn and redials, returning false if the redial fails.
-	// No exponential backoff: this bench is a load generator, not a conformant
+	// reconnect detaches the old connection's cancellation callback before
+	// closing it, then installs a callback that captures the replacement. No
+	// exponential backoff: this bench is a load generator, not a conformant
 	// client.
-	reconnect := func() bool {
+	reconnect := func() error {
+		stopClose()
 		_ = conn.Close()
 		c, err := dialer.DialContext(ctx, "tcp", cfg.addr)
 		if err != nil {
-			return false
+			if contextStopped(ctx) {
+				return nil
+			}
+			return fmt.Errorf("redial TCP: %w", err)
 		}
 		conn = c
+		stopClose = closeOnCancel(ctx, c)
 		setTCPNoDelay(conn)
-		return true
+		return nil
 	}
 
 	replyBuf := make([]byte, protocol.PacketHeaderSize+protocol.MaxTCPReplyBody)
@@ -259,15 +300,15 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		start := time.Now()
 		if _, err := conn.Write(req); err != nil {
 			if contextStopped(ctx) {
-				return true
+				return nil
 			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
 				bumpAfter(start, collectAfter, &out.errWrite)
 			}
-			if !reconnect() {
-				return false
+			if err := reconnect(); err != nil || contextStopped(ctx) {
+				return err
 			}
 			continue
 		}
@@ -276,38 +317,38 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		hdr := replyBuf[:protocol.PacketHeaderSize]
 		if _, err := io.ReadFull(conn, hdr); err != nil {
 			if contextStopped(ctx) {
-				return true
+				return nil
 			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
 			}
-			if !reconnect() {
-				return false
+			if err := reconnect(); err != nil || contextStopped(ctx) {
+				return err
 			}
 			continue
 		}
 		bodyLen, err := protocol.ParsePacketHeader(hdr)
 		if err != nil || bodyLen == 0 || bodyLen > protocol.MaxTCPReplyBody {
 			bumpAfter(start, collectAfter, &out.errRead)
-			if !reconnect() {
-				return false
+			if err := reconnect(); err != nil || contextStopped(ctx) {
+				return err
 			}
 			continue
 		}
 		pkt := replyBuf[:protocol.PacketHeaderSize+int(bodyLen)]
 		if _, err := io.ReadFull(conn, pkt[protocol.PacketHeaderSize:]); err != nil {
 			if contextStopped(ctx) {
-				return true
+				return nil
 			}
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				bumpAfter(start, collectAfter, &out.timeouts)
 			} else {
 				bumpAfter(start, collectAfter, &out.errRead)
 			}
-			if !reconnect() {
-				return false
+			if err := reconnect(); err != nil || contextStopped(ctx) {
+				return err
 			}
 			continue
 		}
@@ -317,13 +358,6 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		if collect {
 			out.received++
 		}
-		if len(pkt) > len(req) {
-			if collect {
-				out.errAmp++
-			}
-			continue
-		}
-
 		if verify {
 			if _, _, err := protocol.VerifyReply(cfg.versions, pkt, cfg.rootPK, nonce, req); err != nil {
 				if collect {
@@ -338,5 +372,5 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			cfg.latencies.record(rtt)
 		}
 	}
-	return true
+	return nil
 }

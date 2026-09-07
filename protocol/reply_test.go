@@ -6,13 +6,67 @@ package protocol
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"strings"
 	"testing"
 	"time"
 )
 
+// TestValidateRequestForReply covers version offers, root binding, and the
+// historical nonce-only Request API.
+func TestValidateRequestForReply(t *testing.T) {
+	cert, _ := testCert(t)
+	srv := ComputeSRV(cert.edRootPK)
+	for _, tc := range []struct {
+		name    string
+		ver     Version
+		req     Request
+		wantErr string
+	}{
+		{"Google nonce only", VersionGoogle, Request{}, ""},
+		{"Google with versions", VersionGoogle, Request{Versions: []Version{VersionDraft08}}, "unexpectedly contains versions"},
+		{"legacy nonce only", VersionDraft08, Request{}, ""},
+		{"legacy matching offer", VersionDraft08, Request{Versions: []Version{VersionDraft08}}, ""},
+		{"legacy wrong offer", VersionDraft08, Request{Versions: []Version{VersionDraft07}}, "not offered"},
+		{"matching root", VersionDraft11, Request{SRV: srv}, ""},
+		{"wrong root", VersionDraft11, Request{SRV: make([]byte, 32)}, "does not identify"},
+		{"missing packet", VersionDraft12, Request{Versions: []Version{VersionDraft12}}, "missing RawPacket"},
+		{"typed missing packet", VersionDraft12, Request{HasType: true, Versions: []Version{VersionDraft12}}, "missing RawPacket"},
+		{"PQ missing packet", VersionMLDSA44, Request{HasType: true, Versions: []Version{VersionMLDSA44}}, "missing RawPacket"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRequestForReply(tc.ver, tc.req, cert)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run("parsed "+ver.ShortString(), func(t *testing.T) {
+			_, raw, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := ParseRequest(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateRequestForReply(ver, *req, cert); err != nil {
+				t.Fatal(err)
+			}
+			req.Versions = []Version{VersionDraft07}
+			if err := validateRequestForReply(ver, *req, cert); err == nil {
+				t.Fatal("accepted a mismatched offer")
+			}
+		})
+	}
+}
+
 // TestCreateRepliesBatch covers batched responses across versions.
 func TestCreateRepliesBatch(t *testing.T) {
-	// Cases cover batching across representative wire groups.
 	for _, tc := range []struct {
 		version Version
 		size    int

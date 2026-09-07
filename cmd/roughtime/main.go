@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -57,11 +58,11 @@ var (
 	// greaseRate is the probability of greasing each response.
 	greaseRate = flag.Float64("grease-rate", 0.01, "fraction of responses to grease (0 to disable)")
 	// metricsAddr is the optional metrics-listener address flag.
-	metricsAddr = flag.String("metrics-addr", "", "address (host:port) for unauthenticated /metrics and /healthz endpoints. Empty disables; use 127.0.0.1:PORT for loopback")
+	metricsAddr = flag.String("metrics-addr", "", "unauthenticated /metrics and /healthz address (host:port, empty disables). Use 127.0.0.1:PORT for loopback")
 	// statsInterval is the periodic statistics-log cadence flag.
 	statsInterval = flag.Duration("stats-interval", 60*time.Second, "cadence of the periodic stats log (e.g. 10s, 5m). Minimum 1s")
 	// offlineDelegation selects read-once root-key operation.
-	offlineDelegation = flag.Bool("offline-delegation", false, "read root keys only at startup and disable automatic delegation refresh; restart before certificate expiry")
+	offlineDelegation = flag.Bool("offline-delegation", false, "read root keys only at startup and disable delegation refresh. Restart before certificate expiry")
 )
 
 // Server-wide tunable constants.
@@ -119,8 +120,36 @@ func main() {
 	}
 }
 
+// validateActionFlags rejects ambiguous one-shot command invocations before any
+// action can modify a key file or print output.
+func validateActionFlags() error {
+	actions := make([]string, 0, 5)
+	if *showVersion {
+		actions = append(actions, "-version")
+	}
+	if *keygen != "" {
+		actions = append(actions, "-keygen")
+	}
+	if *pqKeygen != "" {
+		actions = append(actions, "-pq-keygen")
+	}
+	if *pubkey != "" {
+		actions = append(actions, "-pubkey")
+	}
+	if *pqPubkey != "" {
+		actions = append(actions, "-pq-pubkey")
+	}
+	if len(actions) > 1 {
+		return fmt.Errorf("action flags are mutually exclusive: %s", strings.Join(actions, ", "))
+	}
+	return nil
+}
+
 // dispatch routes the parsed flag globals to a subcommand or to serve.
 func dispatch() error {
+	if err := validateActionFlags(); err != nil {
+		return err
+	}
 	if *showVersion {
 		fmt.Printf("roughtime %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Full(), version.Copyright)
 		return nil
@@ -196,6 +225,7 @@ func serve(ctx context.Context) error {
 			enc.AddDuration("cert_end_offset", certEndOffset)
 			enc.AddDuration("cert_refresh_threshold", certRefreshThreshold)
 			enc.AddDuration("cert_check_interval", certCheckInterval)
+			enc.AddDuration("cert_validity_check_interval", certValidityCheckInterval)
 			enc.AddDuration("stats_interval", *statsInterval)
 			return nil
 		})),
@@ -246,7 +276,7 @@ func serve(ctx context.Context) error {
 		// captured so refreshLoop detects silent on-disk root-key changes
 		initialRootPK := append(ed25519.PublicKey(nil), rootPK...)
 		if *offlineDelegation {
-			certLog.Warn("offline delegation mode: Ed25519 root key will not be read again; restart before expiry",
+			certLog.Warn("offline delegation mode: Ed25519 root key will not be read again. Restart before expiry",
 				zap.Time("expiry", expiry),
 			)
 			wg.Go(func() {
@@ -280,7 +310,7 @@ func serve(ctx context.Context) error {
 
 		initialRootPK := append([]byte(nil), rootPK...)
 		if *offlineDelegation {
-			certLog.Warn("offline delegation mode: ML-DSA-44 root key will not be read again; restart before expiry",
+			certLog.Warn("offline delegation mode: ML-DSA-44 root key will not be read again. Restart before expiry",
 				zap.Time("expiry", expiry),
 			)
 			wg.Go(func() {

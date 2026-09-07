@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -39,6 +41,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	origPQPubkey := *pqPubkey
 	origMetrics := *metricsAddr
 	origStatsInterval := *statsInterval
+	origOfflineDelegation := *offlineDelegation
 	t.Cleanup(func() {
 		*port = origPort
 		*listenAddress = origListenAddress
@@ -53,6 +56,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 		*pqPubkey = origPQPubkey
 		*metricsAddr = origMetrics
 		*statsInterval = origStatsInterval
+		*offlineDelegation = origOfflineDelegation
 	})
 	*port = p
 	*listenAddress = ""
@@ -66,39 +70,181 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	*pqKeygen = ""
 	*pqPubkey = ""
 	*metricsAddr = ""
+	*offlineDelegation = false
 }
 
-// TestServeDualStack covers combined Ed25519 and ML-DSA-44 serving.
+// TestDispatchVersion exercises version output without starting listeners.
+func TestDispatchVersion(t *testing.T) {
+	withFlagGlobals(t, "", "", "error", 2002, 0)
+	output, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStdout := os.Stdout
+	t.Cleanup(func() {
+		os.Stdout = originalStdout
+		_ = output.Close()
+	})
+	os.Stdout = output
+	*showVersion = true
+	if err := dispatch(); err != nil {
+		t.Fatalf("dispatch version: %v", err)
+	}
+	if _, err := output.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(output)
+	if err != nil || !bytes.Contains(data, []byte("github.com/tannerryan/roughtime")) {
+		t.Fatalf("version output=%q, error=%v", data, err)
+	}
+}
+
+// TestValidateActionFlagsAllowsSingles preserves every existing one-shot
+// command while checking their shared mutual-exclusion gate.
+func TestValidateActionFlagsAllowsSingles(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func()
+	}{
+		{name: "none", set: func() {}},
+		{name: "version", set: func() { *showVersion = true }},
+		{name: "keygen", set: func() { *keygen = "ed.key" }},
+		{name: "pq-keygen", set: func() { *pqKeygen = "pq.key" }},
+		{name: "pubkey", set: func() { *pubkey = "ed.key" }},
+		{name: "pq-pubkey", set: func() { *pqPubkey = "pq.key" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFlagGlobals(t, "", "", "error", 2002, 0)
+			tc.set()
+			if err := validateActionFlags(); err != nil {
+				t.Fatalf("validateActionFlags: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateActionFlagsRejectsConflicts covers conflicts across version, key
+// generation, and public-key derivation actions.
+func TestValidateActionFlagsRejectsConflicts(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func()
+	}{
+		{name: "version and keygen", set: func() { *showVersion, *keygen = true, "ed.key" }},
+		{name: "both keygens", set: func() { *keygen, *pqKeygen = "ed.key", "pq.key" }},
+		{name: "both pubkeys", set: func() { *pubkey, *pqPubkey = "ed.key", "pq.key" }},
+		{name: "keygen and pubkey", set: func() { *pqKeygen, *pubkey = "pq.key", "ed.key" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFlagGlobals(t, "", "", "error", 2002, 0)
+			tc.set()
+			if err := validateActionFlags(); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+				t.Fatalf("validateActionFlags conflict error=%v", err)
+			}
+		})
+	}
+}
+
+// TestDispatchRejectsConflictingActionsBeforeExecution ensures a successful
+// first action cannot hide an ignored second action.
+func TestDispatchRejectsConflictingActionsBeforeExecution(t *testing.T) {
+	withFlagGlobals(t, "", "", "error", 2002, 0)
+	edPath := filepath.Join(t.TempDir(), "ed.key")
+	pqPath := filepath.Join(t.TempDir(), "pq.key")
+	*keygen = edPath
+	*pqKeygen = pqPath
+
+	err := dispatch()
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") ||
+		!strings.Contains(err.Error(), "-keygen") || !strings.Contains(err.Error(), "-pq-keygen") {
+		t.Fatalf("dispatch conflict error=%v", err)
+	}
+	for _, path := range []string{edPath, pqPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("conflicting dispatch modified %s: stat err=%v", path, err)
+		}
+	}
+}
+
+// startServeForTest retries the full server fixture if another process claims
+// either selected port before serve binds it.
+func startServeForTest(t *testing.T) (chan error, context.CancelFunc, string) {
+	t.Helper()
+	const maxAttempts = 5
+	var lastErr error
+attempts:
+	for range maxAttempts {
+		*port = pickFreeTCPPort(t)
+		metricsPort := pickFreeTCPPort(t)
+		if metricsPort == *port {
+			continue
+		}
+		metricsHostPort := net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort))
+		*metricsAddr = metricsHostPort
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			defer close(done)
+			done <- serve(ctx)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			if err := awaitTest(t, done, 5*time.Second, "full server cleanup"); err != nil {
+				t.Errorf("serve cleanup: %v", err)
+			}
+		})
+
+		addresses := [...]string{
+			net.JoinHostPort("::1", strconv.Itoa(*port)),
+			metricsHostPort,
+		}
+		var ready [len(addresses)]bool
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case err := <-done:
+				if !errors.Is(err, syscall.EADDRINUSE) {
+					t.Fatalf("serve startup: %v", err)
+				}
+				lastErr = err
+				cancel()
+				continue attempts
+			default:
+			}
+			for i, addr := range addresses {
+				if ready[i] {
+					continue
+				}
+				conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+				if err == nil {
+					ready[i] = true
+					_ = conn.Close()
+				}
+			}
+			if ready[0] && ready[1] {
+				return done, cancel, metricsHostPort
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		cancel()
+		lastErr = awaitTest(t, done, 5*time.Second, "failed full server attempt")
+		t.Fatalf("server did not become ready, serve returned: %v", lastErr)
+	}
+	t.Fatalf("server did not start after %d attempts, last error: %v", maxAttempts, lastErr)
+	return nil, nil, ""
+}
+
+// TestServeDualStack covers combined Ed25519 and ML-DSA-44 serving plus the
+// configured metrics listener.
 func TestServeDualStack(t *testing.T) {
-	dir := t.TempDir()
-	edPath := filepath.Join(dir, "ed.key")
-	if err := generateKeypair(edPath); err != nil {
-		t.Fatalf("generateKeypair: %v", err)
-	}
-	pqPath := filepath.Join(dir, "pq.key")
-	if err := generateMLDSA44Keypair(pqPath); err != nil {
-		t.Fatalf("generateMLDSA44Keypair: %v", err)
-	}
-	withFlagGlobals(t, edPath, pqPath, "error", pickFreeTCPPort(t), 0)
-	edCert, _, edRootPK, _, err := provisionCertificateKey()
-	if err != nil {
-		t.Fatalf("provision Ed25519: %v", err)
-	}
-	defer edCert.Wipe()
-	pqCert, _, pqRootPK, _, err := provisionMLDSA44CertificateKey()
-	if err != nil {
-		t.Fatalf("provision ML-DSA-44: %v", err)
-	}
-	defer pqCert.Wipe()
+	edPath, edRootPK := withSeedFile(t)
+	pqPath, pqRootPK := withPQSeedFile(t)
+	withFlagGlobals(t, edPath, pqPath, "error", 2002, 0)
+	done, cancel, metricsHostPort := startServeForTest(t)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- serve(ctx) }()
-
-	// Poll until the TCP listener is bound so cancellation does not race
-	// startup.
-	waitForTCPReady(t, *port, 2*time.Second)
-	// Cases cover both configured signing schemes.
 	for _, test := range []struct {
 		version protocol.Version
 		rootPK  []byte
@@ -118,87 +264,22 @@ func TestServeDualStack(t *testing.T) {
 			t.Fatalf("VerifyReply(%s): %v", test.version, err)
 		}
 	}
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("serve: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after cancel")
-	}
-}
-
-// waitForTCPReady polls until a TCP dial to [::1]:port succeeds or timeout
-// elapses.
-func waitForTCPReady(t *testing.T, port int, timeout time.Duration) {
-	t.Helper()
-	waitForTCPDialReady(t, net.JoinHostPort("::1", strconv.Itoa(port)), timeout)
-}
-
-// waitForTCPDialReady polls a literal host:port until a TCP dial succeeds or
-// timeout elapses.
-func waitForTCPDialReady(t *testing.T, addr string, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
-		if err == nil {
-			_ = c.Close()
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("TCP listener on %s not ready within %s", addr, timeout)
-}
-
-// TestServeWithMetricsAddr covers the configured metrics listener.
-func TestServeWithMetricsAddr(t *testing.T) {
-	dir := t.TempDir()
-	edPath := filepath.Join(dir, "ed.key")
-	if err := generateKeypair(edPath); err != nil {
-		t.Fatalf("generateKeypair: %v", err)
-	}
-	metricsPort := pickFreeTCPPort(t)
-	metricsHostPort := net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort))
-
-	withFlagGlobals(t, edPath, "", "error", pickFreeTCPPort(t), 0)
-	*metricsAddr = metricsHostPort
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- serve(ctx) }()
-
-	waitForTCPReady(t, *port, 2*time.Second)
-	waitForTCPDialReady(t, metricsHostPort, 2*time.Second)
-
-	resp, err := http.Get("http://" + metricsHostPort + "/metrics")
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + metricsHostPort + "/metrics")
 	if err != nil {
-		cancel()
-		<-done
 		t.Fatalf("scrape: %v", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		cancel()
-		<-done
+	if readErr != nil {
+		t.Fatalf("read scrape: %v", readErr)
+	}
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte("roughtime_build_info")) {
 		t.Fatalf("scrape status=%d body=%s", resp.StatusCode, body)
 	}
-	if !bytes.Contains(body, []byte("roughtime_build_info")) {
-		cancel()
-		<-done
-		t.Fatalf("scrape missing build_info:\n%s", body)
-	}
-
 	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("serve: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after cancel")
+	if err := awaitTest(t, done, 5*time.Second, "dual-stack server shutdown"); err != nil {
+		t.Fatalf("serve: %v", err)
 	}
 }
 
@@ -227,7 +308,7 @@ func TestServeRejectsBadEd25519Key(t *testing.T) {
 
 	err := serve(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "Ed25519") {
-		t.Fatalf("serve: %v; want Ed25519 provisioning error", err)
+		t.Fatalf("serve: %v, want Ed25519 provisioning error", err)
 	}
 }
 
@@ -246,6 +327,6 @@ func TestServeRejectsBadPQKey(t *testing.T) {
 
 	err := serve(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "ML-DSA-44") {
-		t.Fatalf("serve: %v; want ML-DSA-44 provisioning error", err)
+		t.Fatalf("serve: %v, want ML-DSA-44 provisioning error", err)
 	}
 }

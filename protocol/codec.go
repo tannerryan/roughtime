@@ -20,7 +20,8 @@ const (
 	maxEncodeTags = 512
 	// maxDecodeTags caps the tag count accepted by Decode.
 	maxDecodeTags = 512
-	// maxVersionList caps VER/VERS list length.
+	// maxVersionList caps generated VER/VERS lists and modern typed input.
+	// Historical and untyped draft-12 input remains bounded by maxMessageSize.
 	maxVersionList = 32
 )
 
@@ -229,7 +230,7 @@ func unwrapRequest(raw []byte) ([]byte, error) {
 
 // NonceOffsetInRequest returns the byte offset of a 32- or 64-byte NONC value
 // in a raw request. Framing is validated, but the inner message is only
-// inspected enough to locate NONC; callers that accept untrusted requests
+// inspected enough to locate NONC. Callers that accept untrusted requests
 // should use [ParseRequest] for full validation.
 func NonceOffsetInRequest(request []byte) (int, error) {
 	msg, err := unwrapRequest(request)

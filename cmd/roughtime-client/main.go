@@ -20,50 +20,73 @@ import (
 	"time"
 
 	"github.com/tannerryan/roughtime"
+	"github.com/tannerryan/roughtime/internal/fileutil"
 	"github.com/tannerryan/roughtime/internal/version"
+	"github.com/tannerryan/roughtime/protocol"
 )
 
 var (
+	// commandLine returns parse errors so they pass through the same terminal
+	// sanitizer as validation and runtime errors.
+	commandLine = flag.NewFlagSet("roughtime-client", flag.ContinueOnError)
 	// serversFile is the ecosystem path flag.
-	serversFile = flag.String("servers", "", "path to JSON server list")
+	serversFile = commandLine.String("servers", "", "path to JSON server list")
 	// nameFilter selects one ecosystem entry.
-	nameFilter = flag.String("name", "", "query only the named server from the JSON list")
+	nameFilter = commandLine.String("name", "", "query only the named server from the JSON list")
 	// addr is the direct server endpoint flag.
-	addr = flag.String("addr", "", "host:port of a single Roughtime server")
+	addr = commandLine.String("addr", "", "host:port of a single Roughtime server")
 	// pubkey is the direct server root-key flag.
-	pubkey = flag.String("pubkey", "", "root public key (base64 or hex, with -addr); 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
+	pubkey = commandLine.String("pubkey", "", "root public key with -addr (base64 or hex, 32 bytes Ed25519 or 1312 bytes ML-DSA-44)")
 	// useTCP forces TCP for Ed25519.
-	useTCP = flag.Bool("tcp", false, "force TCP for IETF Ed25519 servers (Google-Roughtime is UDP-only; ML-DSA-44 always uses TCP)")
+	useTCP = commandLine.Bool("tcp", false, "force TCP for IETF Ed25519 servers (Google-Roughtime is UDP-only, ML-DSA-44 is TCP-only)")
 	// timeout bounds each exchange attempt.
-	timeout = flag.Duration("timeout", time.Second, "read/write timeout per attempt")
+	timeout = commandLine.Duration("timeout", time.Second, "read/write timeout per attempt")
 	// retries caps attempts per server.
-	retries = flag.Int("retries", 3, "max attempts per server (1 = single attempt; backoff 1s × 1.5^(n-1) between attempts, cap 24h)")
+	retries = commandLine.Int("retries", 3, "max attempts per server (1 = no retries, backoff starts at 1s, grows by 1.5, caps at 24h)")
 	// chainMode enables causal ecosystem queries.
-	chainMode = flag.Bool("chain", true, "chain queries sequentially: each nonce derives from the previous reply and fresh random salt")
+	chainMode = commandLine.Bool("chain", true, "chain queries sequentially: each nonce derives from the previous reply and fresh random salt")
 	// all disables default ecosystem sampling.
-	all = flag.Bool("all", false, "query every transport-compatible ecosystem server (default: up to 5 endpoint-domain groups)")
+	all = commandLine.Bool("all", false, "query every transport-compatible ecosystem server (default: up to 5 endpoint-domain groups)")
+	// twoPass requests a complete same-order two-pass measurement.
+	twoPass = commandLine.Bool("two-pass", false, "require a complete two-pass same-order ecosystem chain (at least 3 endpoint groups and trust roots)")
+	// standardSize selects the draft-19 message-size padding convention.
+	standardSize = commandLine.Bool("standard-size", false, "send standard message-sized padding plus framing (default: legacy total-packet sizing)")
 	// showVersion requests version output and exit.
-	showVersion = flag.Bool("version", false, "print version and exit")
+	showVersion = commandLine.Bool("version", false, "print version and exit")
 )
 
-// defaultSampleSize caps the default ecosystem sample.
-const defaultSampleSize = 5
+const (
+	// defaultSampleSize caps the default ecosystem sample.
+	defaultSampleSize = 5
+	// maxCLIErrorRunes bounds sanitized top-level errors.
+	maxCLIErrorRunes = 1024
+)
 
 // main parses flags and runs the client.
 func main() {
-	flag.Parse()
+	commandLine.SetOutput(io.Discard)
+	if err := commandLine.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, "Usage of roughtime-client:")
+			commandLine.SetOutput(os.Stderr)
+			commandLine.PrintDefaults()
+			return
+		}
+		fmt.Fprintln(os.Stderr, "client:", terminalError(err))
+		os.Exit(2)
+	}
 	if *showVersion {
 		fmt.Printf("roughtime-client %s (github.com/tannerryan/roughtime)\n\n%s\n", version.Full(), version.Copyright)
 		return
 	}
 	if err := validateFlags(); err != nil {
-		fmt.Fprintln(os.Stderr, "client:", err)
+		fmt.Fprintln(os.Stderr, "client:", terminalError(err))
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "client:", err)
+		fmt.Fprintln(os.Stderr, "client:", terminalError(err))
 		if errors.Is(ctx.Err(), context.Canceled) {
 			os.Exit(130)
 		}
@@ -79,8 +102,8 @@ func validateFlags() error {
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout %s must be > 0", *timeout)
 	}
-	if flag.NArg() > 0 {
-		return fmt.Errorf("unexpected positional args: %v", flag.Args())
+	if commandLine.NArg() > 0 {
+		return fmt.Errorf("unexpected positional args: %v", commandLine.Args())
 	}
 	if *retries < 1 {
 		return fmt.Errorf("-retries %d must be >= 1", *retries)
@@ -106,6 +129,12 @@ func validateFlags() error {
 	if *all && *nameFilter != "" {
 		return errors.New("-all and -name are mutually exclusive")
 	}
+	if *twoPass && *serversFile == "" {
+		return errors.New("-two-pass requires -servers")
+	}
+	if *twoPass && !*chainMode {
+		return errors.New("-two-pass requires -chain=true")
+	}
 	return nil
 }
 
@@ -115,8 +144,16 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	expectedProbes := 0
+	if *twoPass {
+		servers, err = twoPassServers(servers)
+		if err != nil {
+			return err
+		}
+		expectedProbes = len(servers)
+	}
 
-	c := &roughtime.Client{Timeout: *timeout, MaxAttempts: *retries}
+	c := newClient()
 
 	if len(servers) == 1 {
 		resp, err := c.Query(ctx, servers[0])
@@ -142,10 +179,20 @@ func run(ctx context.Context) error {
 	} else {
 		results = c.QueryAll(ctx, servers)
 	}
-	if err := printTable(results, proof); err != nil {
+	if err := printTable(results, proof, expectedProbes); err != nil {
 		return err
 	}
 	return qcErr
+}
+
+// newClient maps command flags to the high-level client without changing the
+// legacy packet-size default.
+func newClient() *roughtime.Client {
+	return &roughtime.Client{
+		Timeout:            *timeout,
+		MaxAttempts:        *retries,
+		StandardPacketSize: *standardSize,
+	}
 }
 
 // loadServers resolves the configured flags into the list of servers to query.
@@ -170,6 +217,10 @@ func loadServers() ([]roughtime.Server, error) {
 						return nil, fmt.Errorf("server %q in %s has no tcp address", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
 					}
 				}
+				s, err = roughtime.NormalizeServer(s)
+				if err != nil {
+					return nil, fmt.Errorf("server %q in %s is unusable: %w", roughtime.SanitizeForDisplay(*nameFilter), safeFile, err)
+				}
 				return []roughtime.Server{s}, nil
 			}
 			return nil, fmt.Errorf("server %q not found in %s", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
@@ -179,6 +230,10 @@ func loadServers() ([]roughtime.Server, error) {
 			if len(servers) == 0 {
 				return nil, fmt.Errorf("no servers in %s have a tcp address", safeFile)
 			}
+		}
+		servers = normalizeServers(servers)
+		if len(servers) == 0 {
+			return nil, fmt.Errorf("no compatible servers in %s", safeFile)
 		}
 		if !*all {
 			servers = roughtime.SampleByOperator(servers, defaultSampleSize)
@@ -210,6 +265,44 @@ func loadServers() ([]roughtime.Server, error) {
 		}}, nil
 	}
 	return nil, errors.New("provide -servers <file> or -addr <host:port> -pubkey <base64-or-hex>")
+}
+
+// normalizeServers filters incompatible entries and orders usable endpoints.
+// Named queries report incompatibility as an error instead of skipping it.
+func normalizeServers(servers []roughtime.Server) []roughtime.Server {
+	out := make([]roughtime.Server, 0, len(servers))
+	for _, s := range servers {
+		normalized, err := roughtime.NormalizeServer(s)
+		if err != nil {
+			continue
+		}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+// twoPassServers validates and expands a strict two-pass measurement. The
+// second half repeats the exact normalized server order.
+func twoPassServers(servers []roughtime.Server) ([]roughtime.Server, error) {
+	groups := make(map[string]struct{}, len(servers))
+	roots := make(map[string]struct{}, len(servers))
+	for _, s := range servers {
+		groups[roughtime.OperatorKey(s)] = struct{}{}
+		roots[string(s.PublicKey)] = struct{}{}
+	}
+	if len(groups) < 3 {
+		return nil, fmt.Errorf("-two-pass requires at least 3 endpoint-domain groups (got %d)", len(groups))
+	}
+	if len(roots) < 3 {
+		return nil, fmt.Errorf("-two-pass requires at least 3 distinct trust roots (got %d)", len(roots))
+	}
+	if len(servers) > protocol.MaxChainLinks/2 {
+		return nil, fmt.Errorf("-two-pass requires %d chain links, exceeding max %d", 2*len(servers), protocol.MaxChainLinks)
+	}
+	out := make([]roughtime.Server, 0, 2*len(servers))
+	out = append(out, servers...)
+	out = append(out, servers...)
+	return out, nil
 }
 
 // filterTCPOnly narrows each server's Addresses to TCP and drops servers with
@@ -249,7 +342,7 @@ func tcpAddresses(addrs []roughtime.Address) []roughtime.Address {
 
 // loadServersFile reads and parses a size-capped ecosystem JSON file.
 func loadServersFile(path string) ([]roughtime.Server, error) {
-	f, err := os.Open(path)
+	f, err := fileutil.OpenRegular(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading server list: %w", err)
 	}
@@ -264,4 +357,9 @@ func loadServersFile(path string) ([]roughtime.Server, error) {
 		return nil, fmt.Errorf("server list %s exceeds %d bytes", roughtime.SanitizeForDisplay(path), roughtime.MaxEcosystemBytes)
 	}
 	return roughtime.ParseEcosystem(data)
+}
+
+// terminalError sanitizes and bounds errors at the final stderr boundary.
+func terminalError(err error) string {
+	return display(err.Error(), maxCLIErrorRunes)
 }

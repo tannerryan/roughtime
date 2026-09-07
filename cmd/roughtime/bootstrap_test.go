@@ -7,17 +7,21 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/mldsa"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
+	"go.uber.org/zap"
 )
 
 // withSeedFile writes an Ed25519 seed with permissions no broader than 0600.
@@ -71,7 +75,6 @@ func setPQRootKeyPath(t *testing.T, path string) {
 
 // TestValidateFlagsRejects covers invalid required and range settings.
 func TestValidateFlagsRejects(t *testing.T) {
-	// Cases cover invalid required and range settings.
 	cases := []struct {
 		name string
 		mut  func(t *testing.T)
@@ -307,6 +310,297 @@ func TestTryRefreshCertRejectsChangedRoot(t *testing.T) {
 	_, _, err = tryRefreshCert(otherPK)
 	if err == nil || !strings.Contains(err.Error(), "root public key on disk has changed") {
 		t.Fatalf("tryRefreshCert want identity error, got %v", err)
+	}
+}
+
+// TestTryRefreshCertMLDSA44Success covers PQ certificate rotation setup.
+func TestTryRefreshCertMLDSA44Success(t *testing.T) {
+	path, pk := withPQSeedFile(t)
+	setPQRootKeyPath(t, path)
+
+	newState, newOnlinePK, err := tryRefreshCertMLDSA44(pk)
+	if err != nil {
+		t.Fatalf("tryRefreshCertMLDSA44: %v", err)
+	}
+	if newState == nil || newState.cert == nil {
+		t.Fatal("newState or cert nil")
+	}
+	if len(newOnlinePK) != mldsa.MLDSA44PublicKeySize {
+		t.Fatalf("online public key size=%d want %d", len(newOnlinePK), mldsa.MLDSA44PublicKeySize)
+	}
+	if got, want := newState.srvHash, protocol.ComputeSRV(pk); !bytes.Equal(got, want) {
+		t.Fatal("srvHash does not match PQ root public key")
+	}
+}
+
+// TestTryRefreshCertMLDSA44RejectsChangedRoot covers PQ root identity changes.
+func TestTryRefreshCertMLDSA44RejectsChangedRoot(t *testing.T) {
+	path, _ := withPQSeedFile(t)
+	setPQRootKeyPath(t, path)
+	other, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		t.Fatalf("mldsa gen: %v", err)
+	}
+	_, _, err = tryRefreshCertMLDSA44(other.PublicKey().Bytes())
+	if err == nil || !strings.Contains(err.Error(), "PQ root public key on disk has changed") {
+		t.Fatalf("tryRefreshCertMLDSA44 want identity error, got %v", err)
+	}
+}
+
+// TestRunRefreshChecksValidityTickSkipsValidCertificate ensures the short
+// monitor does not reread the root key once per second during normal service.
+func TestRunRefreshChecksValidityTickSkipsValidCertificate(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	state := &atomic.Pointer[certState]{}
+	state.Store(&certState{notBefore: base.Add(-time.Hour), expiry: base.Add(4 * time.Hour)})
+	refreshTicks := make(chan time.Time)
+	validityTicks := make(chan time.Time)
+	checked := make(chan struct{}, 1)
+	var refreshCalls atomic.Int32
+	now := func() time.Time {
+		select {
+		case checked <- struct{}{}:
+		default:
+		}
+		return base
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		done <- runRefreshChecks(ctx, zap.NewNop(), "test", "", nil, state,
+			refreshTicks, validityTicks, now, func() (*certState, []byte, error) {
+				refreshCalls.Add(1)
+				return nil, nil, errors.New("unexpected refresh")
+			})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := awaitTest(t, done, time.Second, "validity-check cleanup"); err != nil {
+			t.Errorf("runRefreshChecks cleanup: %v", err)
+		}
+	})
+
+	select {
+	case validityTicks <- base:
+	case <-time.After(time.Second):
+		t.Fatal("validity check did not accept tick")
+	}
+	awaitTest(t, checked, time.Second, "validity check")
+	if got := refreshCalls.Load(); got != 0 {
+		t.Fatalf("refresh calls=%d want 0", got)
+	}
+	cancel()
+	if err := awaitTest(t, done, time.Second, "validity-check shutdown"); err != nil {
+		t.Fatalf("runRefreshChecks: %v", err)
+	}
+	if got := refreshCalls.Load(); got != 0 {
+		t.Fatalf("refresh calls after shutdown=%d want 0", got)
+	}
+}
+
+// TestRunRefreshChecksRotatesAfterForwardClockStep verifies that crossing the
+// expiry bound triggers immediate rotation instead of waiting 15 minutes.
+func TestRunRefreshChecksRotatesAfterForwardClockStep(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	oldState := &certState{notBefore: base.Add(-time.Hour), expiry: base.Add(time.Hour)}
+	newState := &certState{notBefore: base.Add(time.Hour), expiry: base.Add(20 * time.Hour)}
+	state := &atomic.Pointer[certState]{}
+	state.Store(oldState)
+	var nowNanos atomic.Int64
+	nowNanos.Store(base.UnixNano())
+	now := func() time.Time { return time.Unix(0, nowNanos.Load()) }
+	refreshTicks := make(chan time.Time)
+	validityTicks := make(chan time.Time)
+	refreshed := make(chan struct{}, 1)
+	var refreshCalls atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		done <- runRefreshChecks(ctx, zap.NewNop(), "test", "", nil, state,
+			refreshTicks, validityTicks, now, func() (*certState, []byte, error) {
+				refreshCalls.Add(1)
+				refreshed <- struct{}{}
+				return newState, nil, nil
+			})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := awaitTest(t, done, time.Second, "clock-step cleanup"); err != nil {
+			t.Errorf("runRefreshChecks cleanup: %v", err)
+		}
+	})
+
+	nowNanos.Store(base.Add(2 * time.Hour).UnixNano())
+	select {
+	case validityTicks <- base:
+	case <-time.After(time.Second):
+		t.Fatal("clock-step refresh did not accept tick")
+	}
+	awaitTest(t, refreshed, time.Second, "clock-step refresh")
+	// An unbuffered second tick can be received only after the swap completes.
+	select {
+	case validityTicks <- base:
+	case <-time.After(time.Second):
+		t.Fatal("clock-step refresh did not complete")
+	}
+	if got := state.Load(); got != newState {
+		t.Fatalf("published state=%p want %p", got, newState)
+	}
+	oldState.mu.RLock()
+	retired := oldState.retired
+	oldState.mu.RUnlock()
+	if !retired {
+		t.Fatal("previous state was not retired after rotation")
+	}
+	if got := refreshCalls.Load(); got != 1 {
+		t.Fatalf("refresh calls=%d want 1", got)
+	}
+	cancel()
+	if err := awaitTest(t, done, time.Second, "clock-step shutdown"); err != nil {
+		t.Fatalf("runRefreshChecks: %v", err)
+	}
+}
+
+// TestRunRefreshChecksFailsClosedAfterClockStep covers refresh failure once a
+// forward or backward correction leaves the delegation window.
+func TestRunRefreshChecksFailsClosedAfterClockStep(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	cases := []struct {
+		name string
+		now  time.Time
+		want string
+	}{
+		{name: "past expiry", now: base.Add(2 * time.Hour), want: "failed with"},
+		{name: "before not-before", now: base.Add(-2 * time.Hour), want: "not yet valid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &atomic.Pointer[certState]{}
+			state.Store(&certState{notBefore: base.Add(-time.Hour), expiry: base.Add(time.Hour)})
+			refreshTicks := make(chan time.Time)
+			validityTicks := make(chan time.Time)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() {
+				defer close(done)
+				done <- runRefreshChecks(ctx, zap.NewNop(), "test", "", nil, state,
+					refreshTicks, validityTicks, func() time.Time { return tc.now }, func() (*certState, []byte, error) {
+						return nil, nil, errors.New("root unavailable")
+					})
+			}()
+			t.Cleanup(func() {
+				cancel()
+				_ = awaitTest(t, done, time.Second, "failed refresh cleanup")
+			})
+			select {
+			case validityTicks <- base:
+			case <-time.After(time.Second):
+				t.Fatal("failed refresh did not accept tick")
+			}
+			if err := awaitTest(t, done, time.Second, "failed refresh result"); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("runRefreshChecks error=%v want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunRefreshChecksRoutineRefreshPreserved verifies the normal 15-minute
+// check still rotates a valid certificate inside the refresh threshold.
+func TestRunRefreshChecksRoutineRefreshPreserved(t *testing.T) {
+	base := time.Unix(1_800_000_000, 0)
+	oldState := &certState{notBefore: base.Add(-time.Hour), expiry: base.Add(2 * time.Hour)}
+	newState := &certState{notBefore: base.Add(-time.Hour), expiry: base.Add(18 * time.Hour)}
+	state := &atomic.Pointer[certState]{}
+	state.Store(oldState)
+	refreshTicks := make(chan time.Time)
+	validityTicks := make(chan time.Time)
+	refreshed := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		done <- runRefreshChecks(ctx, zap.NewNop(), "test", "", nil, state,
+			refreshTicks, validityTicks, func() time.Time { return base }, func() (*certState, []byte, error) {
+				refreshed <- struct{}{}
+				return newState, nil, nil
+			})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		if err := awaitTest(t, done, time.Second, "routine refresh cleanup"); err != nil {
+			t.Errorf("runRefreshChecks cleanup: %v", err)
+		}
+	})
+	select {
+	case refreshTicks <- base:
+	case <-time.After(time.Second):
+		t.Fatal("routine refresh did not accept tick")
+	}
+	awaitTest(t, refreshed, time.Second, "routine refresh")
+	select {
+	case validityTicks <- base:
+	case <-time.After(time.Second):
+		t.Fatal("routine refresh did not complete")
+	}
+	if state.Load() != newState {
+		t.Fatal("routine refresh did not publish new state")
+	}
+	cancel()
+	if err := awaitTest(t, done, time.Second, "routine refresh shutdown"); err != nil {
+		t.Fatalf("runRefreshChecks: %v", err)
+	}
+}
+
+// TestMonitorOfflineDelegationTerminalStates covers immediate lifecycle exits.
+func TestMonitorOfflineDelegationTerminalStates(t *testing.T) {
+	now := wallClockNow()
+	notYetValid := &atomic.Pointer[certState]{}
+	notYetValid.Store(&certState{notBefore: now.Add(time.Hour), expiry: now.Add(2 * time.Hour)})
+	expired := &atomic.Pointer[certState]{}
+	expired.Store(&certState{notBefore: now.Add(-2 * time.Hour), expiry: now.Add(-time.Hour)})
+	cases := []struct {
+		name  string
+		state *atomic.Pointer[certState]
+		want  string
+	}{
+		{name: "nil pointer", want: "unavailable"},
+		{name: "nil state", state: &atomic.Pointer[certState]{}, want: "unavailable"},
+		{name: "not yet valid", state: notYetValid, want: "not yet valid"},
+		{name: "expired", state: expired, want: "expired"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := monitorOfflineDelegation(context.Background(), "test", tc.state)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("monitorOfflineDelegation error=%v want %q", err, tc.want)
+			}
+		})
+	}
+
+	valid := &atomic.Pointer[certState]{}
+	valid.Store(&certState{notBefore: now.Add(-time.Hour), expiry: now.Add(time.Hour)})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := monitorOfflineDelegation(ctx, "test", valid); err != nil {
+		t.Fatalf("monitorOfflineDelegation canceled: %v", err)
+	}
+}
+
+// TestRefreshFailureTerminal covers the retry safety margin boundary.
+func TestRefreshFailureTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		remaining time.Duration
+		want      bool
+	}{
+		{remaining: certCheckInterval + time.Minute + time.Nanosecond, want: false},
+		{remaining: certCheckInterval + time.Minute, want: true},
+		{remaining: -time.Second, want: true},
+	} {
+		if got := refreshFailureTerminal(tc.remaining); got != tc.want {
+			t.Fatalf("refreshFailureTerminal(%s)=%t want %t", tc.remaining, got, tc.want)
+		}
 	}
 }
 

@@ -75,6 +75,23 @@ func TestDecodeTimestampUnixSeconds(t *testing.T) {
 	}
 }
 
+// TestDecodeTimestampPublic covers the exported decoder's validation and
+// version-specific dispatch.
+func TestDecodeTimestampPublic(t *testing.T) {
+	ts := time.Unix(1700000000, 0).UTC()
+	buf := encodeTimestamp(ts, groupD08)
+	got, err := DecodeTimestamp(VersionDraft08, buf[:])
+	if err != nil || !got.Equal(ts) {
+		t.Fatalf("DecodeTimestamp = %v, %v, want %v", got, err, ts)
+	}
+	if _, err := DecodeTimestamp(VersionDraft08, buf[:7]); err == nil {
+		t.Fatal("DecodeTimestamp accepted a short timestamp")
+	}
+	if _, err := DecodeTimestamp(Version(0xdeadbeef), buf[:]); err == nil {
+		t.Fatal("DecodeTimestamp accepted an unknown version")
+	}
+}
+
 // TestMJDMicroRoundTrip covers microsecond MJD precision.
 func TestMJDMicroRoundTrip(t *testing.T) {
 	ts := time.Date(2024, 11, 15, 10, 30, 0, 0, time.UTC)

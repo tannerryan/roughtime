@@ -9,7 +9,6 @@ import "testing"
 func TestFull(t *testing.T) {
 	oldCommit, oldDate := Commit, Date
 	defer func() { Commit, Date = oldCommit, oldDate }()
-	// Cases cover version and optional build metadata.
 	for _, test := range []struct {
 		commit, date, want string
 	}{

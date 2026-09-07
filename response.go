@@ -44,8 +44,8 @@ func (r *Response) Drift() time.Duration {
 	return r.Midpoint.Sub(ref)
 }
 
-// InSync reports whether |Drift| is within the server's uncertainty Radius
-// using a closed interval.
+// InSync reports whether the RTT-center estimate from [Drift] is within Radius
+// (inclusive). It does not account for network-delay uncertainty.
 func (r *Response) InSync() bool {
 	if r == nil || r.Radius < 0 {
 		return false

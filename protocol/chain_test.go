@@ -73,7 +73,6 @@ func buildChain(t *testing.T, ver Version, n int) (*Chain, []chainServer) {
 // TestChainNonce covers first and subsequent chain nonces.
 func TestChainNonce(t *testing.T) {
 	previous := randBytes(t, 128)
-	// Cases cover each nonce construction used by chaining.
 	for _, tc := range []struct {
 		version Version
 		size    int

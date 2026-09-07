@@ -29,7 +29,7 @@ type ChainLink struct {
 	Rand []byte
 	// PublicKey is the server's long-term key.
 	PublicKey []byte
-	// Nonce caches the nonce from Request; reports do not serialize it
+	// Nonce caches the nonce from Request. Reports do not serialize it
 	// separately.
 	Nonce []byte
 	// Request is the full request packet.

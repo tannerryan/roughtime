@@ -5,7 +5,6 @@ package protocol
 
 import (
 	"crypto/ed25519"
-	"crypto/mldsa"
 	"crypto/rand"
 	"encoding/binary"
 	"strings"
@@ -216,7 +215,7 @@ func TestVerifyNoVersionDowngradeRejectsUnsortedVERS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = verifySREPVersions(srep, []Version{VersionDraft12})
+	err = verifySREPVersions(srep, []Version{VersionDraft12}, groupD12)
 	if err == nil {
 		t.Fatal("expected error for unsorted VERS in SREP")
 	}
@@ -225,33 +224,152 @@ func TestVerifyNoVersionDowngradeRejectsUnsortedVERS(t *testing.T) {
 	}
 }
 
+// TestVerifyReplyVersionListCompatibility covers signed 32/33-entry VERS at the
+// draft-12/13 boundary. Untyped input follows the historical draft-12 policy.
+// TYPE makes the modern cap enforceable.
+func TestVerifyReplyVersionListCompatibility(t *testing.T) {
+	cert, _ := testCert(t)
+	for _, tc := range []struct {
+		name       string
+		count      int
+		withType   bool
+		wantReject bool
+	}{
+		{"untyped 32", 32, false, false},
+		{"untyped 33", 33, false, false},
+		{"typed 32", 32, true, false},
+		{"typed 33", 33, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := RequestOptions{OmitTYPE: !tc.withType}
+			nonce, request, err := CreateRequestWithOptions(
+				[]Version{VersionDraft12}, rand.Reader, nil, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseRequest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replies, err := CreateReplies(
+				VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply := resignSREP(t, replies[0], cert.edOnlineSK, func(srep map[uint32][]byte) {
+				srep[TagVERS] = testVersionBytes(longVersionList(VersionDraft12, tc.count))
+			})
+			_, _, err = VerifyReply(
+				[]Version{VersionDraft12}, reply, cert.edRootPK, nonce, request)
+			if tc.wantReject {
+				if err == nil || !strings.Contains(err.Error(), "max 32") {
+					t.Fatalf("VerifyReply error = %v, want 32-entry limit", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VerifyReply: %v", err)
+			}
+		})
+	}
+}
+
+// TestVerifyReplyRejectsSignedMalformedSREPFields exercises semantic checks
+// after a valid online-key signature, rather than failing at authentication.
+func TestVerifyReplyRejectsSignedMalformedSREPFields(t *testing.T) {
+	cert, _ := testCert(t)
+	nonce, request, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseRequest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies, err := CreateReplies(
+		VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		mutate  func(map[uint32][]byte)
+		wantErr string
+	}{
+		{"missing MIDP", func(s map[uint32][]byte) { delete(s, TagMIDP) }, "missing MIDP"},
+		{"short MIDP", func(s map[uint32][]byte) { s[TagMIDP] = make([]byte, 4) }, "timestamp must be 8 bytes"},
+		{"missing RADI", func(s map[uint32][]byte) { delete(s, TagRADI) }, "missing RADI"},
+		{"long RADI", func(s map[uint32][]byte) { s[TagRADI] = make([]byte, 8) }, "RADI must be 4 bytes"},
+		{"missing ROOT", func(s map[uint32][]byte) { delete(s, TagROOT) }, "missing or invalid ROOT"},
+		{"short ROOT", func(s map[uint32][]byte) { s[TagROOT] = make([]byte, 28) }, "missing or invalid ROOT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reply := resignSREP(t, replies[0], cert.edOnlineSK, tc.mutate)
+			if _, _, err := VerifyReply(
+				[]Version{VersionDraft12}, reply, cert.edRootPK, nonce, request); err == nil ||
+				!strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("VerifyReply error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// resignSREP replaces and signs a nested SREP in an otherwise valid IETF reply.
+// It lets tests distinguish authenticated malformed fields from random
+// signature corruption.
+func resignSREP(t *testing.T, reply []byte, onlineSK ed25519.PrivateKey, mutate func(map[uint32][]byte)) []byte {
+	t.Helper()
+	inner, err := unwrapPacket(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := Decode(inner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srep, err := Decode(resp[TagSREP])
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(srep)
+	srepBytes, err := encode(srep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp[TagSREP] = srepBytes
+	resp[TagSIG] = signEd25519(onlineSK, srepBytes, responseCtx)
+	inner, err = encode(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wrapPacket(inner)
+}
+
 // TestVerifyReplyRejectsMismatchedNONCInSREP covers signed nonce mismatch.
 func TestVerifyReplyRejectsMismatchedNONCInSREP(t *testing.T) {
 	for _, ver := range []Version{VersionDraft01, VersionDraft02} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
-			reply, rootPK, nonce, req := validReply(t, ver, []Version{ver})
-
-			tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
-				srepBytes := tags[TagSREP]
-				srepTags, err := Decode(srepBytes)
-				if err != nil {
-					t.Fatal(err)
-				}
-				srepNonce := srepTags[TagNONC]
-				if len(srepNonce) == 0 {
-					t.Fatal("expected NONC in SREP for this draft")
-				}
-				srepNonce[0] ^= 0xff
-				srepTags[TagNONC] = srepNonce
-				newSREP, err := encode(srepTags)
-				if err != nil {
-					t.Fatal(err)
-				}
-				tags[TagSREP] = newSREP
+			cert, _ := testCert(t)
+			nonce, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseRequest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replies, err := CreateReplies(ver, []Request{*parsed}, time.Now(), time.Second, cert)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tampered := resignSREP(t, replies[0], cert.edOnlineSK, func(srep map[uint32][]byte) {
+				srep[TagNONC][0] ^= 0xff
 			})
 
-			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err == nil {
-				t.Fatal("expected error for tampered NONC in SREP")
+			if _, _, err := VerifyReply([]Version{ver}, tampered, cert.edRootPK, nonce, req); err == nil ||
+				!strings.Contains(err.Error(), "NONC in SREP does not match request nonce") {
+				t.Fatalf("VerifyReply error = %v, want signed NONC mismatch", err)
 			}
 		})
 	}
@@ -347,7 +465,7 @@ func TestVerifyReplyRejectsZeroRADI(t *testing.T) {
 			}
 			_, _, err = VerifyReply(versions, reply, rootPK, nonce, req)
 			if err == nil || !strings.Contains(err.Error(), "RADI must not be zero") {
-				t.Fatalf("VerifyReply: %v; want zero-RADI error", err)
+				t.Fatalf("VerifyReply error = %v, want zero-RADI error", err)
 			}
 		})
 	}
@@ -425,7 +543,7 @@ func TestPQRoundTrip(t *testing.T) {
 	}
 }
 
-// TestPQTamperedSREPFailsVerify covers generic PQ reply tampering.
+// TestPQTamperedSREPFailsVerify covers PQ SREP authentication.
 func TestPQTamperedSREPFailsVerify(t *testing.T) {
 	cert, rootPK := testPQCert(t)
 	versions := []Version{VersionMLDSA44}
@@ -433,38 +551,48 @@ func TestPQTamperedSREPFailsVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	parsed, _ := ParseRequest(req)
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
 	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, cert)
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}
-	reply := append([]byte(nil), replies[0]...)
-	reply[len(reply)-1] ^= 0xff
-	if _, _, err := VerifyReply(versions, reply, rootPK, nonce, req); err == nil {
-		t.Fatal("expected error on tampered reply")
+	reply := corruptReplyTag(t, replies[0], true, func(resp map[uint32][]byte) {
+		srep := append([]byte(nil), resp[TagSREP]...)
+		lo, _, ok := findTagRange(srep, TagMIDP)
+		if !ok {
+			t.Fatal("missing MIDP in SREP")
+		}
+		srep[lo] ^= 0xff
+		resp[TagSREP] = srep
+	})
+	if _, _, err := VerifyReply(versions, reply, rootPK, nonce, req); err == nil ||
+		!strings.Contains(err.Error(), "SREP signature verification failed") {
+		t.Fatalf("VerifyReply error = %v, want SREP authentication failure", err)
 	}
 }
 
-// TestPQVERSDowngradeRejected covers a PQ-only VERS with a mixed client offer.
-func TestPQVERSDowngradeRejected(t *testing.T) {
+// TestPQVERSMixedOfferAccepted covers a PQ-only VERS with a mixed wire offer.
+func TestPQVERSMixedOfferAccepted(t *testing.T) {
 	cert, rootPK := testPQCert(t)
-	versions := []Version{VersionMLDSA44}
-	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
+	offered := []Version{VersionDraft12, VersionMLDSA44}
+	nonce, req, err := CreateRequest(offered, rand.Reader, nil)
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	parsed, _ := ParseRequest(req)
+	parsed, err := ParseRequest(req)
+	if err != nil {
+		t.Fatalf("ParseRequest: %v", err)
+	}
+	if len(parsed.Versions) != 2 || parsed.Versions[0] != VersionDraft12 || parsed.Versions[1] != VersionMLDSA44 {
+		t.Fatalf("wire offer = %v, want %v", parsed.Versions, offered)
+	}
 	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, cert)
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}
-	if _, _, err := VerifyReply(versions, replies[0], rootPK, nonce, req); err != nil {
-		t.Fatalf("VerifyReply baseline: %v", err)
-	}
-
-	// mixed client offer. PQ-only VERS still yields PQ as mutual-best, so the
-	// check passes
-	offered := []Version{VersionDraft12, VersionMLDSA44}
 	if _, _, err := VerifyReply(offered, replies[0], rootPK, nonce, req); err != nil {
 		t.Fatalf("PQ-only VERS with mixed client offer unexpectedly rejected: %v", err)
 	}
@@ -518,33 +646,27 @@ func TestVersCrossSchemeInflationRejected(t *testing.T) {
 
 // FuzzVerifyReply exercises response authentication on arbitrary input.
 func FuzzVerifyReply(f *testing.F) {
-	_, rootSK, _ := ed25519.GenerateKey(rand.Reader)
-	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
-	rootPK := rootSK.Public().(ed25519.PublicKey)
-	now := time.Now()
-	cert, _ := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
-	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
-		nonce, req, _ := CreateRequest([]Version{ver}, rand.Reader, nil)
-		parsed, _ := ParseRequest(req)
-		replies, _ := CreateReplies(ver, []Request{*parsed}, now, time.Second, cert)
-		f.Add(replies[0], []byte(rootPK), nonce, req)
+	edCert, _ := testCert(f)
+	pqCert, pqRootKey := testPQCert(f)
+	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12, VersionMLDSA44} {
+		cert, rootKey := edCert, []byte(edCert.edRootPK)
+		if ver == VersionMLDSA44 {
+			cert, rootKey = pqCert, pqRootKey
+		}
+		nonce, request, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+		if err != nil {
+			f.Fatal(err)
+		}
+		parsed, err := ParseRequest(request)
+		if err != nil {
+			f.Fatal(err)
+		}
+		replies, err := CreateReplies(ver, []Request{*parsed}, time.Now(), time.Second, cert)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(replies[0], rootKey, nonce, request)
 	}
-	pqRootSK, err := mldsa.GenerateKey(mldsa.MLDSA44())
-	if err != nil {
-		f.Fatal(err)
-	}
-	pqOnlineSK, err := mldsa.GenerateKey(mldsa.MLDSA44())
-	if err != nil {
-		f.Fatal(err)
-	}
-	pqCert, err := NewCertificateMLDSA44(now.Add(-time.Hour), now.Add(time.Hour), pqOnlineSK, pqRootSK)
-	if err != nil {
-		f.Fatal(err)
-	}
-	pqNonce, pqReq, _ := CreateRequest([]Version{VersionMLDSA44}, rand.Reader, nil)
-	pqParsed, _ := ParseRequest(pqReq)
-	pqReplies, _ := CreateReplies(VersionMLDSA44, []Request{*pqParsed}, now, time.Second, pqCert)
-	f.Add(pqReplies[0], pqRootSK.PublicKey().Bytes(), pqNonce, pqReq)
 
 	f.Fuzz(func(t *testing.T, reply, rootKey, nonce, request []byte) {
 		parsed, err := ParseRequest(request)
@@ -567,6 +689,11 @@ func FuzzVerifyReply(f *testing.F) {
 		}
 		if !midA.Equal(midB) || radA != radB {
 			t.Fatalf("non-deterministic: %v±%v vs %v±%v", midA, radA, midB, radB)
+		}
+		badNonce := append([]byte(nil), nonce...)
+		badNonce[0] ^= 0xff
+		if _, _, err := VerifyReply(versions, reply, rootKey, badNonce, request); err == nil {
+			t.Fatal("authenticated reply accepted a mutated nonce")
 		}
 	})
 }

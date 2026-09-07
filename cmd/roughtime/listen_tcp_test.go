@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,8 @@ import (
 	"time"
 
 	"github.com/tannerryan/roughtime/protocol"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // startListenTCP binds listenTCP to a free port and retries on a pick/bind
@@ -46,7 +49,9 @@ func startListenTCP(t *testing.T, edState, pqState *atomic.Pointer[certState]) (
 		// Drain listener before caller's global-restore cleanups (LIFO).
 		t.Cleanup(func() {
 			cancel()
-			<-done
+			if err := awaitTest(t, done, 6*time.Second, "listenTCP cleanup"); err != nil {
+				t.Errorf("listenTCP cleanup: %v", err)
+			}
 		})
 		return p, done, cancel
 	}
@@ -129,10 +134,8 @@ func TestListenTCPEndToEndEd25519(t *testing.T) {
 	}
 
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(6 * time.Second):
-		t.Fatal("listenTCP did not exit after cancel")
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
 	}
 }
 
@@ -156,10 +159,156 @@ func TestListenTCPEndToEndPQ(t *testing.T) {
 	}
 
 	cancel()
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
+}
+
+// TestPrepareTCPItemRequiresSRVForDualRootModernRequests covers long-term-key
+// selection before a request reaches either signing queue.
+func TestPrepareTCPItemRequiresSRVForDualRootModernRequests(t *testing.T) {
+	_, edState := newCertState(t)
+	_, pqState := newPQCertState(t)
+	edCh := make(chan tcpBatchItem)
+	pqCh := make(chan tcpBatchItem)
+	peer := &net.TCPAddr{IP: net.IPv6loopback, Port: 2002}
+	prefs := tcpServerPrefs(edState, pqState)
+
+	for _, version := range []protocol.Version{protocol.VersionDraft10, protocol.VersionDraft12, protocol.VersionMLDSA44} {
+		t.Run(version.ShortString(), func(t *testing.T) {
+			_, req, err := protocol.CreateRequest([]protocol.Version{version}, rand.Reader, nil)
+			if err != nil {
+				t.Fatalf("CreateRequest: %v", err)
+			}
+			_, ch, reason, err := prepareTCPItem(zap.NewNop(), peer, req, edState, pqState, edCh, pqCh, prefs)
+			if err == nil || reason != dropSRV || ch != nil {
+				t.Fatalf("prepareTCPItem: ch=%v reason=%q err=%v, want pre-route SRV rejection", ch, reason, err)
+			}
+		})
+	}
+}
+
+// TestPrepareTCPItemAllowsMissingSRVWithOneRoot preserves the drafts' optional
+// SRV behavior for an endpoint with one configured long-term key.
+func TestPrepareTCPItemAllowsMissingSRVWithOneRoot(t *testing.T) {
+	_, edState := newCertState(t)
+	edCh := make(chan tcpBatchItem)
+	peer := &net.TCPAddr{IP: net.IPv6loopback, Port: 2002}
+	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, nil)
+	if err != nil {
+		t.Fatalf("CreateRequest: %v", err)
+	}
+	item, ch, reason, err := prepareTCPItem(zap.NewNop(), peer, req, edState, nil, edCh, nil, tcpServerPrefs(edState, nil))
+	if err != nil || reason != dropNone || ch != edCh || item.version != protocol.VersionDraft12 {
+		t.Fatalf("prepareTCPItem: version=%s ch=%v reason=%q err=%v", item.version, ch, reason, err)
+	}
+}
+
+// TestPrepareTCPItemAllowsDualRootLegacyWithoutSRV preserves pre-draft-10
+// negotiation, which predates long-term-key selection through SRV.
+func TestPrepareTCPItemAllowsDualRootLegacyWithoutSRV(t *testing.T) {
+	_, edState := newCertState(t)
+	_, pqState := newPQCertState(t)
+	edCh := make(chan tcpBatchItem)
+	pqCh := make(chan tcpBatchItem)
+	peer := &net.TCPAddr{IP: net.IPv6loopback, Port: 2002}
+	prefs := []protocol.Version{protocol.VersionDraft09, protocol.VersionGoogle}
+
+	for _, version := range prefs {
+		t.Run(version.ShortString(), func(t *testing.T) {
+			_, req, err := protocol.CreateRequest([]protocol.Version{version}, rand.Reader, nil)
+			if err != nil {
+				t.Fatalf("CreateRequest: %v", err)
+			}
+			item, ch, reason, err := prepareTCPItem(zap.NewNop(), peer, req, edState, pqState, edCh, pqCh, prefs)
+			if err != nil || reason != dropNone || ch != edCh || item.version != version {
+				t.Fatalf("prepareTCPItem: version=%s ch=%v reason=%q err=%v", item.version, ch, reason, err)
+			}
+		})
+	}
+}
+
+// TestDeliverTCPBatchError covers queued delivery and verifies that abandoned
+// full or nil reply channels cannot block the batcher.
+func TestDeliverTCPBatchError(t *testing.T) {
+	wantErr := errors.New("batch failed")
+	queued := make(chan tcpBatchReply, 1)
+	full := make(chan tcpBatchReply, 1)
+	occupiedErr := errors.New("occupied")
+	full <- tcpBatchReply{err: occupiedErr}
+	items := []tcpBatchItem{
+		{reply: queued},
+		{reply: full},
+		{reply: nil},
+	}
+	startBatchErrs := statsBatchErrs.Load()
+	done := make(chan struct{})
+	go func() {
+		deliverTCPBatchError(items, wantErr)
+		close(done)
+	}()
 	select {
 	case <-done:
-	case <-time.After(6 * time.Second):
-		t.Fatal("listenTCP did not exit after cancel")
+	case <-time.After(time.Second):
+		t.Fatal("deliverTCPBatchError blocked on a full or nil reply channel")
+	}
+	if got := statsBatchErrs.Load(); got != startBatchErrs+1 {
+		t.Fatalf("batch errors=%d want %d", got, startBatchErrs+1)
+	}
+	if got := awaitTest(t, queued, time.Second, "queued batch error"); got.err != wantErr {
+		t.Fatalf("queued error=%v want %v", got.err, wantErr)
+	}
+	if got := awaitTest(t, full, time.Second, "existing batch error"); got.err != occupiedErr {
+		t.Fatalf("full channel error=%v want original %v", got.err, occupiedErr)
+	}
+	select {
+	case got := <-full:
+		t.Fatalf("full channel received unexpected second result: %+v", got)
+	default:
+	}
+}
+
+// TestTCPBatcherPanicCountsBatchError checks error delivery and accounting
+// after a logging hook panics while rejecting an invalid request.
+func TestTCPBatcherPanicCountsBatchError(t *testing.T) {
+	_, state := newCertState(t)
+	core := zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(io.Discard), zap.WarnLevel)
+	log := zap.New(core, zap.Hooks(func(entry zapcore.Entry) error {
+		if entry.Level == zap.WarnLevel {
+			panic("test warning hook")
+		}
+		return nil
+	}))
+	reply := make(chan tcpBatchReply, 1)
+	incoming := make(chan tcpBatchItem, 1)
+	incoming <- tcpBatchItem{version: protocol.VersionDraft12, reply: reply}
+	close(incoming)
+	startPanics, startErrors := statsPanics.Load(), statsBatchErrs.Load()
+	tcpBatcher(log, state, incoming, 1, time.Second)
+	if got := statsPanics.Load(); got != startPanics+1 {
+		t.Fatalf("panics=%d want %d", got, startPanics+1)
+	}
+	if got := statsBatchErrs.Load(); got != startErrors+1 {
+		t.Fatalf("batch errors=%d want %d", got, startErrors+1)
+	}
+	if got := awaitTest(t, reply, time.Second, "panic batch error"); got.err == nil {
+		t.Fatal("panic did not produce a batch error")
+	}
+}
+
+// TestFlushTCPBatchCurrentWithoutCertificate covers fail-closed delivery when
+// no signing state is published.
+func TestFlushTCPBatchCurrentWithoutCertificate(t *testing.T) {
+	reply := make(chan tcpBatchReply, 1)
+	flushTCPBatchCurrent(zap.NewNop(), nil, protocol.VersionDraft12, []tcpBatchItem{{reply: reply}})
+	select {
+	case got := <-reply:
+		if got.err == nil || got.err.Error() != "active certificate unavailable" {
+			t.Fatalf("flush error=%v want active certificate unavailable", got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("flush did not deliver missing-certificate error")
 	}
 }
 
@@ -185,7 +334,9 @@ func TestListenTCPSequentialRequests(t *testing.T) {
 	}
 
 	cancel()
-	<-done
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
 }
 
 // TestListenTCPRejectsBadMagic covers invalid frame magic.
@@ -207,7 +358,9 @@ func TestListenTCPRejectsBadMagic(t *testing.T) {
 	_ = conn.Close()
 
 	cancel()
-	<-done
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
 }
 
 // TestListenTCPRejectsOversizeLength covers oversized request bodies.
@@ -230,7 +383,67 @@ func TestListenTCPRejectsOversizeLength(t *testing.T) {
 	_ = conn.Close()
 
 	cancel()
-	<-done
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
+}
+
+// TestListenTCPRejectsZeroBody covers the lower framing bound.
+func TestListenTCPRejectsZeroBody(t *testing.T) {
+	_, edState := newCertState(t)
+	startDropped := droppedFor(transportTCP, dropFraming)
+	p, done, cancel := startListenTCP(t, edState, nil)
+
+	conn := dialTCP(t, p)
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	hdr := make([]byte, protocol.PacketHeaderSize)
+	copy(hdr[:8], []byte("ROUGHTIM"))
+	if _, err := conn.Write(hdr); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var scratch [1]byte
+	if _, err := conn.Read(scratch[:]); err == nil {
+		t.Fatal("expected EOF after zero body")
+	}
+	if got := droppedFor(transportTCP, dropFraming); got <= startDropped {
+		t.Fatalf("framing drops=%d want greater than %d", got, startDropped)
+	}
+	_ = conn.Close()
+	cancel()
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
+}
+
+// TestListenTCPRejectsShortBody covers the bounded body-read error path.
+func TestListenTCPRejectsShortBody(t *testing.T) {
+	prev := tcpReadTimeout
+	tcpReadTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { tcpReadTimeout = prev })
+	_, edState := newCertState(t)
+	startDropped := droppedFor(transportTCP, dropRead)
+	p, done, cancel := startListenTCP(t, edState, nil)
+
+	conn := dialTCP(t, p)
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	hdr := make([]byte, protocol.PacketHeaderSize)
+	copy(hdr[:8], []byte("ROUGHTIM"))
+	binary.LittleEndian.PutUint32(hdr[8:12], 32)
+	if _, err := conn.Write(append(hdr, 0)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	var scratch [1]byte
+	if _, err := conn.Read(scratch[:]); err == nil {
+		t.Fatal("expected EOF after short body timeout")
+	}
+	if got := droppedFor(transportTCP, dropRead); got <= startDropped {
+		t.Fatalf("read drops=%d want greater than %d", got, startDropped)
+	}
+	_ = conn.Close()
+	cancel()
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
 }
 
 // TestListenTCPIdleTimeoutClosesConn covers idle connection expiry.
@@ -251,7 +464,9 @@ func TestListenTCPIdleTimeoutClosesConn(t *testing.T) {
 	_ = conn.Close()
 
 	cancel()
-	<-done
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
+	}
 }
 
 // TestListenTCPShutdownForceClose covers shutdown after the grace period.
@@ -277,15 +492,13 @@ func TestListenTCPShutdownForceClose(t *testing.T) {
 
 	cancelStart := time.Now()
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("listenTCP did not exit within 5s of cancel")
+	if err := awaitTest(t, done, 5*time.Second, "listenTCP forced shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
 	}
 	elapsed := time.Since(cancelStart)
 	// Must exit well inside tcpIdleTimeout
 	if elapsed > 2*time.Second {
-		t.Fatalf("shutdown took %s; force-close path not taken (grace=%s, idle=%s)",
+		t.Fatalf("shutdown took %s, force-close path not taken (grace=%s, idle=%s)",
 			elapsed, tcpShutdownGrace, tcpIdleTimeout)
 	}
 }
@@ -336,10 +549,8 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 	}
 
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("listenTCP did not exit after cancel")
+	if err := awaitTest(t, done, 5*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
 	}
 }
 
@@ -375,9 +586,7 @@ func TestListenTCPPerFamily(t *testing.T) {
 	}
 
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(6 * time.Second):
-		t.Fatal("listenTCP did not exit after cancel")
+	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
+		t.Fatalf("listenTCP: %v", err)
 	}
 }

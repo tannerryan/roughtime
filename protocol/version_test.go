@@ -9,7 +9,6 @@ import (
 
 // TestVersionString covers full version labels.
 func TestVersionString(t *testing.T) {
-	// Cases cover every recognized value and one unknown value.
 	tests := []struct {
 		ver  Version
 		want string

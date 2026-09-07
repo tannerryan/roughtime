@@ -10,6 +10,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
@@ -25,8 +26,18 @@ func printDiagnostic(r probeResult) {
 	}
 	tags := decode(msgBody(r.reply))
 	printTags(tags)
+	if r.transport == "udp" {
+		status := "ok"
+		if len(r.reply) > len(r.request) {
+			status = "VIOLATED"
+		}
+		fmt.Printf("Amplification:   %s (reply %d, request %d)\n", status, len(r.reply), len(r.request))
+	}
 	if r.err != nil {
-		fmt.Printf("Verification:    failed: %s\n", r.err)
+		fmt.Printf("Verification:    failed: %s\n", roughtime.SanitizeForDisplay(r.err.Error()))
+		if r.transportErr != nil {
+			fmt.Printf("Later transport: failed: %s\n", roughtime.SanitizeForDisplay(r.transportErr.Error()))
+		}
 		return
 	}
 
@@ -36,13 +47,6 @@ func printDiagnostic(r probeResult) {
 	fmt.Printf("Radius:          %s\n", r.radius)
 	fmt.Printf("Local time:      %s\n", r.localNow.UTC().Format(time.RFC3339Nano))
 	fmt.Printf("Clock drift:     %s\n", r.midpoint.Sub(r.localNow.Add(-r.rtt/2)).Round(time.Millisecond))
-	if r.transport == "udp" {
-		status := "ok"
-		if len(r.reply) > len(r.request) {
-			status = "VIOLATED"
-		}
-		fmt.Printf("Amplification:   %s (reply %d, request %d)\n", status, len(r.reply), len(r.request))
-	}
 	printSREP(tags, r.plan.version)
 	printCertificate(tags, r.plan.version, r.midpoint)
 }

@@ -28,8 +28,8 @@ type ReplyOptions struct {
 // CreateReplies builds signed responses for a batch of requests. A zero
 // midpoint uses the current time. Radius is rounded up to the wire unit and its
 // required floor. Midpoints outside years 2000–3000 are rejected. For the
-// ambiguous TYPE=1 wire group it emits the draft-16+ hash-first Merkle form;
-// use [CreateRepliesWithOptions] for a draft-14/15 peer.
+// ambiguous TYPE=1 wire group it emits the draft-16+ hash-first Merkle form.
+// Use [CreateRepliesWithOptions] for a draft-14/15 peer.
 func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate) ([][]byte, error) {
 	return CreateRepliesWithOptions(ver, requests, midpoint, radius, cert, ReplyOptions{})
 }

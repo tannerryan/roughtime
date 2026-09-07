@@ -106,7 +106,7 @@ func testCert(t testing.TB) (*Certificate, ed25519.PrivateKey) {
 
 // testPQCert returns a fresh ML-DSA-44 Certificate and the encoded root public
 // key.
-func testPQCert(t *testing.T) (*Certificate, []byte) {
+func testPQCert(t testing.TB) (*Certificate, []byte) {
 	t.Helper()
 	rootSK, err := mldsa.GenerateKey(mldsa.MLDSA44())
 	if err != nil {
@@ -228,6 +228,17 @@ func testVersionBytes(versions []Version) []byte {
 		binary.LittleEndian.PutUint32(out[4*i:], uint32(version))
 	}
 	return out
+}
+
+// longVersionList returns n versions starting with first, followed by unknown
+// extensions. n must be positive.
+func longVersionList(first Version, n int) []Version {
+	versions := make([]Version, n)
+	versions[0] = first
+	for i := 1; i < n; i++ {
+		versions[i] = Version(0xf0000100 + i)
+	}
+	return versions
 }
 
 // mustRadiSeconds encodes radius or fails the test.

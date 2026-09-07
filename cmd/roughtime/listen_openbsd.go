@@ -124,44 +124,29 @@ func (c *openBSDMmsgConn) writeReplies(ctx context.Context, log *zap.Logger, ver
 		count++
 	}
 
-	sent := 0
-	for sent < count {
-		if ctx.Err() != nil {
-			break
-		}
+	remaining, lastN, err := drainUDPBatch(ctx, count, func(offset int) (int, error) {
 		_ = c.conn.SetWriteDeadline(time.Now().Add(udpWriteTimeout))
-		n, err := c.writeBatch(c.writeHeaders[sent:count])
-		if n > 0 && n <= count-sent {
-			udpRespondedEd.Add(uint64(n))
-			if ce := log.Check(zap.DebugLevel, "sent response batch"); ce != nil {
-				ce.Write(
-					zap.Int("batch_size", n),
-					zap.Stringer("version", ver),
-				)
-			}
-			sent += n
-			continue
-		}
-		if errors.Is(err, syscall.EINTR) {
-			continue
-		}
-		// sendmmsg hides a per-datagram error behind the short count of the
-		// messages before it, so skip that one datagram rather than the whole
-		// tail. Deadline and socket-wide failures still abandon the rest
-		errno, ok := errors.AsType[syscall.Errno](err)
-		if !ok || !dropsOneDatagram(errno) {
-			log.Warn("sendmmsg failed",
-				zap.Error(err),
-				zap.Int("written", n),
-				zap.Int("dropped", count-sent),
+		return c.writeBatch(c.writeHeaders[offset:count])
+	}, func(n int) {
+		udpRespondedEd.Add(uint64(n))
+		if ce := log.Check(zap.DebugLevel, "sent response batch"); ce != nil {
+			ce.Write(
+				zap.Int("batch_size", n),
+				zap.Stringer("version", ver),
 			)
-			break
 		}
+	}, func(err error) {
 		log.Warn("sendmmsg dropped datagram", zap.Error(err))
 		incDropped(transportUDP, dropWrite)
-		sent++
+	})
+	if err != nil {
+		log.Warn("sendmmsg failed",
+			zap.Error(err),
+			zap.Int("written", lastN),
+			zap.Int("dropped", remaining),
+		)
 	}
-	for range count - sent {
+	for range remaining {
 		incDropped(transportUDP, dropWrite)
 	}
 	runtime.KeepAlive(replies)

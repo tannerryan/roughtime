@@ -10,7 +10,7 @@
 // 14+). Drafts 14-15 and 16-19 specify opposite Merkle child orderings under
 // those same identifiers. [CreateReplies] defaults to the draft-16+ form,
 // [CreateRepliesWithOptions] can emit the draft-14/15 form, and verification
-// accepts either. Request builders include TYPE by default; [RequestOptions]
+// accepts either. Request builders include TYPE by default. [RequestOptions]
 // can emit the draft-12/13 form, and [VerifyOptions] can require TYPE when a
 // caller intentionally targets draft 14+.
 package protocol

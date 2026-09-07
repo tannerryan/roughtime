@@ -3,7 +3,7 @@
 
 // Command roughtime-bench is a closed-loop Roughtime load generator. It has no
 // rate limit or reconnect backoff and must only target servers you control.
-// Latency percentiles use a run-wide bounded reservoir; -verify excludes
+// Latency percentiles use a run-wide bounded reservoir. -verify excludes
 // unauthenticated replies from it. ML-DSA-44 always uses TCP.
 package main
 
@@ -16,7 +16,6 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -92,12 +91,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "WARNING: closed-loop load generator; do not target servers you do not own")
+	fmt.Fprintln(os.Stderr, "WARNING: closed-loop load generator. Do not target servers you do not own.")
 
 	// Verification can be CPU-bound, so cap default workers.
 	if *verify && !flagSet("workers") {
 		if maxW := runtime.NumCPU() * 2; *workers > maxW {
-			fmt.Fprintf(os.Stderr, "bench: -verify can be CPU-bound; capping workers %d -> %d (override with -workers)\n", *workers, maxW)
+			fmt.Fprintf(os.Stderr, "bench: -verify can be CPU-bound. Capping workers %d -> %d (override with -workers)\n", *workers, maxW)
 			*workers = maxW
 		}
 	}
@@ -156,8 +155,10 @@ func main() {
 
 	// run warmup and measurement in one pass so sockets stay open across the
 	// boundary
-	totalCtx, totalCancel := context.WithTimeout(ctx, *warmup+*duration)
+	runFor := *warmup + *duration
+	totalCtx, totalCancel := context.WithTimeout(ctx, runFor)
 	defer totalCancel()
+	stopTime := captureContextStop(totalCtx)
 	start := time.Now()
 	collectAfter := start.Add(*warmup)
 	results, latencies, err := runWorkers(totalCtx, cfg, *workers, collectAfter)
@@ -165,8 +166,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "bench: %s\n", err)
 		os.Exit(1)
 	}
-	// clamp at zero in case a SIGINT cancels before collectAfter elapses
-	elapsed := min(max(time.Since(collectAfter), 0), *duration)
+	// Use the context-stop instant rather than worker-drain completion so a
+	// canceled partial run does not understate throughput.
+	elapsed := min(max((<-stopTime).Sub(collectAfter), 0), *duration)
 
 	report(runMeta{workers: *workers, verify: *verify}, results, latencies, elapsed)
 }
@@ -199,6 +201,9 @@ func validateFlags() error {
 	if *warmup < 0 {
 		return fmt.Errorf("-warmup %s must be >= 0", *warmup)
 	}
+	if *warmup > time.Duration(1<<63-1)-*duration {
+		return fmt.Errorf("-warmup %s plus -duration %s exceeds maximum run duration", *warmup, *duration)
+	}
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout %s must be > 0", *timeout)
 	}
@@ -208,23 +213,39 @@ func validateFlags() error {
 	return nil
 }
 
+// captureContextStop records when cancellation is observed, without waiting for
+// worker cleanup.
+func captureContextStop(ctx context.Context) <-chan time.Time {
+	stopped := make(chan time.Time, 1)
+	context.AfterFunc(ctx, func() { stopped <- time.Now() })
+	return stopped
+}
+
 // runWorkers starts n workers and waits for them to finish.
 func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.Time) ([]workerResult, []time.Duration, error) {
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	results := make([]workerResult, n)
 	reservoir := &latencyReservoir{values: make([]time.Duration, 0, reservoirSize)}
 	cfg.latencies = reservoir
 	var wg sync.WaitGroup
-	var completed atomic.Int32
+	errCh := make(chan error, 1)
 	for i := range n {
 		wg.Go(func() {
-			if worker(ctx, cfg, &results[i], collectAfter) {
-				completed.Add(1)
+			if err := worker(workerCtx, cfg, &results[i], collectAfter); err != nil {
+				select {
+				case errCh <- fmt.Errorf("worker %d: %w", i, err):
+					cancel()
+				default:
+				}
 			}
 		})
 	}
 	wg.Wait()
-	if got := int(completed.Load()); got != n {
-		return nil, nil, fmt.Errorf("%d of %d workers failed to start or terminated early", n-got, n)
+	select {
+	case err := <-errCh:
+		return nil, nil, err
+	default:
 	}
 	return results, reservoir.values, nil
 }

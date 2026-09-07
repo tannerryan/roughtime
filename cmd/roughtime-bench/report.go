@@ -40,7 +40,7 @@ func report(meta runMeta, results []workerResult, latencies []time.Duration, ela
 		}
 	}
 
-	// Verification and amplification failures are sub-buckets of received.
+	// Verification and UDP amplification failures are sub-buckets of received.
 	errs := errWrite + errRead
 
 	var successRate, throughput float64
@@ -61,7 +61,7 @@ func report(meta runMeta, results []workerResult, latencies []time.Duration, ela
 		fmt.Printf("Verify fail:  %d (grease or fault)\n", errVerify)
 	}
 	if errAmp > 0 {
-		fmt.Printf("Amplifying:   %d\n", errAmp)
+		fmt.Printf("UDP oversize: %d\n", errAmp)
 	}
 	fmt.Printf("Errors:       %d\n", errs)
 	fmt.Printf("Timeouts:     %d\n", timeouts)

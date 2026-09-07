@@ -2,8 +2,8 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Command roughtime-debug probes a server's supported wire versions and prints
-// a concise authenticated response summary. Draft 12 is probed in typed and
-// untyped forms.
+// a concise authenticated response summary. Full scans probe draft 12 in typed
+// and untyped forms.
 package main
 
 import (
@@ -29,15 +29,17 @@ var (
 	// addr is the server endpoint flag.
 	addr = flag.String("addr", "", "host:port of the Roughtime server")
 	// pubkey is the server root-key flag.
-	pubkey = flag.String("pubkey", "", "root public key (base64 or hex); 32 raw bytes selects Ed25519, 1312 raw bytes selects ML-DSA-44")
+	pubkey = flag.String("pubkey", "", "root public key (base64 or hex, 32 bytes Ed25519 or 1312 bytes ML-DSA-44)")
 	// useTCP selects TCP transport.
-	useTCP = flag.Bool("tcp", false, "use TCP transport; Google-Roughtime is UDP-only and ML-DSA-44 keys always use TCP")
+	useTCP = flag.Bool("tcp", false, "use TCP transport (Google-Roughtime is UDP-only, ML-DSA-44 is TCP-only)")
 	// timeout bounds each attempt.
 	timeout = flag.Duration("timeout", 500*time.Millisecond, "timeout for each attempt (consider raising for ML-DSA-44 over TCP)")
 	// retries caps attempts per version form.
-	retries = flag.Int("retries", 3, "max attempts per version/form (>=1)")
+	retries = flag.Int("retries", 3, "max attempts per request size/version form (>=1)")
+	// scanTimeout bounds the complete version scan, including retry backoff.
+	scanTimeout = flag.Duration("scan-timeout", defaultScanTimeout, "maximum duration for the complete version scan")
 	// forceVer selects one wire version.
-	forceVer = flag.String("ver", "", "probe only this wire version, case-sensitive (e.g. draft-12, Google, ml-dsa-44); draft-12 falls back to the untyped form")
+	forceVer = flag.String("ver", "", "probe one wire version (e.g. draft-12, Google, ml-dsa-44). Names are case-sensitive. draft-12 falls back to the untyped form")
 	// showVersion requests version output and exit.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -62,6 +64,70 @@ type probeResult struct {
 	request   []byte
 	reply     []byte
 	err       error
+	// transportErr is a transport failure after the retained invalid reply.
+	transportErr error
+}
+
+const (
+	// defaultScanTimeout allows all forms and size fallbacks to be attempted
+	// with the default retry count, even when every exchange fails.
+	defaultScanTimeout = 5 * time.Minute
+	// debugBackoffInitial is the delay after the first failed exchange.
+	debugBackoffInitial = 1 * time.Second
+	// debugBackoffMax lets a full diagnostic scan fit its default budget. Draft
+	// 19 section 5 permits alternate timer values. The high-level client keeps
+	// the recommended 24-hour cap.
+	debugBackoffMax = 3 * time.Second
+)
+
+// debugRetryState applies the draft retry schedule across every request sent
+// during one run. A successful, fully verified response is the only reset.
+type debugRetryState struct {
+	delay time.Duration
+	wait  func(context.Context, time.Duration) error
+}
+
+// newDebugRetryState starts an unpenalized scan using context-aware waits.
+func newDebugRetryState() *debugRetryState {
+	return &debugRetryState{wait: waitForDebugRetry}
+}
+
+// beforeAttempt applies the pending delay before another exchange.
+func (s *debugRetryState) beforeAttempt(ctx context.Context) error {
+	if s.delay == 0 {
+		return nil
+	}
+	return s.wait(ctx, s.delay)
+}
+
+// failed advances the shared failure schedule by a factor of 1.5.
+func (s *debugRetryState) failed() {
+	if s.delay == 0 {
+		s.delay = debugBackoffInitial
+		return
+	}
+	next := s.delay + s.delay/2
+	if next > debugBackoffMax {
+		next = debugBackoffMax
+	}
+	s.delay = next
+}
+
+// verified clears the failure schedule after an authenticated response.
+func (s *debugRetryState) verified() {
+	s.delay = 0
+}
+
+// waitForDebugRetry waits for the retry delay or the scan's cancellation.
+func waitForDebugRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // main parses flags and runs the diagnostic client.
@@ -72,13 +138,14 @@ func main() {
 		return
 	}
 	if err := validateFlags(); err != nil {
-		fmt.Fprintln(os.Stderr, "debug:", err)
+		fmt.Fprintln(os.Stderr, "debug:", roughtime.SanitizeForDisplay(err.Error()))
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "debug:", *addr+":", err)
+		message := *addr + ": " + err.Error()
+		fmt.Fprintln(os.Stderr, "debug:", roughtime.SanitizeForDisplay(message))
 		if errors.Is(ctx.Err(), context.Canceled) {
 			os.Exit(130)
 		}
@@ -105,6 +172,9 @@ func validateFlags() error {
 	}
 	if *retries < 1 {
 		return fmt.Errorf("-retries %d must be >= 1", *retries)
+	}
+	if *scanTimeout <= 0 {
+		return fmt.Errorf("-scan-timeout %s must be > 0", *scanTimeout)
 	}
 	return nil
 }
@@ -160,6 +230,9 @@ func run(ctx context.Context) error {
 	if sch == roughtime.SchemeMLDSA44 || *useTCP {
 		transport = "tcp"
 	}
+	scanCtx, cancel := context.WithTimeout(ctx, *scanTimeout)
+	defer cancel()
+	retryState := newDebugRetryState()
 	if *forceVer != "" {
 		ver, err := protocol.ParseShortVersion(*forceVer)
 		if err != nil {
@@ -176,25 +249,26 @@ func run(ctx context.Context) error {
 		plans = plansForVersion(ver)
 		var lastErr error
 		for _, plan := range plans {
-			result := probe(ctx, rootPK, plan, transport)
+			result := probe(scanCtx, rootPK, plan, transport, retryState)
 			fmt.Printf("=== Forced Version: %s ===\n", plan.label)
 			if result.err != nil {
-				fmt.Printf("Probe error: %s\n\n", result.err)
-				lastErr = result.err
+				lastErr = resultError(result)
+				fmt.Printf("Probe error: %s\n\n", roughtime.SanitizeForDisplay(lastErr.Error()))
 			}
 			printDiagnostic(result)
 			if result.err == nil {
 				return nil
 			}
-			if err := ctx.Err(); err != nil {
-				return err
+			if err := scanCtx.Err(); err != nil {
+				return scanError(ctx, err)
 			}
 		}
 		return lastErr
 	}
 
 	fmt.Printf("=== Version Probe: %s (%s) ===\n", roughtime.SanitizeForDisplay(*addr), transport)
-	fmt.Printf("Timeout per attempt: %s; attempts per form: %d\n", *timeout, *retries)
+	fmt.Printf("Timeout per attempt: %s. Attempts per form: %d\n", *timeout, *retries)
+	fmt.Printf("Overall scan timeout: %s\n", *scanTimeout)
 	var supported []probePlan
 	var best *probeResult
 
@@ -204,16 +278,16 @@ func run(ctx context.Context) error {
 			fmt.Printf("  %-48s %s\n", plan.label, "skipped (Google-Roughtime is UDP-only)")
 			continue
 		}
-		result := probe(ctx, rootPK, plan, transport)
-		status := "OK"
+		result := probe(scanCtx, rootPK, plan, transport, retryState)
+		status := fmt.Sprintf("OK (%d-byte request)", len(result.request))
 		if result.err != nil {
-			status = result.err.Error()
+			status = resultError(result).Error()
 		}
 		fmt.Printf("  %-48s %s\n", plan.label, roughtime.SanitizeForDisplay(status))
 
 		if result.err != nil {
-			if err := ctx.Err(); err != nil {
-				return err
+			if err := scanCtx.Err(); err != nil {
+				return scanError(ctx, err)
 			}
 			continue
 		}
@@ -239,9 +313,30 @@ func run(ctx context.Context) error {
 	return nil
 }
 
+// scanError distinguishes caller cancellation from expiration of the command's
+// overall scan budget.
+func scanError(parent context.Context, err error) error {
+	if parent.Err() != nil {
+		return parent.Err()
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("version scan incomplete after %s: %w", *scanTimeout, err)
+	}
+	return err
+}
+
+// resultError includes a later transport failure without discarding the
+// verification error associated with a retained reply.
+func resultError(result probeResult) error {
+	if result.transportErr == nil {
+		return result.err
+	}
+	return fmt.Errorf("%v. Later transport failure: %v", result.err, result.transportErr)
+}
+
 // probe sends a Roughtime request for a concrete version form, retrying on
 // failure.
-func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string) probeResult {
+func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string, retryState *debugRetryState) probeResult {
 	result := probeResult{plan: plan, transport: transport}
 	versions := []protocol.Version{plan.version}
 
@@ -249,46 +344,56 @@ func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string)
 	if plan.version != protocol.VersionGoogle {
 		srv = protocol.ComputeSRV(rootPK)
 	}
-	options := protocol.RequestOptions{
-		OmitTYPE:         plan.omitTYPE,
-		LegacyPacketSize: plan.version != protocol.VersionDraft12 || plan.omitTYPE,
+	legacySize := plan.version != protocol.VersionDraft12 || plan.omitTYPE
+	sizes := []bool{legacySize}
+	if transport == "udp" && legacySize && plan.version != protocol.VersionGoogle {
+		sizes = append(sizes, false)
 	}
-	nonce, request, err := protocol.CreateRequestWithOptions(versions, rand.Reader, srv, options)
-	if err != nil {
-		result.err = fmt.Errorf("request: %w", err)
-		return result
-	}
-	result.request = request
-
-	for attempt := range *retries {
-		if err := ctx.Err(); err != nil {
-			result.err = err
+	for _, useLegacySize := range sizes {
+		nonce, request, err := protocol.CreateRequestWithOptions(versions, rand.Reader, srv, protocol.RequestOptions{
+			OmitTYPE: plan.omitTYPE, LegacyPacketSize: useLegacySize,
+		})
+		if err != nil {
+			result.err = fmt.Errorf("request: %w", err)
 			return result
 		}
-		result.reply = nil
-		result.rtt = 0
-		result.localNow = time.Time{}
-		result.midpoint = time.Time{}
-		result.radius = 0
-		reply, rtt, localNow, sendErr := sendProbe(ctx, request, *timeout, transport)
-		if sendErr != nil {
-			err = sendErr
-		} else {
+		for range *retries {
+			if err := retryState.beforeAttempt(ctx); err != nil {
+				if len(result.reply) == 0 {
+					result.request = request
+					result.err = err
+				} else {
+					result.transportErr = err
+				}
+				return result
+			}
+			reply, rtt, localNow, sendErr := probeRoundTrip(ctx, request, *timeout, transport)
+			if sendErr != nil {
+				retryState.failed()
+				if len(result.reply) == 0 {
+					result.request = request
+					result.err = sendErr
+				} else {
+					result.transportErr = sendErr
+				}
+				continue
+			}
+
+			midpoint, radius, verifyErr := verifyProbeReply(plan, reply, rootPK, nonce, request)
+			result.request = request
 			result.reply = reply
 			result.rtt = rtt
 			result.localNow = localNow
-			result.midpoint, result.radius, err = verifyProbeReply(plan, reply, rootPK, nonce, request)
-			if err != nil {
-				err = fmt.Errorf("verify: %w", err)
+			result.midpoint = midpoint
+			result.radius = radius
+			result.transportErr = nil
+			if verifyErr == nil {
+				result.err = nil
+				retryState.verified()
+				return result
 			}
-		}
-		if err == nil {
-			result.err = nil
-			return result
-		}
-		result.err = err
-		if attempt == *retries-1 {
-			return result
+			result.err = fmt.Errorf("verify: %w", verifyErr)
+			retryState.failed()
 		}
 	}
 	return result
@@ -332,6 +437,9 @@ func sendProbe(ctx context.Context, request []byte, deadline time.Duration, tran
 		return nil, 0, time.Time{}, fmt.Errorf("unsupported transport %q", transport)
 	}
 }
+
+// probeRoundTrip is replaceable by focused command tests.
+var probeRoundTrip = sendProbe
 
 // isIETF reports whether pkt starts with the IETF "ROUGHTIM" framing magic.
 func isIETF(pkt []byte) bool {

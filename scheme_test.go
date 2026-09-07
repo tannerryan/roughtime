@@ -21,13 +21,13 @@ func TestVersionsForScheme(t *testing.T) {
 	}
 	for _, v := range ed {
 		if v == protocol.VersionGoogle || v == protocol.VersionMLDSA44 {
-			t.Fatalf("Ed25519 list contains %v; should exclude Google and PQ", v)
+			t.Fatalf("Ed25519 list contains %v, should exclude Google and PQ", v)
 		}
 	}
 
 	pq := roughtime.VersionsForScheme(roughtime.SchemeMLDSA44)
 	if len(pq) != 1 || pq[0] != protocol.VersionMLDSA44 {
-		t.Fatalf("MLDSA44 list = %v; want [VersionMLDSA44]", pq)
+		t.Fatalf("MLDSA44 list = %v, want [VersionMLDSA44]", pq)
 	}
 }
 

@@ -419,7 +419,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 
 // prepareTCPItem parses, negotiates, and SRV-checks reqBytes, returning the
 // tcpBatchItem and destination batch channel. On failure the dropReason
-// classifies the rejection; success returns dropNone.
+// classifies the rejection. Success returns dropNone.
 func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) (tcpBatchItem, chan<- tcpBatchItem, dropReason, error) {
 	req, err := protocol.ParseRequest(reqBytes)
 	if err != nil {
@@ -445,6 +445,12 @@ func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pq
 		}
 		return tcpBatchItem{}, nil, dropVersion, err
 	}
+	if req.SRV == nil && edState != nil && pqState != nil && tcpVersionUsesSRV(ver) {
+		if ce := log.Check(zap.DebugLevel, "SRV required with multiple configured roots"); ce != nil {
+			ce.Write(zap.Stringer("peer", peer), zap.Stringer("version", ver))
+		}
+		return tcpBatchItem{}, nil, dropSRV, errors.New("SRV required with multiple configured roots")
+	}
 	st, ch, err := tcpRouteForVersion(ver, edState, pqState, edBatchCh, pqBatchCh)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "TCP route unavailable"); ce != nil {
@@ -459,6 +465,13 @@ func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pq
 		return tcpBatchItem{}, nil, dropSRV, errors.New("SRV mismatch")
 	}
 	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, dropNone, nil
+}
+
+// tcpVersionUsesSRV reports whether ver belongs to a profile that introduced
+// long-term-key selection through SRV.
+func tcpVersionUsesSRV(ver protocol.Version) bool {
+	return ver == protocol.VersionMLDSA44 ||
+		(ver >= protocol.VersionDraft10 && ver <= protocol.VersionDraft12)
 }
 
 // filterTCPPrefsBySRV keeps only versions whose configured key matches srv.
@@ -517,12 +530,7 @@ func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-ch
 		)
 		err := fmt.Errorf("tcp batcher panic: %v", r)
 		for _, b := range batches {
-			for _, it := range b.items {
-				select {
-				case it.reply <- tcpBatchReply{err: err}:
-				default:
-				}
-			}
+			deliverTCPBatchError(b.items, err)
 		}
 	}()
 

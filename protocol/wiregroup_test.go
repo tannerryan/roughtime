@@ -10,7 +10,6 @@ import (
 
 // TestWireGroupOf covers version-to-wire-group mapping.
 func TestWireGroupOf(t *testing.T) {
-	// Cases map each version family to its wire group.
 	tests := []struct {
 		ver     Version
 		hasType bool
@@ -38,23 +37,29 @@ func TestWireGroupOf(t *testing.T) {
 	}
 }
 
-// TestNoncInSREP covers nonce placement by wire group.
+// TestNoncInSREP covers the public nonce-placement query.
 func TestNoncInSREP(t *testing.T) {
-	for _, g := range []wireGroup{groupD01, groupD02} {
-		if !noncInSREP(g) {
-			t.Fatalf("group %d should have NONC in SREP", g)
-		}
-	}
-	for _, g := range []wireGroup{groupGoogle, groupD03, groupD05, groupD07, groupD08, groupD10, groupD12, groupD14} {
-		if noncInSREP(g) {
-			t.Fatalf("group %d should not have NONC in SREP", g)
+	for _, tc := range []struct {
+		version Version
+		hasType bool
+		want    bool
+	}{
+		{VersionGoogle, false, false},
+		{VersionDraft01, false, true},
+		{VersionDraft02, false, true},
+		{VersionDraft03, false, false},
+		{VersionDraft12, false, false},
+		{VersionDraft12, true, false},
+		{VersionMLDSA44, true, false},
+	} {
+		if got := NoncInSREP(tc.version, tc.hasType); got != tc.want {
+			t.Fatalf("NoncInSREP(%s, %v) = %v, want %v", tc.version, tc.hasType, got, tc.want)
 		}
 	}
 }
 
 // TestNonceSize covers nonce length by wire group.
 func TestNonceSize(t *testing.T) {
-	// Cases cover each nonce-size transition.
 	tests := []struct {
 		ver  Version
 		want int
@@ -77,7 +82,6 @@ func TestNonceSize(t *testing.T) {
 
 // TestSigningContextsMatchSpec covers signature context strings.
 func TestSigningContextsMatchSpec(t *testing.T) {
-	// Cases cover every signing context.
 	tests := []struct {
 		name string
 		got  []byte

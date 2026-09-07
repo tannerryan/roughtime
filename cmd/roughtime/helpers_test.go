@@ -17,6 +17,21 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
+// awaitTest bounds synchronization with test-owned asynchronous work.
+func awaitTest[T any](t *testing.T, ch <-chan T, timeout time.Duration, operation string) T {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case result := <-ch:
+		return result
+	case <-timer.C:
+		t.Fatalf("timed out waiting for %s", operation)
+		var zero T
+		return zero
+	}
+}
+
 // reset clears every request counter for test isolation.
 func (c *requestCounters) reset() {
 	c.udpEd.Store(0)

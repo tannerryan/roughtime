@@ -39,7 +39,7 @@ type Server struct {
 	// Name identifies the server for logs and error messages.
 	Name string
 	// Version is an optional ecosystem label. [VersionLabelGoogle] and the
-	// numeric Google ecosystem version select Google-Roughtime; other numeric
+	// numeric Google ecosystem version select Google-Roughtime. Other numeric
 	// values cap advertised scheme-compatible versions.
 	Version string
 	// PublicKey is the server's long-term root public key (32 bytes Ed25519 or
@@ -103,12 +103,17 @@ type Client struct {
 	Timeout time.Duration
 	// MaxAttempts caps attempts per query. Backoff starts at 1s, grows by 1.5,
 	// persists by root key across calls, and resets after a verified response.
-	// Zero tries each configured endpoint once; negative values mean one
+	// Zero tries each configured endpoint once. Negative values mean one
 	// attempt.
 	MaxAttempts int
 	// Concurrency caps in-flight queries in [Client.QueryAll] and defaults to
 	// [MaxQueryAllConcurrency] when non-positive.
 	Concurrency int
+	// StandardPacketSize pads framed requests to a 1024-byte message body plus
+	// the 12-byte header (an 8192-byte body for ML-DSA-44). The default false
+	// value retains the historical 1024-byte total packet size, or 8192-byte
+	// total for ML-DSA-44, for deployed interoperability.
+	StandardPacketSize bool
 
 	retry *retryTracker
 }
@@ -116,15 +121,28 @@ type Client struct {
 // retryState is the persistent per-server backoff recommended by drafts 16-17
 // and required by drafts 18-19.
 type retryState struct {
-	interval  time.Duration
-	notBefore time.Time
-	reset     chan struct{}
+	interval   time.Duration
+	notBefore  time.Time
+	probing    bool
+	generation uint64
+	active     int
+	changed    chan struct{}
+}
+
+// retryAttempt identifies one exchange admitted by the per-root tracker.
+// Generations prevent concurrent failures from multiplying one shared penalty
+// and prevent a stale failure from reinstating backoff after a verified reply.
+type retryAttempt struct {
+	key        string
+	state      *retryState
+	generation uint64
+	probe      bool
 }
 
 // retryTracker is shared by copies of an initialized Client.
 type retryTracker struct {
 	mu      sync.Mutex
-	retries map[string]retryState
+	retries map[string]*retryState
 }
 
 // Error sentinels re-exported from the protocol package for use with
@@ -185,7 +203,7 @@ func (c *Client) queryPlanned(ctx context.Context, s Server, plan serverPlan) (*
 	if !isGoogleOnly(plan.versions) {
 		srvHash = protocol.ComputeSRV(s.PublicKey)
 	}
-	nonce, request, err := protocol.CreateRequestWithOptions(plan.versions, rand.Reader, srvHash, protocol.RequestOptions{LegacyPacketSize: true})
+	nonce, request, err := protocol.CreateRequestWithOptions(plan.versions, rand.Reader, srvHash, c.requestOptions())
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -203,7 +221,7 @@ func (c *Client) QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*R
 	if !isGoogleOnly(plan.versions) {
 		srvHash = protocol.ComputeSRV(s.PublicKey)
 	}
-	request, err := protocol.CreateRequestWithNonceOptions(plan.versions, nonce, srvHash, protocol.RequestOptions{LegacyPacketSize: true})
+	request, err := protocol.CreateRequestWithNonceOptions(plan.versions, nonce, srvHash, c.requestOptions())
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
@@ -233,6 +251,11 @@ func Query(ctx context.Context, s Server) (*Response, error) {
 // client.
 func QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*Response, error) {
 	return defaultClient.QueryWithNonce(ctx, s, nonce)
+}
+
+// requestOptions preserves legacy packet sizing for Client's zero value.
+func (c *Client) requestOptions() protocol.RequestOptions {
+	return protocol.RequestOptions{LegacyPacketSize: !c.StandardPacketSize}
 }
 
 // Verify re-validates a stored request/reply pair against the server's
@@ -343,7 +366,7 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 		}
 		if err == nil {
 			link.PublicKey = append([]byte(nil), s.PublicKey...)
-			link.Request, err = protocol.CreateRequestWithNonceOptions(plan.versions, link.Nonce, protocol.ComputeSRV(s.PublicKey), protocol.RequestOptions{LegacyPacketSize: true})
+			link.Request, err = protocol.CreateRequestWithNonceOptions(plan.versions, link.Nonce, protocol.ComputeSRV(s.PublicKey), c.requestOptions())
 		}
 		if err != nil {
 			results[i].Err = fmt.Errorf("chained request: %w", err)
@@ -388,7 +411,8 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
 		}
-		if !c.waitForRetry(ctx, key) {
+		attempt, ok := c.waitForRetry(ctx, key)
+		if !ok {
 			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctx.Err()
 		}
 		addr = plan.addresses[i%len(plan.addresses)]
@@ -396,15 +420,16 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 		if err == nil {
 			midpoint, radius, err = verify(reply)
 			if err == nil {
-				c.resetRetry(key)
+				c.resetRetry(attempt)
 				return addr, reply, rtt, localNow, midpoint, radius, nil
 			}
 			err = fmt.Errorf("verification: %w", err)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			c.releaseRetry(attempt)
 			return addr, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
 		}
-		c.recordRetryFailure(key)
+		c.recordRetryFailure(attempt)
 		if i == attempts-1 {
 			return addr, nil, 0, time.Time{}, time.Time{}, 0, err
 		}
@@ -412,44 +437,72 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 	return addr, nil, 0, time.Time{}, time.Time{}, 0, err
 }
 
-// waitForRetry waits until the server's persistent retry interval has elapsed.
-func (c *Client) waitForRetry(ctx context.Context, key string) bool {
+// waitForRetry waits until the server's persistent retry interval has elapsed
+// and, after a failure, reserves the sole next probe for this root. With no
+// active penalty it admits independent exchanges in parallel.
+func (c *Client) waitForRetry(ctx context.Context, key string) (retryAttempt, bool) {
 	tracker := c.retryTracker()
 	for {
 		tracker.mu.Lock()
-		state, ok := tracker.retries[key]
+		if tracker.retries == nil {
+			tracker.retries = make(map[string]*retryState)
+		}
+		state := tracker.retries[key]
+		if state == nil {
+			state = &retryState{changed: make(chan struct{})}
+			tracker.retries[key] = state
+		}
+		if state.interval == 0 {
+			state.active++
+			attempt := retryAttempt{key: key, state: state, generation: state.generation}
+			tracker.mu.Unlock()
+			return attempt, true
+		}
+		if !state.probing {
+			d := time.Until(state.notBefore)
+			if d <= 0 {
+				state.probing = true
+				state.active++
+				attempt := retryAttempt{key: key, state: state, generation: state.generation, probe: true}
+				tracker.mu.Unlock()
+				return attempt, true
+			}
+			changed := state.changed
+			tracker.mu.Unlock()
+			timer := time.NewTimer(d)
+			select {
+			case <-timer.C:
+			case <-changed:
+			case <-ctx.Done():
+				timer.Stop()
+				return retryAttempt{}, false
+			}
+			timer.Stop()
+			continue
+		}
+		changed := state.changed
 		tracker.mu.Unlock()
-		if !ok {
-			return true
-		}
-		d := time.Until(state.notBefore)
-		if d <= 0 {
-			return true
-		}
-		timer := time.NewTimer(d)
 		select {
-		case <-timer.C:
-		case <-state.reset:
-			timer.Stop()
+		case <-changed:
 		case <-ctx.Done():
-			timer.Stop()
-			return false
+			return retryAttempt{}, false
 		}
-		// A concurrent failure may have extended the deadline; recheck it.
 	}
 }
 
 // recordRetryFailure advances the persistent per-server retry schedule.
-func (c *Client) recordRetryFailure(key string) {
+func (c *Client) recordRetryFailure(attempt retryAttempt) {
 	tracker := c.retryTracker()
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	if tracker.retries == nil {
-		tracker.retries = make(map[string]retryState)
+	state := tracker.retries[attempt.key]
+	if state != attempt.state {
+		return
 	}
-	state := tracker.retries[key]
-	if state.reset == nil {
-		state.reset = make(chan struct{})
+	state.active--
+	if state.generation != attempt.generation {
+		c.cleanupRetryLocked(tracker, attempt.key, state)
+		return
 	}
 	if state.interval == 0 {
 		state.interval = retryBackoffInitial
@@ -457,20 +510,60 @@ func (c *Client) recordRetryFailure(key string) {
 		state.interval = nextBackoff(state.interval)
 	}
 	state.notBefore = time.Now().Add(state.interval)
-	tracker.retries[key] = state
+	state.probing = false
+	state.generation++
+	notifyRetryWaiters(state)
 }
 
 // resetRetry clears a server's backoff after a properly signed response.
-func (c *Client) resetRetry(key string) {
+func (c *Client) resetRetry(attempt retryAttempt) {
 	tracker := c.retryTracker()
 	tracker.mu.Lock()
-	if state, ok := tracker.retries[key]; ok {
-		if state.reset != nil {
-			close(state.reset)
-		}
+	defer tracker.mu.Unlock()
+	state := tracker.retries[attempt.key]
+	if state != attempt.state {
+		return
+	}
+	state.active--
+	state.interval = 0
+	state.notBefore = time.Time{}
+	state.probing = false
+	state.generation++
+	notifyRetryWaiters(state)
+	c.cleanupRetryLocked(tracker, attempt.key, state)
+}
+
+// releaseRetry relinquishes an admitted attempt without treating caller
+// cancellation as a server failure. A canceled reserved probe wakes one of the
+// other waiters to take its place.
+func (c *Client) releaseRetry(attempt retryAttempt) {
+	tracker := c.retryTracker()
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	state := tracker.retries[attempt.key]
+	if state != attempt.state {
+		return
+	}
+	state.active--
+	if attempt.probe && state.generation == attempt.generation && state.probing {
+		state.probing = false
+		notifyRetryWaiters(state)
+	}
+	c.cleanupRetryLocked(tracker, attempt.key, state)
+}
+
+// cleanupRetryLocked drops idle healthy entries while retaining failed roots.
+func (c *Client) cleanupRetryLocked(tracker *retryTracker, key string, state *retryState) {
+	if state.active == 0 && state.interval == 0 {
 		delete(tracker.retries, key)
 	}
-	tracker.mu.Unlock()
+}
+
+// notifyRetryWaiters broadcasts a state transition and installs the next
+// generation's wait channel. tracker.mu must be held.
+func notifyRetryWaiters(state *retryState) {
+	close(state.changed)
+	state.changed = make(chan struct{})
 }
 
 // retryTracker returns c's lazily installed tracker. Copies made after first
@@ -509,6 +602,19 @@ func nextBackoff(cur time.Duration) time.Duration {
 type serverPlan struct {
 	addresses []Address
 	versions  []protocol.Version
+}
+
+// NormalizeServer checks client compatibility without network I/O. It returns
+// a copy with usable addresses ordered as [Client.Query] will try them.
+// The address slice is cloned, but PublicKey still shares the input's storage.
+func NormalizeServer(s Server) (Server, error) {
+	plan, err := resolveServer(s)
+	if err != nil {
+		return Server{}, err
+	}
+	out := s
+	out.Addresses = slices.Clone(plan.addresses)
+	return out, nil
 }
 
 // resolveServer derives the scheme, orders usable addresses, and returns the

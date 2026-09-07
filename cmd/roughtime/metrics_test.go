@@ -43,7 +43,6 @@ func TestMetricsRegistry(t *testing.T) {
 
 // TestMetricsHandlers covers endpoint methods, statuses, and bodies.
 func TestMetricsHandlers(t *testing.T) {
-	// Cases cover endpoint methods, statuses, and bodies.
 	tests := []struct {
 		name, method, path string
 		handler            http.HandlerFunc

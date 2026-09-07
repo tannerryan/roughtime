@@ -26,6 +26,22 @@ func TestSchemeOfGroupSweep(t *testing.T) {
 	}
 }
 
+// TestSigSchemeString covers stable labels and diagnostic fallback formatting.
+func TestSigSchemeString(t *testing.T) {
+	for _, tc := range []struct {
+		scheme sigScheme
+		want   string
+	}{
+		{schemeEd25519, "Ed25519"},
+		{schemeMLDSA44, "ML-DSA-44"},
+		{sigScheme(99), "sigScheme(99)"},
+	} {
+		if got := tc.scheme.String(); got != tc.want {
+			t.Fatalf("sigScheme.String() = %q, want %q", got, tc.want)
+		}
+	}
+}
+
 // TestPQSchemeOf covers ML-DSA-44 scheme selection.
 func TestPQSchemeOf(t *testing.T) {
 	if s := schemeOf(VersionGoogle); s != schemeEd25519 {

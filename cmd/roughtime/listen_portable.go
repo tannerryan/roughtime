@@ -62,8 +62,9 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		_ = conn.SetDeadline(time.Unix(1, 0))
 	}()
 
-	// readOne does one read-dispatch iteration and returns true on shutdown.
-	// Recovered panics leak the in-flight buffer rather than returning it
+	// readOne does one read-dispatch iteration and returns true on shutdown. A
+	// recovered panic discards the in-flight pooled buffer. The garbage
+	// collector can reclaim it.
 	readOne := func() bool {
 		defer recoverGoroutine(listenLog, "listen")
 

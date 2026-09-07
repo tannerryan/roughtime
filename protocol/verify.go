@@ -128,8 +128,8 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 		return time.Time{}, 0, fmt.Errorf("protocol: nonce length %d, want %d", len(nonce), nonceSize(g))
 	}
 
-	// Drafts 01-11 require top-level VER; 12+ moved it into SREP. This check is
-	// structural; later cryptographic and semantic checks reject false claims.
+	// Drafts 01-11 require top-level VER, while 12+ moved it into SREP. This
+	// checks structure only. Authentication follows below.
 	if hasResponseVER(g) {
 		vb, ok := resp[TagVER]
 		if !ok {
@@ -155,7 +155,7 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 		return time.Time{}, 0, err
 	}
 	if g >= groupD12 {
-		if err := verifySREPVersions(srep, offeredVersions); err != nil {
+		if err := verifySREPVersions(srep, offeredVersions, g); err != nil {
 			return time.Time{}, 0, err
 		}
 	}
@@ -165,7 +165,9 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 
 // verifySREPVersions validates the signed version declaration used by drafts
 // 12+ and ML-DSA-44. Selection need not use the highest numeric version.
-func verifySREPVersions(srep map[uint32][]byte, clientVersions []Version) error {
+// Untyped draft-12/13 input may exceed 32 entries because those drafts share an
+// identifier and draft 12 had no limit. Typed modern input remains capped.
+func verifySREPVersions(srep map[uint32][]byte, clientVersions []Version, g wireGroup) error {
 	if srep == nil {
 		return errors.New("protocol: missing SREP for downgrade check")
 	}
@@ -182,7 +184,7 @@ func verifySREPVersions(srep map[uint32][]byte, clientVersions []Version) error 
 		return errors.New("protocol: missing or malformed VERS in SREP")
 	}
 	nv := len(versBytes) / 4
-	if nv > maxVersionList {
+	if g >= groupD14 && nv > maxVersionList {
 		return fmt.Errorf("protocol: VERS has %d entries (max %d)", nv, maxVersionList)
 	}
 	serverSupports := make(map[Version]bool, nv)
@@ -218,7 +220,7 @@ func extractResponseVER(resp, srep map[uint32][]byte) (Version, bool) {
 }
 
 // ExtractVersion returns the version claimed by a raw server reply. It does not
-// authenticate the reply; call [VerifyReply] before trusting the result.
+// authenticate the reply. Call [VerifyReply] before trusting the result.
 func ExtractVersion(reply []byte) (Version, bool) {
 	msg := reply
 	if len(reply) >= 12 {
@@ -316,7 +318,7 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	}
 
 	// Drafts 01-02 bind NONC through SREP. Later responses commonly echo NONC
-	// at top level; validate it when present. Some deployed historical servers
+	// at top level. Validate it when present. Some deployed historical servers
 	// omit that redundant echo, so absence remains accepted for compatibility.
 	if noncInSREP(g) {
 		srepNonce, ok := srep[TagNONC]

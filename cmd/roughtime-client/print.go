@@ -26,10 +26,23 @@ const (
 	maxTableErrorRunes = 240
 )
 
+// responseInSync reports whether the local exchange interval and authenticated
+// server window overlap. Both intervals are closed, so touching boundaries
+// count as synchronized.
+func responseInSync(r *roughtime.Response) bool {
+	if r == nil || r.Radius < 0 || r.RTT < 0 {
+		return false
+	}
+	localStart, localEnd := r.LocalNow.Add(-r.RTT), r.LocalNow
+	serverStart := r.Midpoint.Add(-r.Radius)
+	serverEnd := r.Midpoint.Add(r.Radius)
+	return !localEnd.Before(serverStart) && !serverEnd.Before(localStart)
+}
+
 // printSingle prints one verified response.
 func printSingle(r *roughtime.Response) {
 	status := "out-of-sync"
-	if r.InSync() {
+	if responseInSync(r) {
 		status = "in-sync"
 	}
 	if r.Server.Name != r.Address.Address {
@@ -48,8 +61,16 @@ func printSingle(r *roughtime.Response) {
 	fmt.Printf("Status:     %s\n", status)
 }
 
-// printTable prints batch results, consensus, and chain status.
-func printTable(results []roughtime.Result, proof *roughtime.Proof) error {
+// printTable prints batch results, chain status, and drift statistics.
+// expectedProbes is nonzero only for strict two-pass measurements.
+func printTable(results []roughtime.Result, proof *roughtime.Proof, expectedProbes int) error {
+	probeResults := len(results)
+	probeSuccesses := 0
+	for _, result := range results {
+		if result.Err == nil && result.Response != nil {
+			probeSuccesses++
+		}
+	}
 	// Collapse repeated trust-root/endpoint entries without merging distinct
 	// endpoints that share a root key.
 	type rowKey struct {
@@ -63,7 +84,7 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof) error {
 			rows = append(rows, result)
 			continue
 		}
-		key := rowKey{publicKey: string(result.Server.PublicKey), address: resultAddress(result)}
+		key := rowKey{publicKey: string(result.Server.PublicKey), address: resultAddressKey(result)}
 		if i, ok := rowIndex[key]; ok {
 			if rows[i].Err != nil && result.Err == nil {
 				rows[i] = result
@@ -98,7 +119,7 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof) error {
 		response := result.Response
 		successes = append(successes, result)
 		status := "out-of-sync"
-		if response.InSync() {
+		if responseInSync(response) {
 			status = "in-sync"
 		}
 		fmt.Printf(rowFmt,
@@ -112,29 +133,58 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof) error {
 			status)
 	}
 
-	fmt.Printf("\n%d/%d servers responded\n", len(successes), len(results))
-	printConsensus(successes)
+	if expectedProbes > 0 {
+		fmt.Printf("\n%d/%d probes responded\n", probeSuccesses, expectedProbes)
+	} else {
+		fmt.Printf("\n%d/%d servers responded\n", len(successes), len(results))
+	}
 	if proof != nil {
 		if err := printChainStatus(proof); err != nil {
 			return err
 		}
 	}
+	if expectedProbes > 0 {
+		links := 0
+		if proof != nil {
+			links = proof.Len()
+		}
+		if probeResults != expectedProbes || probeSuccesses != expectedProbes || links != expectedProbes {
+			fmt.Printf("Measurement:        FAILED: complete %d-probe chain required (%d replies, %d links)\n",
+				expectedProbes, probeSuccesses, links)
+			return fmt.Errorf("incomplete two-pass measurement: got %d/%d replies and %d/%d proof links",
+				probeSuccesses, expectedProbes, links, expectedProbes)
+		}
+		fmt.Printf("Measurement:        complete (%d probes)\n", expectedProbes)
+	}
 	if len(successes) == 0 {
 		return errors.New("no servers responded")
 	}
+	printConsensus(successes)
 	return nil
 }
 
-// resultAddress returns the selected or first configured endpoint.
+// resultAddress returns the selected endpoint, or explicitly identifies a
+// configured endpoint when no attempt succeeded.
 func resultAddress(result roughtime.Result) string {
-	address := result.Address
-	if address.Address == "" && len(result.Server.Addresses) > 0 {
-		address = result.Server.Addresses[0]
+	if result.Address.Address != "" {
+		return result.Address.String()
 	}
-	if address.Address == "" {
-		return ""
+	if len(result.Server.Addresses) > 0 {
+		return "unknown (configured: " + result.Server.Addresses[0].String() + ")"
 	}
-	return address.String()
+	return "unknown (no configured endpoint)"
+}
+
+// resultAddressKey retains the historical coalescing key without presenting a
+// configured endpoint as the endpoint associated with a failure.
+func resultAddressKey(result roughtime.Result) string {
+	if result.Address.Address != "" {
+		return result.Address.String()
+	}
+	if len(result.Server.Addresses) > 0 {
+		return result.Server.Addresses[0].String()
+	}
+	return ""
 }
 
 // display sanitizes and truncates untrusted terminal text.
@@ -153,10 +203,22 @@ func printConsensus(results []roughtime.Result) {
 	if c.Samples == 0 {
 		return
 	}
-	fmt.Printf("Consensus drift:    %s (median of %d samples)\n", c.Median.Round(time.Millisecond), c.Samples)
+	fmt.Printf("Consensus drift:    %s (median of %d endpoint samples, not agreement)\n", c.Median.Round(time.Millisecond), c.Samples)
 	fmt.Printf("Corrected local:    %s (now + median drift)\n", time.Now().Add(c.Median).UTC().Format(time.RFC3339))
 	fmt.Printf("Drift spread:       %s (min=%s, max=%s)\n",
-		(c.Max - c.Min).Round(time.Millisecond), c.Min.Round(time.Millisecond), c.Max.Round(time.Millisecond))
+		durationSpread(c.Min, c.Max).Round(time.Millisecond), c.Min.Round(time.Millisecond), c.Max.Round(time.Millisecond))
+}
+
+// durationSpread subtracts ordered durations with saturation on overflow.
+func durationSpread(minimum, maximum time.Duration) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	if maximum < minimum {
+		return 0
+	}
+	if minimum < 0 && maximum > maxDuration+minimum {
+		return maxDuration
+	}
+	return maximum - minimum
 }
 
 // printChainStatus verifies and prints the causal chain status.

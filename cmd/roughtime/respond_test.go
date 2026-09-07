@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,6 +59,50 @@ func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
 	if _, reason, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok || reason != dropSRV {
 		t.Fatalf("validateRequest SRV mismatch: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropSRV)
+	}
+}
+
+// TestRejectUDPBatchAccountsForEveryRequest covers the shared fail-closed batch
+// rejection path.
+func TestRejectUDPBatchAccountsForEveryRequest(t *testing.T) {
+	startBatches := statsBatchErrs.Load()
+	startDropped := droppedFor(transportUDP, dropBatchErr)
+	items := make([]validatedRequest, 3)
+	if replies := rejectUDPBatch(zap.NewNop(), protocol.VersionDraft12, items, "test rejection"); replies != nil {
+		t.Fatalf("rejectUDPBatch replies=%v want nil", replies)
+	}
+	if got := statsBatchErrs.Load(); got != startBatches+1 {
+		t.Fatalf("batch errors=%d want %d", got, startBatches+1)
+	}
+	if got := droppedFor(transportUDP, dropBatchErr); got != startDropped+uint64(len(items)) {
+		t.Fatalf("batch drops=%d want %d", got, startDropped+uint64(len(items)))
+	}
+}
+
+// TestSignAndBuildRepliesRejectsInvalidCertificate covers unavailable,
+// not-yet-valid, and expired signing states without producing a reply.
+func TestSignAndBuildRepliesRejectsInvalidCertificate(t *testing.T) {
+	now := wallClockNow()
+	_, notYetValid := newCertState(t)
+	notYetValid.Load().notBefore = now.Add(time.Hour)
+	_, expired := newCertState(t)
+	expired.Load().expiry = now.Add(-time.Hour)
+	cases := []struct {
+		name  string
+		state *atomic.Pointer[certState]
+	}{
+		{name: "unavailable", state: &atomic.Pointer[certState]{}},
+		{name: "not yet valid", state: notYetValid},
+		{name: "expired", state: expired},
+	}
+
+	items := []validatedRequest{{}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if replies := signAndBuildRepliesCurrent(zap.NewNop(), tc.state, protocol.VersionDraft12, items); replies != nil {
+				t.Fatalf("signAndBuildRepliesCurrent replies=%v want nil", replies)
+			}
+		})
 	}
 }
 

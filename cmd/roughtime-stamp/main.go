@@ -17,12 +17,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/tannerryan/roughtime"
+	"github.com/tannerryan/roughtime/internal/fileutil"
 	"github.com/tannerryan/roughtime/internal/version"
 )
 
@@ -41,6 +41,9 @@ var (
 	timeout = flag.Duration("timeout", 2*time.Second, "timeout per attempt")
 	// retries caps attempts per server.
 	retries = flag.Int("retries", 3, "max attempts per server")
+	// standardSize selects message-sized rather than legacy packet-sized
+	// padding.
+	standardSize = flag.Bool("standard-size", false, "use standard message-sized request padding (stamp mode)")
 	// showVersion requests version output and exit.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -60,13 +63,13 @@ func main() {
 		return
 	}
 	if err := validateFlags(); err != nil {
-		fmt.Fprintln(os.Stderr, "roughtime-stamp:", err)
+		fmt.Fprintln(os.Stderr, "roughtime-stamp:", display(err.Error()))
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "roughtime-stamp:", err)
+		fmt.Fprintln(os.Stderr, "roughtime-stamp:", display(err.Error()))
 		os.Exit(1)
 	}
 }
@@ -131,7 +134,7 @@ func stamp(ctx context.Context) error {
 		return err
 	}
 
-	client := roughtime.Client{Timeout: *timeout, MaxAttempts: *retries}
+	client := roughtime.Client{Timeout: *timeout, MaxAttempts: *retries, StandardPacketSize: *standardSize}
 	chain, err := client.QueryChainWithNonce(ctx, twoPassOrder(witnesses), digest)
 	if err != nil {
 		return fmt.Errorf("query chain: %w", err)
@@ -157,6 +160,13 @@ func stamp(ctx context.Context) error {
 		return fmt.Errorf("serialized proof trust: %w", err)
 	}
 	if err := parsed.Verify(); err != nil {
+		if errors.Is(err, roughtime.ErrCausalOrder) {
+			path, saveErr := writeMalfeasance(*outPath, data)
+			if saveErr != nil {
+				return fmt.Errorf("serialized proof verify: %w. Saving evidence: %v", err, saveErr)
+			}
+			return fmt.Errorf("serialized proof verify: %w. Evidence saved to %s", err, display(path))
+		}
 		return fmt.Errorf("serialized proof verify: %w", err)
 	}
 	links, err := parsed.Links()
@@ -235,14 +245,17 @@ func twoPassOrder(witnesses []roughtime.Server) []roughtime.Server {
 
 // hashDocument returns a regular file's SHA-256 digest and size.
 func hashDocument(ctx context.Context, path string) ([]byte, int64, error) {
-	f, err := os.Open(path)
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	f, err := fileutil.OpenRegular(path)
 	if err != nil {
 		return nil, 0, fmt.Errorf("opening document: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, 0, errors.New("document is not a regular file")
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat document: %w", err)
 	}
 	hash := sha256.New()
 	buffer := make([]byte, 1024*1024)
@@ -313,16 +326,7 @@ type proofProfile struct {
 
 // analyzeProof identifies two-pass receipts and counts endpoint-domain groups.
 func analyzeProof(links []roughtime.ProofLink, servers []roughtime.Server) proofProfile {
-	endpointGroups := make(map[string]string, len(servers))
-	for _, server := range servers {
-		key := string(server.PublicKey)
-		group := roughtime.OperatorKey(server)
-		if previous, ok := endpointGroups[key]; ok && previous != group {
-			endpointGroups[key] = ""
-		} else if !ok {
-			endpointGroups[key] = group
-		}
-	}
+	endpointGroups := endpointGroupsByRoot(servers)
 	profile := proofProfile{}
 	seen := make(map[string]struct{})
 	for _, link := range links {
@@ -353,6 +357,26 @@ func analyzeProof(links []roughtime.ProofLink, servers []roughtime.Server) proof
 	return profile
 }
 
+// endpointGroupsByRoot maps each usable root to one endpoint-domain group. An
+// empty value marks roots with usable aliases in different groups.
+func endpointGroupsByRoot(servers []roughtime.Server) map[string]string {
+	endpointGroups := make(map[string]string, len(servers))
+	for _, server := range servers {
+		server, err := roughtime.NormalizeServer(server)
+		if err != nil {
+			continue
+		}
+		key := string(server.PublicKey)
+		group := roughtime.OperatorKey(server)
+		if previous, ok := endpointGroups[key]; ok && previous != group {
+			endpointGroups[key] = ""
+		} else if !ok {
+			endpointGroups[key] = group
+		}
+	}
+	return endpointGroups
+}
+
 // loadServers reads and parses a bounded ecosystem file.
 func loadServers(path string) ([]roughtime.Server, error) {
 	data, err := readBoundedFile(path)
@@ -364,7 +388,7 @@ func loadServers(path string) ([]roughtime.Server, error) {
 
 // readBoundedFile accepts files up to maxFileBytes.
 func readBoundedFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := fileutil.OpenRegular(path)
 	if err != nil {
 		return nil, err
 	}
@@ -386,6 +410,11 @@ func writeProofAtomic(ctx context.Context, path string, data []byte) error {
 	}
 	path = filepath.Clean(path)
 	dirPath := filepath.Dir(path)
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return fmt.Errorf("opening proof directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
 	f, err := os.CreateTemp(dirPath, filepath.Base(path)+".tmp.*")
 	if err != nil {
 		return fmt.Errorf("creating proof: %w", err)
@@ -412,42 +441,61 @@ func writeProofAtomic(ctx context.Context, path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("renaming proof: %w", err)
 	}
-	dir, err := os.Open(dirPath)
-	if err != nil {
-		return err
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("proof was replaced, but directory sync failed. Crash durability is unknown: %w", err)
 	}
-	defer func() { _ = dir.Close() }()
-	return dir.Sync()
+	return nil
 }
 
-// filterCompatible retains distinct, non-Google servers usable as witnesses.
+// writeMalfeasance saves causal evidence without replacing the requested
+// receipt.
+func writeMalfeasance(path string, data []byte) (string, error) {
+	dirPath := filepath.Dir(path)
+	dir, err := os.Open(dirPath)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = dir.Close() }()
+	f, err := os.CreateTemp(dirPath, filepath.Base(path)+".malfeasance.*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := dir.Sync(); err != nil {
+		return name, fmt.Errorf("evidence was written to %s, but directory sync failed. Crash durability is unknown: %w", display(name), err)
+	}
+	return name, nil
+}
+
+// filterCompatible retains non-Google witness roots that map to one
+// endpoint-domain group.
 func filterCompatible(servers []roughtime.Server) []roughtime.Server {
-	out := make([]roughtime.Server, 0, len(servers))
-	seen := make(map[string]struct{}, len(servers))
+	endpointGroups := endpointGroupsByRoot(servers)
+	out := make([]roughtime.Server, 0, len(endpointGroups))
+	seen := make(map[string]struct{}, len(endpointGroups))
 	for _, server := range servers {
 		if strings.EqualFold(server.Version, roughtime.VersionLabelGoogle) || server.Version == "3000600613" {
 			continue
 		}
-		scheme, err := roughtime.SchemeOfKey(server.PublicKey)
+		server, err := roughtime.NormalizeServer(server)
 		if err != nil {
 			continue
 		}
-		if scheme == roughtime.SchemeMLDSA44 && !hasTransport(server.Addresses, "tcp") {
+		key := string(server.PublicKey)
+		if endpointGroups[key] == "" {
 			continue
 		}
-		if limit, err := strconv.ParseUint(server.Version, 10, 32); err == nil {
-			compatible := false
-			for _, version := range roughtime.VersionsForScheme(scheme) {
-				if uint64(version) <= limit {
-					compatible = true
-					break
-				}
-			}
-			if !compatible {
-				continue
-			}
-		}
-		key := string(server.PublicKey)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -457,13 +505,6 @@ func filterCompatible(servers []roughtime.Server) []roughtime.Server {
 	return out
 }
 
-// hasTransport reports whether addresses includes transport.
-func hasTransport(addresses []roughtime.Address, transport string) bool {
-	return slices.ContainsFunc(addresses, func(address roughtime.Address) bool {
-		return strings.EqualFold(address.Transport, transport)
-	})
-}
-
 // display sanitizes untrusted terminal text.
 func display(value string) string { return roughtime.SanitizeForDisplay(value) }
 
@@ -471,7 +512,7 @@ func display(value string) string { return roughtime.SanitizeForDisplay(value) }
 func printFailures(results []roughtime.Result) {
 	for _, result := range results {
 		if result.Err != nil {
-			fmt.Printf("  %s: %s\n", display(result.Server.Name), result.Err)
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", display(result.Server.Name), display(result.Err.Error()))
 		}
 	}
 }

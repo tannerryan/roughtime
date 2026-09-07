@@ -117,7 +117,7 @@ func TestParseEcosystemValidatesPublicKeyType(t *testing.T) {
 	}
 	data, _ := json.Marshal(doc)
 	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "publicKeyType") {
-		t.Fatalf("ParseEcosystem: %v; want publicKeyType mismatch error", err)
+		t.Fatalf("ParseEcosystem: %v, want publicKeyType mismatch error", err)
 	}
 }
 
@@ -135,7 +135,7 @@ func TestParseEcosystemEnforcesMaxServers(t *testing.T) {
 	}
 	data, _ := json.Marshal(map[string]any{"servers": servers})
 	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "max") {
-		t.Fatalf("ParseEcosystem: %v; want max-entries error", err)
+		t.Fatalf("ParseEcosystem: %v, want max-entries error", err)
 	}
 }
 
@@ -166,7 +166,7 @@ func TestParseEcosystemRejectsBadTransport(t *testing.T) {
 	}
 	data, _ := json.Marshal(doc)
 	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "unsupported transport") {
-		t.Fatalf("ParseEcosystem: %v; want unsupported-transport error", err)
+		t.Fatalf("ParseEcosystem: %v, want unsupported-transport error", err)
 	}
 }
 
@@ -182,7 +182,7 @@ func TestParseEcosystemRejectsBadAddress(t *testing.T) {
 	}
 	data, _ := json.Marshal(doc)
 	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "bad address") {
-		t.Fatalf("ParseEcosystem: %v; want bad-address error", err)
+		t.Fatalf("ParseEcosystem: %v, want bad-address error", err)
 	}
 }
 
@@ -198,7 +198,7 @@ func TestParseEcosystemRejectsIPv6Zone(t *testing.T) {
 	}
 	data, _ := json.Marshal(doc)
 	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "zone") {
-		t.Fatalf("ParseEcosystem: %v; want IPv6-zone error", err)
+		t.Fatalf("ParseEcosystem: %v, want IPv6-zone error", err)
 	}
 }
 
@@ -260,6 +260,35 @@ func TestParseEcosystemRejectsOversizeInput(t *testing.T) {
 	data := bytes.Repeat([]byte{' '}, roughtime.MaxEcosystemBytes+1)
 	if _, err := roughtime.ParseEcosystem(data); err == nil {
 		t.Fatal("ParseEcosystem accepted oversize input")
+	}
+}
+
+// TestSanitizeForDisplay covers each removed character class and documents
+// preservation of ordinary and nonbreaking Unicode spaces.
+func TestSanitizeForDisplay(t *testing.T) {
+	in := "safe \u00a0" +
+		"\x00\x1f\x7f\u0080\u009f" +
+		"\u061c\u200b\u200c\u200d\u200e\u200f" +
+		"\u2028\u2029\u202a\u202b\u202c\u202d\u202e" +
+		"\u2066\u2067\u2068\u2069" +
+		"done"
+	if got, want := roughtime.SanitizeForDisplay(in), "safe \u00a0done"; got != want {
+		t.Fatalf("SanitizeForDisplay = %q, want %q", got, want)
+	}
+}
+
+// TestParseEcosystemAllowsStructurallyValidForeignCombination documents that
+// parsing is structural while NormalizeServer performs client preflight.
+func TestParseEcosystemAllowsStructurallyValidForeignCombination(t *testing.T) {
+	doc := []byte(`{"servers":[{"name":"pq-over-udp","publicKeyType":"ml-dsa-44","publicKey":"` +
+		base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 1312)) +
+		`","addresses":[{"protocol":"udp","address":"example.com:2002"}]}]}`)
+	servers, err := roughtime.ParseEcosystem(doc)
+	if err != nil {
+		t.Fatalf("ParseEcosystem: %v", err)
+	}
+	if _, err := roughtime.NormalizeServer(servers[0]); err == nil || !strings.Contains(err.Error(), "tcp address") {
+		t.Fatalf("NormalizeServer = %v, want ML transport compatibility error", err)
 	}
 }
 

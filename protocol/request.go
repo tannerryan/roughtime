@@ -29,7 +29,7 @@ type Request struct {
 	// HasType reports whether the request carries TYPE=0.
 	HasType bool
 	// RawPacket is the framed or unframed request. CreateReplies requires it
-	// for drafts 12+ and ML-DSA-44; earlier nonce-leaf versions retain support
+	// for drafts 12+ and ML-DSA-44. Earlier nonce-leaf versions retain support
 	// for caller-built values.
 	RawPacket []byte
 }
@@ -172,6 +172,12 @@ func ParseRequest(raw []byte) (*Request, error) {
 			req.HasType = true
 		}
 	}
+	// Draft 13 introduced the 32-entry limit, but shares its untyped wire
+	// identifier with draft 12. Accept longer untyped lists for historical
+	// interoperability. TYPE identifies modern input where the limit applies.
+	if req.HasType && len(req.Versions) > maxVersionList {
+		return nil, fmt.Errorf("protocol: VER tag has %d entries (max %d)", len(req.Versions), maxVersionList)
+	}
 
 	return req, nil
 }
@@ -184,9 +190,6 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 			return errors.New("protocol: VER tag length invalid")
 		}
 		count := len(vb) / 4
-		if count > maxVersionList {
-			return fmt.Errorf("protocol: VER tag has %d entries (max %d)", count, maxVersionList)
-		}
 		req.Versions = make([]Version, 0, count)
 		for i := 0; i < len(vb); i += 4 {
 			req.Versions = append(req.Versions, Version(binary.LittleEndian.Uint32(vb[i:i+4])))
@@ -199,8 +202,7 @@ func parseOptionalTags(req *Request, msg map[uint32][]byte) error {
 }
 
 // ComputeSRV returns the SRV tag value, the first 32 bytes of SHA-512(0xff ||
-// rootPK). rootPK must be an Ed25519 or ML-DSA-44 key; otherwise it returns
-// nil.
+// rootPK). It returns nil unless rootPK is an Ed25519 or ML-DSA-44 key.
 func ComputeSRV(rootPK []byte) []byte {
 	if len(rootPK) != ed25519.PublicKeySize && len(rootPK) != mldsa.MLDSA44PublicKeySize {
 		return nil
@@ -296,7 +298,7 @@ func createRequestFromNonce(g wireGroup, versions []Version, nonce, srv []byte, 
 		}
 	}
 
-	// IETF request messages are padded to at least 1024 bytes; the ROUGHTIM
+	// IETF request messages are padded to at least 1024 bytes. The ROUGHTIM
 	// framing header is additional. ML-DSA-44 replies are much larger, so an
 	// offer containing it uses the full 8192-byte request-body cap.
 	target := 1024

@@ -198,6 +198,73 @@ func TestChainResultProof(t *testing.T) {
 	}
 }
 
+// TestProofMarshalJSONAndWindow covers the raw JSON API and the public per-link
+// interval helper.
+func TestProofMarshalJSONAndWindow(t *testing.T) {
+	proof := makeProof(t, 2)
+	raw, err := proof.MarshalJSON()
+	if err != nil {
+		t.Fatalf("MarshalJSON: %v", err)
+	}
+	if !json.Valid(raw) || bytes.HasPrefix(raw, []byte{0x1f, 0x8b}) {
+		t.Fatal("MarshalJSON did not return raw valid JSON")
+	}
+	viaJSON, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if !bytes.Equal(viaJSON, raw) {
+		t.Fatal("encoding/json and MarshalJSON outputs differ")
+	}
+	parsed, err := roughtime.ParseProof(raw)
+	if err != nil {
+		t.Fatalf("ParseProof: %v", err)
+	}
+	if err := parsed.Verify(); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	links, err := parsed.Links()
+	if err != nil {
+		t.Fatalf("Links: %v", err)
+	}
+	lower, upper := links[0].Window()
+	if want := links[0].Midpoint.Add(-links[0].Radius); !lower.Equal(want) {
+		t.Fatalf("Window lower = %v, want %v", lower, want)
+	}
+	if want := links[0].Midpoint.Add(links[0].Radius); !upper.Equal(want) {
+		t.Fatalf("Window upper = %v, want %v", upper, want)
+	}
+}
+
+// TestProofNilPublicMethods covers nil-receiver behavior for offline APIs.
+func TestProofNilPublicMethods(t *testing.T) {
+	var proof *roughtime.Proof
+	if proof.Len() != 0 {
+		t.Fatal("nil proof has nonzero Len")
+	}
+	if err := proof.Verify(); err == nil {
+		t.Fatal("nil proof Verify succeeded")
+	}
+	if err := proof.Trust(nil); err == nil {
+		t.Fatal("nil proof Trust succeeded")
+	}
+	if _, err := proof.Links(); err == nil {
+		t.Fatal("nil proof Links succeeded")
+	}
+	if _, err := proof.SeedNonce(); err == nil {
+		t.Fatal("nil proof SeedNonce succeeded")
+	}
+	if _, _, err := proof.AttestationBound(); err == nil {
+		t.Fatal("nil proof AttestationBound succeeded")
+	}
+	if _, err := proof.MarshalJSON(); err == nil {
+		t.Fatal("nil proof MarshalJSON succeeded")
+	}
+	if _, err := proof.MarshalGzip(); err == nil {
+		t.Fatal("nil proof MarshalGzip succeeded")
+	}
+}
+
 // TestProofVerifyTampered covers tampered proof rejection.
 func TestProofVerifyTampered(t *testing.T) {
 	proof := makeProof(t, 2)
@@ -242,7 +309,7 @@ func TestProofTrustUnknown(t *testing.T) {
 func TestParseProofTooLarge(t *testing.T) {
 	huge := make([]byte, roughtime.MaxProofBytes+1)
 	if _, err := roughtime.ParseProof(huge); err == nil || !strings.Contains(err.Error(), "max") {
-		t.Fatalf("ParseProof: %v; want max-bytes error", err)
+		t.Fatalf("ParseProof: %v, want max-bytes error", err)
 	}
 }
 
@@ -251,7 +318,7 @@ func TestParseProofGzipBomb(t *testing.T) {
 	bomb := bytes.Repeat([]byte("A"), roughtime.MaxProofBytes+1)
 	if _, err := roughtime.ParseProof(gzipReport(t, bomb)); err == nil ||
 		!strings.Contains(err.Error(), "exceeds") {
-		t.Fatalf("ParseProof: %v; want exceeds-size error", err)
+		t.Fatalf("ParseProof: %v, want exceeds-size error", err)
 	}
 }
 
@@ -259,28 +326,6 @@ func TestParseProofGzipBomb(t *testing.T) {
 func TestParseProofBadJSON(t *testing.T) {
 	if _, err := roughtime.ParseProof([]byte("not a malfeasance report")); err == nil {
 		t.Fatal("ParseProof accepted non-JSON input")
-	}
-}
-
-// TestParseProofRawJSON covers uncompressed proof JSON.
-func TestParseProofRawJSON(t *testing.T) {
-	proof := makeProof(t, 2)
-	data, _ := proof.MarshalGzip()
-	gr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		t.Fatalf("gzip.NewReader: %v", err)
-	}
-	raw, err := io.ReadAll(gr)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	_ = gr.Close()
-	parsed, err := roughtime.ParseProof(raw)
-	if err != nil {
-		t.Fatalf("ParseProof(raw): %v", err)
-	}
-	if parsed.Len() != 2 {
-		t.Fatalf("Len = %d, want 2", parsed.Len())
 	}
 }
 

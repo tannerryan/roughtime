@@ -52,6 +52,9 @@ const (
 	// certCheckInterval is the cadence at which the refresh loop wakes to check
 	// expiry.
 	certCheckInterval = 15 * time.Minute
+	// certValidityCheckInterval bounds detection of wall-clock corrections that
+	// move the active delegation outside its validity window.
+	certValidityCheckInterval = time.Second
 )
 
 // certState holds the current online certificate, its expiry, and the
@@ -269,13 +272,14 @@ func deriveMLDSA44PublicKey(path string) error {
 // permissions under O_NOFOLLOW.
 func readPrivateKeyFile(path, role string) ([]byte, error) {
 	// O_NOFOLLOW refuses a symlink, then validate the opened descriptor so the
-	// checks can't race a swap between stat and open
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// checks can't race a swap between stat and open. O_NONBLOCK prevents a
+	// FIFO from blocking before the regular-file check.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("%s key file %s is a symlink (refusing to follow)", role, path)
 		}
-		return nil, fmt.Errorf("stat %s key file: %w", role, err)
+		return nil, fmt.Errorf("open %s key file: %w", role, err)
 	}
 	defer func() { _ = f.Close() }()
 	info, err := f.Stat()
@@ -446,10 +450,10 @@ func monitorOfflineDelegation(ctx context.Context, scheme string, state *atomic.
 		}
 		now := wallClockNow()
 		if now.Before(current.notBefore) {
-			return fmt.Errorf("%s offline delegation is not yet valid after a backward clock correction; restart with a fresh delegation", scheme)
+			return fmt.Errorf("%s offline delegation is not yet valid after a backward clock correction. Restart with a fresh delegation", scheme)
 		}
 		if !now.Before(current.expiry) {
-			return fmt.Errorf("%s offline delegation expired; restart with a fresh delegation", scheme)
+			return fmt.Errorf("%s offline delegation expired. Restart with a fresh delegation", scheme)
 		}
 		select {
 		case <-ctx.Done():
@@ -478,35 +482,59 @@ func refreshLoopMLDSA44(ctx context.Context, log *zap.Logger, state *atomic.Poin
 // runRefreshLoop is the scheme-agnostic refresh driver invoked by refreshLoop
 // and refreshLoopMLDSA44.
 func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetric string, rootPK []byte, state *atomic.Pointer[certState], refresh func() (*certState, []byte, error)) error {
-	ticker := time.NewTicker(certCheckInterval)
-	defer ticker.Stop()
+	refreshTicker := time.NewTicker(certCheckInterval)
+	defer refreshTicker.Stop()
+	validityTicker := time.NewTicker(certValidityCheckInterval)
+	defer validityTicker.Stop()
 	log.Info("certificate refresh loop started",
 		zap.String("scheme", schemeName),
 		zap.Duration("check_interval", certCheckInterval),
+		zap.Duration("validity_check_interval", certValidityCheckInterval),
 		zap.Duration("refresh_threshold", certRefreshThreshold),
 	)
+	return runRefreshChecks(ctx, log, schemeName, schemeMetric, rootPK, state,
+		refreshTicker.C, validityTicker.C, wallClockNow, refresh)
+}
 
+// runRefreshChecks handles routine refresh checks and short validity-only
+// checks. The latter reread the root key only after a wall-clock correction
+// moves the active delegation outside its validity window.
+func runRefreshChecks(ctx context.Context, log *zap.Logger, schemeName, schemeMetric string, rootPK []byte, state *atomic.Pointer[certState], refreshTicks, validityTicks <-chan time.Time, now func() time.Time, refresh func() (*certState, []byte, error)) error {
 	for {
+		validityOnly := false
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case <-refreshTicks:
+		case <-validityTicks:
+			validityOnly = true
 		}
 
+		if state == nil {
+			return fmt.Errorf("%s certificate state unavailable", schemeName)
+		}
 		cur := state.Load()
-		now := wallClockNow()
-		if !now.Before(cur.notBefore) && cur.expiry.Sub(now) > certRefreshThreshold {
+		if cur == nil {
+			return fmt.Errorf("%s certificate state unavailable", schemeName)
+		}
+		checkTime := now()
+		invalid := checkTime.Before(cur.notBefore) || !checkTime.Before(cur.expiry)
+		if validityOnly && !invalid {
+			continue
+		}
+		if !invalid && cur.expiry.Sub(checkTime) > certRefreshThreshold {
 			continue
 		}
 		log.Info("attempting certificate refresh",
 			zap.String("scheme", schemeName),
 			zap.Time("current_expiry", cur.expiry),
-			zap.Duration("remaining", certRemaining(cur.expiry)),
+			zap.Duration("remaining", cur.expiry.Sub(checkTime)),
 		)
 		newState, newOnlinePK, err := refresh()
 		if err != nil {
-			remaining := certRemaining(cur.expiry)
-			if now.Before(cur.notBefore) {
+			failureTime := now()
+			remaining := cur.expiry.Sub(failureTime)
+			if failureTime.Before(cur.notBefore) {
 				return fmt.Errorf("%s certificate refresh failed while the current certificate is not yet valid: %w", schemeName, err)
 			}
 			// Leave one check interval plus retry margin. Otherwise the next
@@ -526,14 +554,15 @@ func runRefreshLoop(ctx context.Context, log *zap.Logger, schemeName, schemeMetr
 		}
 		retired := state.Swap(newState)
 		retired.retire()
-		noteCertProvisioned(schemeMetric, newOnlinePK, rootPK, newState.expiry, wallClockNow())
+		provisioned := now()
+		noteCertProvisioned(schemeMetric, newOnlinePK, rootPK, newState.expiry, provisioned)
 		noteCertRotation(schemeMetric)
 		log.Info("certificate refreshed",
 			zap.String("scheme", schemeName),
 			zap.String("online_pubkey", hex.EncodeToString(newOnlinePK)),
 			zap.Time("previous_expiry", cur.expiry),
 			zap.Time("expiry", newState.expiry),
-			zap.Duration("validity", certRemaining(newState.expiry)),
+			zap.Duration("validity", newState.expiry.Sub(provisioned)),
 		)
 	}
 }
@@ -553,7 +582,7 @@ func tryRefreshCert(initialRootPK ed25519.PublicKey) (*certState, ed25519.Public
 	}
 	if !bytes.Equal(newRootPK, initialRootPK) {
 		newCert.Wipe()
-		return nil, nil, fmt.Errorf("root public key on disk has changed since startup (want %s, got %s); restart required",
+		return nil, nil, fmt.Errorf("root public key on disk has changed since startup (want %s, got %s). Restart required",
 			hex.EncodeToString(initialRootPK), hex.EncodeToString(newRootPK))
 	}
 	return &certState{cert: newCert, notBefore: certNotBefore(newExpiry), expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil
@@ -569,7 +598,7 @@ func tryRefreshCertMLDSA44(initialRootPK []byte) (*certState, []byte, error) {
 	}
 	if !bytes.Equal(newRootPK, initialRootPK) {
 		newCert.Wipe()
-		return nil, nil, fmt.Errorf("PQ root public key on disk has changed since startup (want %s, got %s); restart required",
+		return nil, nil, fmt.Errorf("PQ root public key on disk has changed since startup (want %s, got %s). Restart required",
 			hex.EncodeToString(initialRootPK), hex.EncodeToString(newRootPK))
 	}
 	return &certState{cert: newCert, notBefore: certNotBefore(newExpiry), expiry: newExpiry, srvHash: protocol.ComputeSRV(newRootPK)}, newOnlinePK, nil

@@ -40,9 +40,13 @@ func TestCertificateWipe(t *testing.T) {
 	if allZero(cert.edOnlineSK) {
 		t.Fatal("precondition: onlineSK should not already be zero")
 	}
+	onlineSK := cert.edOnlineSK
 	cert.Wipe()
-	if !allZero(cert.edOnlineSK) {
+	if !allZero(onlineSK) {
 		t.Fatal("onlineSK not zeroed after Wipe")
+	}
+	if cert.edOnlineSK != nil {
+		t.Fatal("onlineSK reference retained after Wipe")
 	}
 	var nilCert *Certificate
 	nilCert.Wipe()

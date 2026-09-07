@@ -43,13 +43,8 @@ func TestListenEndToEnd(t *testing.T) {
 	sendAndVerify(t, chosen, rootPK, reqs)
 
 	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("listen returned: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("listen did not exit after cancel")
+	if err := awaitTest(t, done, 5*time.Second, "UDP listener shutdown"); err != nil {
+		t.Fatalf("listen returned: %v", err)
 	}
 
 	if got := requestsReceived.total(); got < reqs {
@@ -79,6 +74,8 @@ func TestListenBatchesConcurrentRequests(t *testing.T) {
 	const requests = 8
 	ready := make(chan struct{}, requests)
 	start := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(start) }) }
 	var wg sync.WaitGroup
 	for range requests {
 		wg.Go(func() {
@@ -113,11 +110,20 @@ func TestListenBatchesConcurrentRequests(t *testing.T) {
 			}
 		})
 	}
+	workersDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(workersDone)
+	}()
+	t.Cleanup(func() {
+		release()
+		awaitTest(t, workersDone, 5*time.Second, "UDP request worker cleanup")
+	})
 	for range requests {
-		<-ready
+		awaitTest(t, ready, 5*time.Second, "UDP request worker readiness")
 	}
-	close(start)
-	wg.Wait()
+	release()
+	awaitTest(t, workersDone, 5*time.Second, "UDP request workers")
 
 	batchedRequests := statsBatchedReqs.Load() - startRequests
 	batches := statsBatches.Load() - startBatches
@@ -125,7 +131,7 @@ func TestListenBatchesConcurrentRequests(t *testing.T) {
 		t.Fatalf("batched requests = %d, want at least %d", batchedRequests, requests)
 	}
 	if batches >= batchedRequests {
-		t.Fatalf("batches = %d for %d requests; requests were not batched", batches, batchedRequests)
+		t.Fatalf("batches = %d for %d requests, requests were not batched", batches, batchedRequests)
 	}
 }
 
@@ -139,7 +145,10 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 		*port = p
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
-		go func() { done <- listen(ctx, st) }()
+		go func() {
+			defer close(done)
+			done <- listen(ctx, st)
+		}()
 
 		// retry on fast failure (e.g. EADDRINUSE)
 		select {
@@ -149,6 +158,12 @@ func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, 
 			continue
 		case <-time.After(50 * time.Millisecond):
 		}
+		t.Cleanup(func() {
+			cancel()
+			if err := awaitTest(t, done, 5*time.Second, "UDP listener cleanup"); err != nil {
+				t.Errorf("listen cleanup: %v", err)
+			}
+		})
 		return p, done, cancel
 	}
 	t.Fatalf("startListen: exhausted %d attempts, last err: %v", maxAttempts, lastErr)
@@ -195,20 +210,8 @@ func startServer(t *testing.T) (int, ed25519.PublicKey) {
 	statsBatchedReqs.Store(0)
 
 	pk, st := newCertState(t)
-	p, done, cancel := startListen(t, st)
+	p, _, _ := startListen(t, st)
 	waitForServerReady(t, p, pk)
-
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("listen returned: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatal("listen did not exit after cancel")
-		}
-	})
 	return p, pk
 }
 
@@ -300,7 +303,15 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 					}
 				})
 			}
-			wg.Wait()
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+			t.Cleanup(func() {
+				awaitTest(t, done, 5*time.Second, "concurrent UDP request cleanup")
+			})
+			awaitTest(t, done, 5*time.Second, "concurrent UDP requests")
 		})
 	}
 }
