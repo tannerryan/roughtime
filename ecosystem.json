@@ -101,6 +101,66 @@
       "publicKeyType": "ed25519",
       "publicKey": "V7hnCRDc7iR2uv0VrmGu37Yn3ovdHjcDW8oiFGC7hh4=",
       "addresses": [{ "protocol": "udp", "address": "us.ntp.inutile.pro:2002" }]
+    },
+    {
+      "name": "meitner.linux.town",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "1BZRGxesktw0QHRvRqWn1XTcUgXboNhxGXwN7JShFGw=",
+      "addresses": [
+        { "protocol": "udp", "address": "rtime.meitner.linux.town:2002" },
+        { "protocol": "tcp", "address": "rtime.meitner.linux.town:2002" }
+      ]
+    },
+    {
+      "name": "sponer.linux.town",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "OLHEXycnCW2PmiN84U+3oLoCOOY9gzuoVmaT1bW31VU=",
+      "addresses": [
+        { "protocol": "udp", "address": "rtime.sponer.linux.town:2002" },
+        { "protocol": "tcp", "address": "rtime.sponer.linux.town:2002" }
+      ]
+    },
+    {
+      "name": "levi.linux.town",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "hFGDwue/DVkPbdRjC1ogZyNb+zTmTfBdTgPMbFjSX2I=",
+      "addresses": [
+        { "protocol": "udp", "address": "rtime.levi.linux.town:2002" },
+        { "protocol": "tcp", "address": "rtime.levi.linux.town:2002" }
+      ]
+    },
+    {
+      "name": "curie.linux.town",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "5B3DjlSbN7wQkIbSV2qr4KnrSyesnc4W7G+yLMqQpow=",
+      "addresses": [
+        { "protocol": "udp", "address": "rtime.curie.linux.town:2002" },
+        { "protocol": "tcp", "address": "rtime.curie.linux.town:2002" }
+      ]
+    },
+    {
+      "name": "leeuwen.linux.town",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "WclgNqT/6U1mKQYaT8IJ190tpofvJ3SwxZGUMmmB800=",
+      "addresses": [
+        { "protocol": "udp", "address": "rtime.leeuwen.linux.town:2002" },
+        { "protocol": "tcp", "address": "rtime.leeuwen.linux.town:2002" }
+      ]
+    },
+    {
+      "name": "ramstedt.linux.town",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "wGZCGOIpmPzxfzyVVaQhr8GgXx/roiuIXs565BENwDU=",
+      "addresses": [
+        { "protocol": "udp", "address": "rtime.ramstedt.linux.town:2002" },
+        { "protocol": "tcp", "address": "rtime.ramstedt.linux.town:2002" }
+      ]
     }
   ]
 }
