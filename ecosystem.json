@@ -161,6 +161,13 @@
         { "protocol": "udp", "address": "rtime.ramstedt.linux.town:2002" },
         { "protocol": "tcp", "address": "rtime.ramstedt.linux.town:2002" }
       ]
+    },
+    {
+      "name": "roughtime.alastyr.com",
+      "version": "IETF-Roughtime",
+      "publicKeyType": "ed25519",
+      "publicKey": "/2Al59PlwUTJHas/VS+FN6BhO9ify/wIjoH2Ezv4V7w=",
+      "addresses": [{ "protocol": "udp", "address": "roughtime.alastyr.com:2002" }]
     }
   ]
 }
