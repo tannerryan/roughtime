@@ -87,6 +87,31 @@ func TestDecodeRejectsNonAscendingTags(t *testing.T) {
 	}
 }
 
+// TestDecodeWithVersion keeps the draft-01 ordering exception scoped to that
+// profile and rejects duplicate tags and unknown versions.
+func TestDecodeWithVersion(t *testing.T) {
+	values := map[uint32][]byte{TagNONC: make([]byte, 32), TagVER: {1, 0, 0, 0}}
+	unsorted := reverseEncoding(values)
+	for _, version := range SupportedWithMode(Flex) {
+		msg, err := DecodeWithVersion(unsorted, version)
+		if version == VersionDraft01 {
+			if err != nil || !bytes.Equal(msg[TagNONC], values[TagNONC]) {
+				t.Fatalf("draft-01 decode: %v", err)
+			}
+		} else if err == nil {
+			t.Fatalf("%s accepted unsorted tags", version)
+		}
+	}
+	duplicate := bytes.Clone(unsorted)
+	copy(duplicate[12:16], duplicate[8:12])
+	if _, err := DecodeWithVersion(duplicate, VersionDraft01); err == nil {
+		t.Fatal("draft 01 accepted duplicate tags")
+	}
+	if _, err := DecodeWithVersion(unsorted, Version(0xdeadbeef)); err == nil {
+		t.Fatal("accepted unknown version")
+	}
+}
+
 // TestWrapUnwrapRoundTrip covers ROUGHTIM framing.
 func TestWrapUnwrapRoundTrip(t *testing.T) {
 	msg := []byte("hello world!")
@@ -156,7 +181,7 @@ func FuzzDecode(f *testing.F) {
 func TestNonceOffsetInRequest(t *testing.T) {
 	nonce := bytes.Repeat([]byte{0x42}, 32)
 
-	framed, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, nil)
+	framed, err := CreateRequestWithNonceOptions([]Version{VersionDraft12}, nonce, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateRequestWithNonce: %v", err)
 	}

@@ -3,8 +3,8 @@
 
 //go:build unix
 
-// Command roughtime is a Roughtime server. It serves Ed25519 over UDP/TCP and
-// the experimental ML-DSA-44 extension over TCP. Run with -h for flags.
+// Command roughtime serves RFC 10049 over UDP and TCP and configured ML-DSA-44
+// over TCP. The -flex-port listener also serves drafts and Google-Roughtime.
 package main
 
 import (
@@ -36,7 +36,9 @@ var logger *zap.Logger
 
 var (
 	// port is the shared UDP/TCP listen-port flag.
-	port = flag.Int("port", 2002, "port to listen on")
+	port = flag.Int("port", 5319, "RFC UDP/TCP port, also serving configured ML-DSA-44 over TCP")
+	// flexPort adds a UDP/TCP compatibility port alongside the primary port.
+	flexPort = flag.Int("flex-port", 0, "enable an additional UDP/TCP port for all supported versions (normally 2002, 0 disables)")
 	// listenAddress is the shared UDP/TCP bind-address flag.
 	listenAddress = flag.String("listen-address", "", "local address for UDP/TCP listeners (empty binds all interfaces)")
 	// rootKeySeedHexFile is the Ed25519 root-seed path flag.
@@ -67,7 +69,8 @@ var (
 
 // Server-wide tunable constants.
 const (
-	// radius is the uncertainty radius advertised on every reply.
+	// radius is the total advertised bound, including clock error, leap-second
+	// ambiguity, and timestamp rounding.
 	radius = 3 * time.Second
 	// minRequestSize is the minimum accepted UDP datagram size.
 	minRequestSize = 1024
@@ -86,8 +89,14 @@ const (
 
 // validateFlags checks the CLI flag globals and returns the first violation.
 func validateFlags() error {
+	if *flexPort < 0 || *flexPort > 65535 {
+		return errors.New("-flex-port must be 0 (disabled) or 1-65535")
+	}
+	if *flexPort != 0 && *flexPort == *port {
+		return errors.New("-flex-port must differ from -port")
+	}
 	if *rootKeySeedHexFile == "" && *pqRootKeySeedHexFile == "" {
-		return fmt.Errorf("usage: roughtime (-root-key-file <path> | -pq-root-key-file <path>) [-port <port>] [-log-level <level>]")
+		return fmt.Errorf("usage: roughtime (-root-key-file <path> | -pq-root-key-file <path>) [-port <port>] [-flex-port <port>] [-log-level <level>]")
 	}
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("-port %d out of range (must be 1-65535)", *port)
@@ -106,9 +115,27 @@ func validateFlags() error {
 	return nil
 }
 
-// serverListenAddr returns the shared UDP/TCP bind endpoint.
-func serverListenAddr() string {
-	return net.JoinHostPort(*listenAddress, strconv.Itoa(*port))
+// serverListenAddr returns the UDP/TCP bind endpoint for listenPort.
+func serverListenAddr(listenPort int) string {
+	return net.JoinHostPort(*listenAddress, strconv.Itoa(listenPort))
+}
+
+// isFlexPort reports whether listenPort serves the compatibility profiles.
+func isFlexPort(listenPort int) bool {
+	return *flexPort != 0 && listenPort == *flexPort
+}
+
+// ed25519Versions returns the union needed by the shared delegation.
+func ed25519Versions() []protocol.Version {
+	return ed25519VersionsForPort(*flexPort != 0)
+}
+
+// ed25519VersionsForPort returns the Ed25519 profiles allowed on a listener.
+func ed25519VersionsForPort(allowDrafts bool) []protocol.Version {
+	if allowDrafts {
+		return protocol.ServerPreferenceEd25519
+	}
+	return []protocol.Version{protocol.Version1}
 }
 
 // main parses flags and dispatches to the appropriate subcommand or to serve.
@@ -207,6 +234,7 @@ func serve(ctx context.Context) error {
 		zap.String("version", version.Version),
 		zap.Int("pid", os.Getpid()),
 		zap.Int("port", *port),
+		zap.Int("flex_port", *flexPort),
 		zap.String("listen_address", *listenAddress),
 		zap.String("root_key", *rootKeySeedHexFile),
 		zap.String("pq_root_key", *pqRootKeySeedHexFile),
@@ -332,15 +360,21 @@ func serve(ctx context.Context) error {
 	// UDP carries only Ed25519 (ML-DSA breaks the amplification budget). TCP
 	// carries both. A listener error cancels listenerCtx and serve returns the
 	// first error.
-	if edState != nil {
-		wg.Go(func() {
-			if err := listen(listenerCtx, edState); err != nil {
-				recordRunningListenerErr("UDP", err)
-			}
-		})
+	ports := []int{*port}
+	if *flexPort != 0 {
+		ports = append(ports, *flexPort)
+	}
+	for _, listenPort := range ports {
+		if edState != nil {
+			wg.Go(func() {
+				if err := listen(listenerCtx, edState, listenPort); err != nil {
+					recordRunningListenerErr("UDP", err)
+				}
+			})
+		}
 	}
 	wg.Go(func() {
-		if err := listenTCP(listenerCtx, edState, pqState); err != nil {
+		if err := listenTCP(listenerCtx, edState, pqState, ports); err != nil {
 			recordRunningListenerErr("TCP", err)
 		}
 	})

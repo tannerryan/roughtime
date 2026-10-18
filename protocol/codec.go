@@ -43,8 +43,8 @@ func ParsePacketHeader(hdr []byte) (bodyLen uint32, err error) {
 	return binary.LittleEndian.Uint32(hdr[8:PacketHeaderSize]), nil
 }
 
-// encode serializes a tag-value map with values 4-byte aligned and tags in
-// ascending order.
+// encode serializes a tag-value map with aligned value offsets and tags in
+// ascending order. The final value may have any byte length.
 func encode(msg map[uint32][]byte) ([]byte, error) {
 	return encodeTo(msg, 0)
 }
@@ -68,8 +68,12 @@ func encodeTo(msg map[uint32][]byte, prefix int) ([]byte, error) {
 	n := uint32(len(tags))
 	headerLen := 4 + 4*(n-1) + 4*n
 	var valsLen uint32
-	for _, v := range msg {
-		if len(v)%4 != 0 {
+	for i, tag := range tags {
+		v := msg[tag]
+		if len(v) > maxMessageSize {
+			return nil, fmt.Errorf("protocol: encoded message exceeds %d bytes", maxMessageSize)
+		}
+		if i < len(tags)-1 && len(v)%4 != 0 {
 			return nil, fmt.Errorf("protocol: value length %d not multiple of 4", len(v))
 		}
 		next := valsLen + uint32(len(v))
@@ -126,14 +130,25 @@ func encodeWrapped(msg map[uint32][]byte) ([]byte, error) {
 // Decode parses a Roughtime message into a tag-value map. Returned slices alias
 // data.
 func Decode(data []byte) (map[uint32][]byte, error) {
+	return decodeMessage(data, false)
+}
+
+// DecodeWithVersion parses an unframed message using the version's tag rules.
+// Draft 01 allows unique unsorted tags. Returned slices alias data.
+func DecodeWithVersion(data []byte, version Version) (map[uint32][]byte, error) {
+	if !isRecognizedVersion(version) {
+		return nil, fmt.Errorf("protocol: unsupported version %s", version)
+	}
+	return decodeProfile(data, wireGroupOf(version, true))
+}
+
+// decodeMessage permits unsorted unique tags only while identifying draft 01.
+func decodeMessage(data []byte, allowUnsorted bool) (map[uint32][]byte, error) {
 	if len(data) < 4 {
 		return nil, errors.New("protocol: message too short")
 	}
 	if len(data) > maxMessageSize {
 		return nil, fmt.Errorf("protocol: message exceeds %d bytes", maxMessageSize)
-	}
-	if len(data)%4 != 0 {
-		return nil, errors.New("protocol: message length not a multiple of 4")
 	}
 	n := binary.LittleEndian.Uint32(data[0:4])
 	if n == 0 {
@@ -161,18 +176,27 @@ func Decode(data []byte) (map[uint32][]byte, error) {
 	for i := range n {
 		tags[i] = binary.LittleEndian.Uint32(data[tBase+4*i : tBase+4*i+4])
 	}
-	if err := validateHeader(tags, offsets, n); err != nil {
+	if err := validateHeader(tags, offsets, n, allowUnsorted); err != nil {
 		return nil, err
 	}
 
 	return decodeValues(data, tags, offsets, headerLen)
 }
 
-// validateHeader checks tags are strictly ascending and offsets aligned and
-// monotonic.
-func validateHeader(tags, offsets []uint32, n uint32) error {
+// validateHeader checks tag uniqueness and aligned monotonic offsets. Except
+// for draft 01 discovery, tags must also be strictly ascending.
+func validateHeader(tags, offsets []uint32, n uint32, allowUnsorted bool) error {
+	if allowUnsorted {
+		seen := make(map[uint32]bool, n)
+		for _, tag := range tags {
+			if seen[tag] {
+				return errors.New("protocol: duplicate tag")
+			}
+			seen[tag] = true
+		}
+	}
 	for i := uint32(1); i < n; i++ {
-		if tags[i] <= tags[i-1] {
+		if !allowUnsorted && tags[i] <= tags[i-1] {
 			return errors.New("protocol: tags not strictly ascending")
 		}
 		if offsets[i]%4 != 0 || offsets[i] < offsets[i-1] {
@@ -180,6 +204,44 @@ func validateHeader(tags, offsets []uint32, n uint32) error {
 		}
 	}
 	return nil
+}
+
+// validateMessage applies the selected profile's rules to an already decoded map.
+func validateMessage(data []byte, msg map[uint32][]byte, g wireGroup) error {
+	n := len(msg)
+	if g != groupD01 {
+		for i := 1; i < n; i++ {
+			if binary.LittleEndian.Uint32(data[4*n+4*i:]) <= binary.LittleEndian.Uint32(data[4*n+4*(i-1):]) {
+				return errors.New("protocol: tags not strictly ascending")
+			}
+		}
+	}
+	for tag, value := range msg {
+		if g == groupGoogle && len(value)%4 != 0 {
+			return errors.New("protocol: Google value length not multiple of 4")
+		}
+		if g >= groupD11 {
+			padding := false
+			for i := range 4 {
+				b := byte(tag >> (8 * i))
+				if b == 0 && i > 0 {
+					padding = true
+				} else if padding || b < 'A' || b > 'Z' {
+					return fmt.Errorf("protocol: invalid tag 0x%08x", tag)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// decodeProfile decodes a message and enforces the selected profile's tag rules.
+func decodeProfile(data []byte, g wireGroup) (map[uint32][]byte, error) {
+	msg, err := decodeMessage(data, g == groupD01)
+	if err == nil {
+		err = validateMessage(data, msg, g)
+	}
+	return msg, err
 }
 
 // decodeValues extracts tag values from the data section.
@@ -210,11 +272,11 @@ func unwrapPacket(pkt []byte) ([]byte, error) {
 		return nil, errors.New("protocol: bad magic")
 	}
 	mlen := binary.LittleEndian.Uint32(pkt[len(packetMagic):PacketHeaderSize])
-	bodyLen := uint32(len(pkt) - PacketHeaderSize)
-	if bodyLen < mlen {
+	bodyLen := uint64(len(pkt) - PacketHeaderSize)
+	if bodyLen < uint64(mlen) {
 		return nil, errors.New("protocol: truncated message")
 	}
-	if bodyLen > mlen {
+	if bodyLen > uint64(mlen) {
 		return nil, errors.New("protocol: trailing data after framed message")
 	}
 	return pkt[PacketHeaderSize : PacketHeaderSize+mlen], nil

@@ -39,11 +39,16 @@ const (
 	TagMAXT uint32 = 0x5458414d
 	// TagINDX is the Merkle index tag.
 	TagINDX uint32 = 0x58444e49
-	// TagZZZZ is the drafts 08+ client padding tag.
+	// TagZZZZ is the RFC and drafts 08+ client padding tag.
 	TagZZZZ uint32 = 0x5a5a5a5a
 	// TagPAD is the Google-Roughtime client padding tag.
 	TagPAD uint32 = 0xff444150
 
 	// tagPADIETF is the drafts 01-07 client padding tag.
 	tagPADIETF uint32 = 0x00444150
+
+	// Optional signed time fields defined by drafts 01-07.
+	tagDUT1 uint32 = 0x31545544
+	tagDTAI uint32 = 0x49415444
+	tagLEAP uint32 = 0x5041454c
 )

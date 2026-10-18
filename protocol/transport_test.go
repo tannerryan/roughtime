@@ -24,11 +24,13 @@ type staticUDPResolver struct {
 	lookupPort string
 }
 
+// LookupIPAddr records the host and returns the configured addresses.
 func (r *staticUDPResolver) LookupIPAddr(_ context.Context, host string) ([]net.IPAddr, error) {
 	r.lookupHost = host
 	return append([]net.IPAddr(nil), r.ips...), nil
 }
 
+// LookupPort records the lookup and returns the configured port.
 func (r *staticUDPResolver) LookupPort(_ context.Context, network, service string) (int, error) {
 	r.lookupNet = network
 	r.lookupPort = service

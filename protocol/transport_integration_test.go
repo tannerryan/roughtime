@@ -22,6 +22,7 @@ func TestAuthenticatedTransports(t *testing.T) {
 		request   RequestOptions
 		nodeFirst bool
 	}{
+		{name: "RFC10049", version: Version1},
 		{name: "Google", version: VersionGoogle},
 		{name: "draft01", version: VersionDraft01},
 		{name: "draft02", version: VersionDraft02},
@@ -30,11 +31,12 @@ func TestAuthenticatedTransports(t *testing.T) {
 		{name: "draft07", version: VersionDraft07},
 		{name: "draft08", version: VersionDraft08},
 		{name: "draft10", version: VersionDraft10},
-		{name: "draft12", version: VersionDraft12, request: RequestOptions{OmitTYPE: true}},
+		{name: "draft12", version: VersionDraft12, request: RequestOptions{Mode: Flex, OmitTYPE: true}},
 		{name: "draft14", version: VersionDraft12, nodeFirst: true},
 		{name: "draft16", version: VersionDraft12},
 		{name: "MLDSA44", version: VersionMLDSA44},
 	} {
+		tc.request.Mode = Flex
 		for _, transport := range []string{"udp", "tcp"} {
 			if tc.version == VersionGoogle && transport == "tcp" || tc.version == VersionMLDSA44 && transport == "udp" {
 				continue
@@ -58,13 +60,13 @@ func TestAuthenticatedTransports(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				sibling, err := ParseRequest(siblingBytes)
+				sibling, err := ParseRequestWithMode(siblingBytes, Flex)
 				if err != nil {
 					t.Fatal(err)
 				}
 				midpoint := time.Now().UTC().Truncate(time.Second)
 				respond := func(raw []byte) ([]byte, error) {
-					parsed, err := ParseRequest(raw)
+					parsed, err := ParseRequestWithMode(raw, Flex)
 					if err != nil {
 						return nil, err
 					}
@@ -73,7 +75,7 @@ func TestAuthenticatedTransports(t *testing.T) {
 						batch = batch[1:]
 					}
 					replies, err := CreateRepliesWithOptions(tc.version, batch, midpoint, 3*time.Second, cert,
-						ReplyOptions{Draft14NodeFirst: tc.nodeFirst})
+						ReplyOptions{Mode: Flex, Draft14NodeFirst: tc.nodeFirst})
 					if err != nil {
 						return nil, err
 					}
@@ -91,7 +93,7 @@ func TestAuthenticatedTransports(t *testing.T) {
 				if err != nil || serverErr != nil {
 					t.Fatalf("exchange: client=%v server=%v", err, serverErr)
 				}
-				got, radius, err := VerifyReply(versions, reply, rootPK, nonce, request)
+				got, radius, err := VerifyReplyWithOptions(versions, reply, rootPK, nonce, request, VerifyOptions{Mode: Flex})
 				if err != nil || !got.Equal(midpoint) || radius != 3*time.Second || rtt <= 0 || localNow.IsZero() {
 					t.Fatalf("verified exchange: midpoint=%s radius=%s RTT=%s local=%s error=%v", got, radius, rtt, localNow, err)
 				}

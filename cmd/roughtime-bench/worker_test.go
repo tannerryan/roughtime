@@ -33,7 +33,7 @@ func benchIdentity(t *testing.T) ([]byte, *protocol.Certificate) {
 		t.Fatalf("online key: %v", err)
 	}
 	now := time.Now()
-	cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, protocol.ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatalf("certificate: %v", err)
 	}
@@ -47,7 +47,7 @@ func benchConfigFor(transport, address string, pk []byte) benchConfig {
 		transport: transport,
 		rootPK:    bytes.Clone(pk),
 		srv:       protocol.ComputeSRV(pk),
-		versions:  roughtime.VersionsForScheme(roughtime.SchemeEd25519),
+		versions:  roughtime.VersionsForSchemeWithMode(roughtime.SchemeEd25519, protocol.Flex),
 		timeout:   time.Hour,
 		latencies: &latencyReservoir{},
 	}
@@ -114,11 +114,11 @@ func encodeReplyMessage(msg map[uint32][]byte) []byte {
 // paddedSignedReply returns a valid response larger than request by adding an
 // ignored, unsigned extension tag at the top level.
 func paddedSignedReply(request []byte, cert *protocol.Certificate) ([]byte, error) {
-	req, err := protocol.ParseRequest(request)
+	req, err := protocol.ParseRequestWithMode(request, protocol.Flex)
 	if err != nil {
 		return nil, err
 	}
-	replies, err := protocol.CreateReplies(protocol.VersionDraft12, []protocol.Request{*req}, time.Now(), time.Second, cert)
+	replies, err := protocol.CreateRepliesWithOptions(protocol.VersionDraft12, []protocol.Request{*req}, time.Now(), time.Second, cert, protocol.ReplyOptions{Mode: protocol.Flex})
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +126,7 @@ func paddedSignedReply(request []byte, cert *protocol.Certificate) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	msg[0xfefefefe] = make([]byte, len(request)+256)
+	msg[0x595a5a5a] = make([]byte, len(request)+256) // ZZZY
 	return encodeReplyMessage(msg), nil
 }
 
@@ -535,5 +535,74 @@ func TestRunWorkersFailsFastWithCause(t *testing.T) {
 	}
 	if err := waitResult(t, "fake peer", serverErr); err != nil {
 		t.Fatalf("server: %v", err)
+	}
+}
+
+// TestStrictWorkerAuthenticatesAndBacksOff checks verification, fresh nonces,
+// and retry delay.
+func TestStrictWorkerAuthenticatesAndBacksOff(t *testing.T) {
+	pk, cert := benchIdentity(t)
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_ = conn.SetDeadline(time.Now().Add(4 * time.Second))
+		buf := make([]byte, 8192)
+		var previous []byte
+		var failedAt time.Time
+		for i := range 3 {
+			n, peer, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				done <- err
+				return
+			}
+			req, err := protocol.ParseRequest(buf[:n])
+			if err != nil {
+				done <- err
+				return
+			}
+			if i == 2 {
+				cancel()
+				done <- nil
+				return
+			}
+			if i == 0 {
+				previous = bytes.Clone(req.Nonce)
+				failedAt = time.Now()
+				_, err = conn.WriteToUDP([]byte("invalid response"), peer)
+			} else {
+				if time.Since(failedAt) < 900*time.Millisecond || bytes.Equal(previous, req.Nonce) {
+					done <- fmt.Errorf("retry lacked backoff or fresh nonce")
+					cancel()
+					return
+				}
+				var replies [][]byte
+				replies, err = protocol.CreateReplies(1, []protocol.Request{*req}, time.Now(), time.Second, cert)
+				if err == nil {
+					_, err = conn.WriteToUDP(replies[0], peer)
+				}
+			}
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	cfg := benchConfigFor("udp", conn.LocalAddr().String(), pk)
+	cfg.client = &roughtime.Client{Timeout: time.Second, MaxAttempts: 1}
+	var out workerResult
+	if err := worker(ctx, cfg, &out, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitResult(t, "strict peer", done); err != nil {
+		t.Fatal(err)
+	}
+	if out.sent != 2 || out.successes != 1 || out.errRead != 1 {
+		t.Fatalf("strict counts: %+v", out)
 	}
 }

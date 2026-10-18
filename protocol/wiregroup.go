@@ -21,19 +21,25 @@ const (
 	groupD07
 	// groupD08 is drafts 08-09.
 	groupD08
-	// groupD10 is drafts 10-11.
+	// groupD10 is draft 10.
 	groupD10
+	// groupD11 adds the restricted tag alphabet.
+	groupD11
 	// groupD12 is drafts 12-13 and the fallback for 14-19 without TYPE.
 	groupD12
 	// groupD14 is drafts 14-19 with TYPE.
 	groupD14
-	// groupPQ is the experimental ML-DSA-44 PQ wire group.
+	// groupPQ follows RFC version 1 with ML-DSA-44 keys and signatures.
 	groupPQ
+	// groupRFC is RFC 10049 version 1.
+	groupRFC
 )
 
 // wireGroupOf returns the wire group for a version and TYPE presence.
 func wireGroupOf(v Version, hasType bool) wireGroup {
 	switch {
+	case v == Version1:
+		return groupRFC
 	case v == VersionGoogle:
 		return groupGoogle
 	case v == VersionMLDSA44:
@@ -50,8 +56,10 @@ func wireGroupOf(v Version, hasType bool) wireGroup {
 		return groupD07
 	case v <= VersionDraft09:
 		return groupD08
-	case v <= VersionDraft11:
+	case v == VersionDraft10:
 		return groupD10
+	case v == VersionDraft11:
+		return groupD11
 	default:
 		if hasType {
 			return groupD14
@@ -86,6 +94,9 @@ func usesMJDMicroseconds(g wireGroup) bool { return g >= groupD01 && g <= groupD
 // packet.
 func usesFullPacketLeaf(g wireGroup) bool { return g >= groupD12 }
 
+// usesRFCFormat reports whether g follows RFC 10049 message rules.
+func usesRFCFormat(g wireGroup) bool { return g == groupRFC || g == groupPQ }
+
 // noncInSREP reports whether NONC sits inside SREP (drafts 01-02).
 func noncInSREP(g wireGroup) bool { return g == groupD01 || g == groupD02 }
 
@@ -109,16 +120,27 @@ var (
 	// delegationCtxOld is the delegation context for Google and drafts 01-06,
 	// 08-11.
 	delegationCtxOld = []byte("RoughTime v1 delegation signature--\x00")
-	// delegationCtxNew is used by draft 07, drafts 12+, and ML-DSA-44.
+	// delegationCtxNew is used by draft 07 and drafts 12+.
 	delegationCtxNew = []byte("RoughTime v1 delegation signature\x00")
+	// delegationCtxRFC is the RFC version 1 delegation context.
+	delegationCtxRFC = []byte("Roughtime v1 delegation signature\x00")
 )
 
-// delegationContext returns the delegation signature context for g. Draft-07
-// alone dropped the "--" suffix (08 restored it, 12+ dropped it again), so
-// groupD07 takes the new context unlike its neighbours.
+// delegationContext returns the variant's exact delegation signature context.
 func delegationContext(g wireGroup) []byte {
+	if usesRFCFormat(g) {
+		return delegationCtxRFC
+	}
 	if g == groupD07 || g >= groupD12 {
 		return delegationCtxNew
 	}
 	return delegationCtxOld
+}
+
+// responseContext returns the signature context for g.
+func responseContext(g wireGroup) []byte {
+	if usesRFCFormat(g) {
+		return []byte("Roughtime v1 response signature\x00")
+	}
+	return responseCtx
 }

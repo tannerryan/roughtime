@@ -24,7 +24,6 @@ jobs:
       - run: make verify verify-tidy verify-vendor
       - run: make fmt && git diff --exit-code
       - run: make lint
-      - run: make lint GOOS=openbsd
       - run: make lint GOOS=freebsd
       - run: make vuln
       - run: make test-race
@@ -36,7 +35,6 @@ jobs:
         target:
           - { goos: linux, goarch: amd64 }
           - { goos: freebsd, goarch: amd64 }
-          - { goos: openbsd, goarch: amd64 }
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup

@@ -6,10 +6,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 	"unicode/utf8"
 
 	"github.com/tannerryan/roughtime"
+	"github.com/tannerryan/roughtime/protocol"
 )
 
 // Table layout and display limits.
@@ -62,7 +64,7 @@ func printSingle(r *roughtime.Response) {
 }
 
 // printTable prints batch results, chain status, and drift statistics.
-// expectedProbes is nonzero only for strict two-pass measurements.
+// expectedProbes is nonzero when a complete two-pass measurement is required.
 func printTable(results []roughtime.Result, proof *roughtime.Proof, expectedProbes int) error {
 	probeResults := len(results)
 	probeSuccesses := 0
@@ -101,7 +103,7 @@ func printTable(results []roughtime.Result, proof *roughtime.Proof, expectedProb
 		nameW = max(nameW, utf8.RuneCountInString(display(result.Server.Name, maxTableNameRunes)))
 		addrW = max(addrW, utf8.RuneCountInString(display(resultAddress(result), maxTableAddressRunes)))
 	}
-	rowFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-9s  %%-30s  %%-8s  %%-6s  %%-8s  %%s\n", nameW, addrW)
+	rowFmt := fmt.Sprintf("%%-%ds  %%-%ds  %%-12s  %%-30s  %%-8s  %%-6s  %%-8s  %%s\n", nameW, addrW)
 	fmt.Printf(rowFmt, "NAME", "ADDRESS", "VERSION", "MIDPOINT", "RADIUS", "RTT", "DRIFT", "STATUS")
 	errFmt := fmt.Sprintf("%%-%ds  %%-%ds  error: %%s\n", nameW, addrW)
 
@@ -175,8 +177,8 @@ func resultAddress(result roughtime.Result) string {
 	return "unknown (no configured endpoint)"
 }
 
-// resultAddressKey retains the historical coalescing key without presenting a
-// configured endpoint as the endpoint associated with a failure.
+// resultAddressKey uses the selected endpoint, or the first configured endpoint
+// when no attempt succeeded.
 func resultAddressKey(result roughtime.Result) string {
 	if result.Address.Address != "" {
 		return result.Address.String()
@@ -225,8 +227,39 @@ func durationSpread(minimum, maximum time.Duration) time.Duration {
 func printChainStatus(proof *roughtime.Proof) error {
 	if err := proof.Verify(); err != nil {
 		fmt.Printf("Chain:              FAILED: %s\n", display(err.Error(), maxTableErrorRunes))
+		if errors.Is(err, protocol.ErrCausalOrder) {
+			path, saveErr := saveMalfeasance(proof)
+			if saveErr != nil {
+				return fmt.Errorf("%w (saving malfeasance evidence: %v)", err, saveErr)
+			}
+			fmt.Printf("Evidence saved:     %s\n", display(path, 1024))
+		}
 		return fmt.Errorf("chain verify: %w", err)
 	}
 	fmt.Printf("Chain:              ok (%d links verified)\n", proof.Len())
 	return nil
+}
+
+// saveMalfeasance retains self-contained authenticated contradiction evidence.
+func saveMalfeasance(proof *roughtime.Proof) (string, error) {
+	data, err := proof.MarshalJSON()
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp("", "roughtime-malfeasance-*.json")
+	if err != nil {
+		return "", err
+	}
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
 }

@@ -23,6 +23,7 @@ type batchWriteResult struct {
 	err error
 }
 
+// TestDrainUDPBatch checks partial writes, interruptions, and error accounting.
 func TestDrainUDPBatch(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -158,6 +159,8 @@ func TestDrainUDPBatch(t *testing.T) {
 	}
 }
 
+// TestDrainUDPBatchStopsAfterCancellation checks cancellation during
+// interrupted writes.
 func TestDrainUDPBatchStopsAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	calls := 0
@@ -174,6 +177,7 @@ func TestDrainUDPBatchStopsAfterCancellation(t *testing.T) {
 	}
 }
 
+// TestDropsOneDatagram distinguishes destination errors from socket failures.
 func TestDropsOneDatagram(t *testing.T) {
 	for _, errno := range []syscall.Errno{
 		unix.EHOSTUNREACH,

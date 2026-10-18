@@ -27,14 +27,19 @@ import (
 // race.
 func startListenTCP(t *testing.T, edState, pqState *atomic.Pointer[certState]) (int, chan error, context.CancelFunc) {
 	t.Helper()
+	savedFlexPort := *flexPort
+	t.Cleanup(func() { *flexPort = savedFlexPort })
 	const maxAttempts = 5
 	for range maxAttempts {
 		p := pickFreeTCPPort(t)
 		*port = p
+		if savedFlexPort != 0 {
+			*flexPort = p
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
-			done <- listenTCP(ctx, edState, pqState)
+			done <- listenTCP(ctx, edState, pqState, []int{p})
 			close(done)
 		}()
 
@@ -121,7 +126,7 @@ func TestListenTCPEndToEndEd25519(t *testing.T) {
 	p, done, cancel := startListenTCP(t, edState, nil)
 
 	srv := protocol.ComputeSRV(rootPK)
-	nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+	nonce, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
@@ -129,7 +134,7 @@ func TestListenTCPEndToEndEd25519(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	reply := tcpRoundTrip(t, conn, req)
-	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req); err != nil {
+	if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 		t.Fatalf("VerifyReply: %v", err)
 	}
 
@@ -146,7 +151,7 @@ func TestListenTCPEndToEndPQ(t *testing.T) {
 	p, done, cancel := startListenTCP(t, nil, pqState)
 
 	srv := protocol.ComputeSRV(rootPK)
-	nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionMLDSA44}, rand.Reader, srv)
+	nonce, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionMLDSA44}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
@@ -154,7 +159,7 @@ func TestListenTCPEndToEndPQ(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	reply := tcpRoundTrip(t, conn, req)
-	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionMLDSA44}, reply, rootPK, nonce, req); err != nil {
+	if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{protocol.VersionMLDSA44}, reply, rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 		t.Fatalf("VerifyReply: %v", err)
 	}
 
@@ -172,11 +177,11 @@ func TestPrepareTCPItemRequiresSRVForDualRootModernRequests(t *testing.T) {
 	edCh := make(chan tcpBatchItem)
 	pqCh := make(chan tcpBatchItem)
 	peer := &net.TCPAddr{IP: net.IPv6loopback, Port: 2002}
-	prefs := tcpServerPrefs(edState, pqState)
+	prefs := tcpServerPrefs(edState, pqState, true)
 
 	for _, version := range []protocol.Version{protocol.VersionDraft10, protocol.VersionDraft12, protocol.VersionMLDSA44} {
 		t.Run(version.ShortString(), func(t *testing.T) {
-			_, req, err := protocol.CreateRequest([]protocol.Version{version}, rand.Reader, nil)
+			_, req, err := protocol.CreateRequestWithOptions([]protocol.Version{version}, rand.Reader, nil, protocol.RequestOptions{Mode: protocol.Flex})
 			if err != nil {
 				t.Fatalf("CreateRequest: %v", err)
 			}
@@ -194,11 +199,11 @@ func TestPrepareTCPItemAllowsMissingSRVWithOneRoot(t *testing.T) {
 	_, edState := newCertState(t)
 	edCh := make(chan tcpBatchItem)
 	peer := &net.TCPAddr{IP: net.IPv6loopback, Port: 2002}
-	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, nil)
+	_, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, nil, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	item, ch, reason, err := prepareTCPItem(zap.NewNop(), peer, req, edState, nil, edCh, nil, tcpServerPrefs(edState, nil))
+	item, ch, reason, err := prepareTCPItem(zap.NewNop(), peer, req, edState, nil, edCh, nil, tcpServerPrefs(edState, nil, true))
 	if err != nil || reason != dropNone || ch != edCh || item.version != protocol.VersionDraft12 {
 		t.Fatalf("prepareTCPItem: version=%s ch=%v reason=%q err=%v", item.version, ch, reason, err)
 	}
@@ -216,7 +221,7 @@ func TestPrepareTCPItemAllowsDualRootLegacyWithoutSRV(t *testing.T) {
 
 	for _, version := range prefs {
 		t.Run(version.ShortString(), func(t *testing.T) {
-			_, req, err := protocol.CreateRequest([]protocol.Version{version}, rand.Reader, nil)
+			_, req, err := protocol.CreateRequestWithOptions([]protocol.Version{version}, rand.Reader, nil, protocol.RequestOptions{Mode: protocol.Flex})
 			if err != nil {
 				t.Fatalf("CreateRequest: %v", err)
 			}
@@ -323,12 +328,12 @@ func TestListenTCPSequentialRequests(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 
 	for i := range 4 {
-		nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+		nonce, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 		if err != nil {
 			t.Fatalf("CreateRequest[%d]: %v", i, err)
 		}
 		reply := tcpRoundTrip(t, conn, req)
-		if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req); err != nil {
+		if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 			t.Fatalf("VerifyReply[%d]: %v", i, err)
 		}
 	}
@@ -550,43 +555,6 @@ func TestListenTCPRejectsAtMaxConnections(t *testing.T) {
 
 	cancel()
 	if err := awaitTest(t, done, 5*time.Second, "listenTCP shutdown"); err != nil {
-		t.Fatalf("listenTCP: %v", err)
-	}
-}
-
-// TestListenTCPPerFamily covers the OpenBSD layout that binds one listener per
-// address family.
-func TestListenTCPPerFamily(t *testing.T) {
-	disableGrease(t)
-	prev := listenNetworks
-	listenNetworks = func(network, _ string) []string {
-		return []string{network + "4", network + "6"}
-	}
-	t.Cleanup(func() { listenNetworks = prev })
-
-	rootPK, edState := newCertState(t)
-	p, done, cancel := startListenTCP(t, edState, nil)
-	srv := protocol.ComputeSRV(rootPK)
-
-	// both families must answer, not just the one a wildcard bind would pick
-	for _, host := range []string{"127.0.0.1", "::1"} {
-		nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
-		if err != nil {
-			t.Fatalf("CreateRequest: %v", err)
-		}
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(p)), time.Second)
-		if err != nil {
-			t.Fatalf("dial %s: %v", host, err)
-		}
-		reply := tcpRoundTrip(t, conn, req)
-		_ = conn.Close()
-		if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, reply, rootPK, nonce, req); err != nil {
-			t.Fatalf("VerifyReply %s: %v", host, err)
-		}
-	}
-
-	cancel()
-	if err := awaitTest(t, done, 6*time.Second, "listenTCP shutdown"); err != nil {
 		t.Fatalf("listenTCP: %v", err)
 	}
 }

@@ -2,8 +2,8 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Command roughtime-client queries one server or a JSON ecosystem and prints
-// authenticated timestamps. It supports Google-Roughtime, IETF drafts 05–19,
-// and the experimental ML-DSA-44 extension.
+// authenticated RFC timestamps. Flex mode also supports Google-Roughtime, IETF
+// drafts 05-19, and the experimental ML-DSA-44 extension.
 package main
 
 import (
@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
@@ -26,6 +27,8 @@ import (
 )
 
 var (
+	// flex enables legacy and experimental wire profiles.
+	flex = commandLine.Bool("flex", false, "also support implemented drafts, Google-Roughtime, and ML-DSA-44")
 	// commandLine returns parse errors so they pass through the same terminal
 	// sanitizer as validation and runtime errors.
 	commandLine = flag.NewFlagSet("roughtime-client", flag.ContinueOnError)
@@ -44,13 +47,13 @@ var (
 	// retries caps attempts per server.
 	retries = commandLine.Int("retries", 3, "max attempts per server (1 = no retries, backoff starts at 1s, grows by 1.5, caps at 24h)")
 	// chainMode enables causal ecosystem queries.
-	chainMode = commandLine.Bool("chain", true, "chain queries sequentially: each nonce derives from the previous reply and fresh random salt")
+	chainMode = commandLine.Bool("chain", true, "chain queries sequentially (required for strict multi-server measurements)")
 	// all disables default ecosystem sampling.
 	all = commandLine.Bool("all", false, "query every transport-compatible ecosystem server (default: up to 5 endpoint-domain groups)")
 	// twoPass requests a complete same-order two-pass measurement.
-	twoPass = commandLine.Bool("two-pass", false, "require a complete two-pass same-order ecosystem chain (at least 3 endpoint groups and trust roots)")
-	// standardSize selects the draft-19 message-size padding convention.
-	standardSize = commandLine.Bool("standard-size", false, "send standard message-sized padding plus framing (default: legacy total-packet sizing)")
+	twoPass = commandLine.Bool("two-pass", false, "require two passes across at least 3 endpoint groups and roots (automatic for unfiltered RFC-only server lists)")
+	// standardSize selects full-body padding in flex mode.
+	standardSize = commandLine.Bool("standard-size", false, "use full-body padding in flex mode (strict mode always uses it)")
 	// showVersion requests version output and exit.
 	showVersion = commandLine.Bool("version", false, "print version and exit")
 )
@@ -145,7 +148,10 @@ func run(ctx context.Context) error {
 		return err
 	}
 	expectedProbes := 0
-	if *twoPass {
+	if *twoPass || (!*flex && *serversFile != "" && *nameFilter == "") {
+		if !*chainMode {
+			return errors.New("strict multi-server measurements require -chain=true")
+		}
 		servers, err = twoPassServers(servers)
 		if err != nil {
 			return err
@@ -185,10 +191,10 @@ func run(ctx context.Context) error {
 	return qcErr
 }
 
-// newClient maps command flags to the high-level client without changing the
-// legacy packet-size default.
+// newClient maps command flags to the high-level client.
 func newClient() *roughtime.Client {
 	return &roughtime.Client{
+		Mode:               protocolMode(),
 		Timeout:            *timeout,
 		MaxAttempts:        *retries,
 		StandardPacketSize: *standardSize,
@@ -217,7 +223,7 @@ func loadServers() ([]roughtime.Server, error) {
 						return nil, fmt.Errorf("server %q in %s has no tcp address", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
 					}
 				}
-				s, err = roughtime.NormalizeServer(s)
+				s, err = roughtime.NormalizeServerWithMode(s, protocolMode())
 				if err != nil {
 					return nil, fmt.Errorf("server %q in %s is unusable: %w", roughtime.SanitizeForDisplay(*nameFilter), safeFile, err)
 				}
@@ -237,6 +243,8 @@ func loadServers() ([]roughtime.Server, error) {
 		}
 		if !*all {
 			servers = roughtime.SampleByOperator(servers, defaultSampleSize)
+		} else if !*flex {
+			mrand.Shuffle(len(servers), func(i, j int) { servers[i], servers[j] = servers[j], servers[i] })
 		}
 		return servers, nil
 	}
@@ -272,7 +280,7 @@ func loadServers() ([]roughtime.Server, error) {
 func normalizeServers(servers []roughtime.Server) []roughtime.Server {
 	out := make([]roughtime.Server, 0, len(servers))
 	for _, s := range servers {
-		normalized, err := roughtime.NormalizeServer(s)
+		normalized, err := roughtime.NormalizeServerWithMode(s, protocolMode())
 		if err != nil {
 			continue
 		}
@@ -356,7 +364,16 @@ func loadServersFile(path string) ([]roughtime.Server, error) {
 	if len(data) > roughtime.MaxEcosystemBytes {
 		return nil, fmt.Errorf("server list %s exceeds %d bytes", roughtime.SanitizeForDisplay(path), roughtime.MaxEcosystemBytes)
 	}
-	return roughtime.ParseEcosystem(data)
+	// List syntax is independent of the protocol mode used for queries.
+	return roughtime.ParseEcosystemWithMode(data, protocol.Flex)
+}
+
+// protocolMode returns the mode selected by -flex.
+func protocolMode() protocol.Mode {
+	if *flex {
+		return protocol.Flex
+	}
+	return protocol.Strict
 }
 
 // terminalError sanitizes and bounds errors at the final stderr boundary.

@@ -5,6 +5,7 @@ package protocol
 
 import (
 	"crypto/ed25519"
+	"crypto/mldsa"
 	"testing"
 	"time"
 )
@@ -24,7 +25,7 @@ func TestNewCertificateGroupD14(t *testing.T) {
 	rootSK, onlineSK := testKeys(t)
 	rootPK := rootSK.Public().(ed25519.PublicKey)
 	now := time.Now()
-	cert, err := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,6 +66,26 @@ func TestPQNewCertificateRejectsNilKey(t *testing.T) {
 	now := time.Now()
 	if _, err := NewCertificateMLDSA44(now, now.Add(time.Hour), nil, nil); err == nil {
 		t.Fatal("expected error on nil keys")
+	}
+}
+
+// TestPQCertificateRejectsOtherParameters rejects ML-DSA-65 and ML-DSA-87 keys.
+func TestPQCertificateRejectsOtherParameters(t *testing.T) {
+	valid, err := mldsa.GenerateKey(mldsa.MLDSA44())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, params := range []mldsa.Parameters{mldsa.MLDSA65(), mldsa.MLDSA87()} {
+		other, err := mldsa.GenerateKey(params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, keys := range [][2]*mldsa.PrivateKey{{valid, other}, {other, valid}} {
+			if _, err := NewCertificateMLDSA44(now, now.Add(time.Hour), keys[0], keys[1]); err == nil {
+				t.Fatalf("accepted %s key in ML-DSA-44 certificate", params)
+			}
+		}
 	}
 }
 

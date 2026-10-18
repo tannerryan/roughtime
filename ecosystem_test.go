@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/tannerryan/roughtime"
+	"github.com/tannerryan/roughtime/protocol"
 )
 
 // udpServer returns a minimal UDP test server.
@@ -82,7 +83,7 @@ func TestParseEcosystemRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	servers, err := roughtime.ParseEcosystem(data)
+	servers, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseEcosystem: %v", err)
 	}
@@ -116,7 +117,7 @@ func TestParseEcosystemValidatesPublicKeyType(t *testing.T) {
 		}},
 	}
 	data, _ := json.Marshal(doc)
-	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "publicKeyType") {
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err == nil || !strings.Contains(err.Error(), "publicKeyType") {
 		t.Fatalf("ParseEcosystem: %v, want publicKeyType mismatch error", err)
 	}
 }
@@ -134,8 +135,34 @@ func TestParseEcosystemEnforcesMaxServers(t *testing.T) {
 		servers[i] = entry
 	}
 	data, _ := json.Marshal(map[string]any{"servers": servers})
-	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "max") {
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err == nil || !strings.Contains(err.Error(), "max") {
 		t.Fatalf("ParseEcosystem: %v, want max-entries error", err)
+	}
+}
+
+// TestEcosystemEntryLimitBeforeDecode checks the exact cap and early rejection.
+func TestEcosystemEntryLimitBeforeDecode(t *testing.T) {
+	entry := `{"name":"fixture","version":1,"publicKeyType":"ed25519","publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","addresses":[{"protocol":"udp","address":"time.example:5319"}]}`
+	valid := []byte(`{"servers":[` + strings.Repeat(entry+`,`, roughtime.MaxEcosystemServers-1) + entry + `]}`)
+	excess := []byte(`{"servers":[` + strings.Repeat(entry+`,`, roughtime.MaxEcosystemServers) + `false]}`)
+	for _, mode := range []protocol.Mode{protocol.Strict, protocol.Flex} {
+		servers, err := roughtime.ParseEcosystemWithMode(valid, mode)
+		if err != nil || len(servers) != roughtime.MaxEcosystemServers {
+			t.Fatalf("mode=%d exact limit: count=%d error=%v", mode, len(servers), err)
+		}
+		if _, err := roughtime.ParseEcosystemWithMode(excess, mode); err == nil || !strings.Contains(err.Error(), "max") {
+			t.Fatalf("mode=%d expected entry-limit error before excess value, got %v", mode, err)
+		}
+		duplicate := []byte(`{"servers":[` + entry + `,` + entry + `],"servers":[` + entry + `],"unknown":true}`)
+		servers, err = roughtime.ParseEcosystemWithMode(duplicate, mode)
+		if err != nil || len(servers) != 1 {
+			t.Fatalf("mode=%d duplicate key: count=%d error=%v", mode, len(servers), err)
+		}
+		for _, value := range []string{`null`, `[]`, `{}`, `false`} {
+			if _, err := roughtime.ParseEcosystemWithMode([]byte(`{"servers":`+value+`}`), mode); err == nil {
+				t.Fatalf("mode=%d accepted empty or invalid servers %s", mode, value)
+			}
+		}
 	}
 }
 
@@ -145,7 +172,7 @@ func TestShippedEcosystemParses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read ecosystem.json: %v", err)
 	}
-	servers, err := roughtime.ParseEcosystem(data)
+	servers, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseEcosystem: %v", err)
 	}
@@ -165,7 +192,7 @@ func TestParseEcosystemRejectsBadTransport(t *testing.T) {
 		}},
 	}
 	data, _ := json.Marshal(doc)
-	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "unsupported transport") {
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err == nil || !strings.Contains(err.Error(), "unsupported transport") {
 		t.Fatalf("ParseEcosystem: %v, want unsupported-transport error", err)
 	}
 }
@@ -181,7 +208,7 @@ func TestParseEcosystemRejectsBadAddress(t *testing.T) {
 		}},
 	}
 	data, _ := json.Marshal(doc)
-	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "bad address") {
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err == nil || !strings.Contains(err.Error(), "bad address") {
 		t.Fatalf("ParseEcosystem: %v, want bad-address error", err)
 	}
 }
@@ -197,7 +224,7 @@ func TestParseEcosystemRejectsIPv6Zone(t *testing.T) {
 		}},
 	}
 	data, _ := json.Marshal(doc)
-	if _, err := roughtime.ParseEcosystem(data); err == nil || !strings.Contains(err.Error(), "zone") {
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err == nil || !strings.Contains(err.Error(), "zone") {
 		t.Fatalf("ParseEcosystem: %v, want IPv6-zone error", err)
 	}
 }
@@ -208,7 +235,7 @@ func TestParseEcosystemAcceptsIntVersion(t *testing.T) {
 	doc := []byte(`{"servers":[{"name":"x","version":12,"publicKey":"` +
 		base64.StdEncoding.EncodeToString(pk) +
 		`","addresses":[{"protocol":"udp","address":"x:1"}]}]}`)
-	servers, err := roughtime.ParseEcosystem(doc)
+	servers, err := roughtime.ParseEcosystemWithMode(doc, protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseEcosystem: %v", err)
 	}
@@ -234,11 +261,11 @@ func TestMarshalEcosystemRoundTrip(t *testing.T) {
 			Addresses: []roughtime.Address{{Transport: "tcp", Address: "beta.example:2003"}},
 		},
 	}
-	data, err := roughtime.MarshalEcosystem(in)
+	data, err := roughtime.MarshalEcosystemWithMode(in, protocol.Flex)
 	if err != nil {
 		t.Fatalf("MarshalEcosystem: %v", err)
 	}
-	out, err := roughtime.ParseEcosystem(data)
+	out, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseEcosystem (round-trip): %v", err)
 	}
@@ -258,7 +285,7 @@ func TestMarshalEcosystemRoundTrip(t *testing.T) {
 // TestParseEcosystemRejectsOversizeInput covers the byte-size limit.
 func TestParseEcosystemRejectsOversizeInput(t *testing.T) {
 	data := bytes.Repeat([]byte{' '}, roughtime.MaxEcosystemBytes+1)
-	if _, err := roughtime.ParseEcosystem(data); err == nil {
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err == nil {
 		t.Fatal("ParseEcosystem accepted oversize input")
 	}
 }
@@ -283,12 +310,94 @@ func TestParseEcosystemAllowsStructurallyValidForeignCombination(t *testing.T) {
 	doc := []byte(`{"servers":[{"name":"pq-over-udp","publicKeyType":"ml-dsa-44","publicKey":"` +
 		base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 1312)) +
 		`","addresses":[{"protocol":"udp","address":"example.com:2002"}]}]}`)
-	servers, err := roughtime.ParseEcosystem(doc)
+	servers, err := roughtime.ParseEcosystemWithMode(doc, protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseEcosystem: %v", err)
 	}
-	if _, err := roughtime.NormalizeServer(servers[0]); err == nil || !strings.Contains(err.Error(), "tcp address") {
+	if _, err := roughtime.NormalizeServerWithMode(servers[0], protocol.Flex); err == nil || !strings.Contains(err.Error(), "tcp address") {
 		t.Fatalf("NormalizeServer = %v, want ML transport compatibility error", err)
+	}
+}
+
+// TestRFCServerListMetadata checks required names and optional HTTPS URLs.
+func TestRFCServerListMetadata(t *testing.T) {
+	entry := `{"name":"example","version":1,"publicKeyType":"ed25519","publicKey":"` +
+		base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)) +
+		`","addresses":[{"protocol":"udp","address":"example.com:5319"}]}`
+	for _, tc := range []struct {
+		name     string // subtest label
+		metadata string // optional top-level JSON fields
+		valid    bool   // expected strict-mode acceptance
+	}{
+		{"absent", "", true},
+		{"HTTPS", `,"sources":["https://example.com/list"],"reports":"https://example.com/report"`, true},
+		{"empty sources", `,"sources":[]`, true},
+		{"HTTP source", `,"sources":["http://example.com/list"]`, false},
+		{"relative source", `,"sources":["/list"]`, false},
+		{"source object", `,"sources":{}`, false},
+		{"null sources", `,"sources":null`, false},
+		{"HTTP reports", `,"reports":"http://example.com/report"`, false},
+		{"empty reports", `,"reports":""`, false},
+		{"reports array", `,"reports":[]`, false},
+		{"null reports", `,"reports":null`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{"servers":[` + entry + `]` + tc.metadata + `}`)
+			if _, err := roughtime.ParseEcosystem(data); (err == nil) != tc.valid {
+				t.Fatalf("strict parsing: %v, want valid=%t", err, tc.valid)
+			}
+			if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err != nil {
+				t.Fatalf("flex parsing: %v", err)
+			}
+		})
+	}
+	data := []byte(`{"servers":[` + strings.Replace(entry, `"name":"example",`, "", 1) + `]}`)
+	if _, err := roughtime.ParseEcosystem(data); err == nil {
+		t.Fatal("strict parsing accepted a missing name")
+	}
+	if _, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex); err != nil {
+		t.Fatalf("flex parsing: %v", err)
+	}
+}
+
+// TestRFCServerListAddresses checks RFC endpoints and flex parsing.
+func TestRFCServerListAddresses(t *testing.T) {
+	for _, tc := range []struct {
+		transport string // endpoint protocol label
+		address   string // host and port under test
+		valid     bool   // expected strict-mode acceptance
+	}{
+		{"udp", "example.com:5319", true},
+		{"tcp", "192.0.2.1:0", true},
+		{"udp", "[2001:db8::1]:65535", true},
+		{"udp", "[::ffff:192.0.2.1]:5319", true},
+		{"udp", "example.com:+5319", false},
+		{"udp", "example.com:-0", false},
+		{"udp", "[example.com]:5319", false},
+		{"udp", "[192.0.2.1]:5319", false},
+		{"udp", "[2001:db8::xyz]:5319", false},
+		{"UDP", "example.com:5319", false},
+	} {
+		t.Run(tc.transport+"/"+tc.address, func(t *testing.T) {
+			data, err := json.Marshal(map[string]any{"servers": []map[string]any{{
+				"name": "example", "version": 1, "publicKeyType": "ed25519",
+				"publicKey": base64.StdEncoding.EncodeToString(make([]byte, ed25519.PublicKeySize)),
+				"addresses": []map[string]string{{"protocol": tc.transport, "address": tc.address}},
+			}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := roughtime.ParseEcosystem(data); (err == nil) != tc.valid {
+				t.Fatalf("strict parsing: %v, want valid=%t", err, tc.valid)
+			}
+			servers, err := roughtime.ParseEcosystemWithMode(data, protocol.Flex)
+			if err != nil {
+				t.Fatalf("flex parsing: %v", err)
+			}
+			if _, err := roughtime.MarshalEcosystem(servers); (err == nil) != (tc.valid || tc.transport == "UDP") {
+				t.Fatalf("strict serialization: %v", err)
+			}
+		})
 	}
 }
 
@@ -299,9 +408,11 @@ func FuzzParseEcosystem(f *testing.F) {
 		f.Fatal(err)
 	}
 	doc := map[string]any{"servers": []map[string]any{{
-		"name":      "ex",
-		"publicKey": base64.StdEncoding.EncodeToString(pk),
-		"addresses": []map[string]string{{"protocol": "udp", "address": "x:1"}},
+		"version":       1,
+		"publicKeyType": "ed25519",
+		"name":          "ex",
+		"publicKey":     base64.StdEncoding.EncodeToString(pk),
+		"addresses":     []map[string]string{{"protocol": "udp", "address": "x:1"}},
 	}}}
 	good, _ := json.Marshal(doc)
 	f.Add(good)
@@ -311,7 +422,8 @@ func FuzzParseEcosystem(f *testing.F) {
 	f.Add([]byte(`{"servers":[{}]}`))
 
 	f.Fuzz(func(t *testing.T, in []byte) {
-		servers, err := roughtime.ParseEcosystem(in)
+		_, _ = roughtime.ParseEcosystem(in)
+		servers, err := roughtime.ParseEcosystemWithMode(in, protocol.Flex)
 		if err != nil {
 			return
 		}
@@ -324,4 +436,30 @@ func FuzzParseEcosystem(f *testing.F) {
 			}
 		}
 	})
+}
+
+// TestStrictEndpointSyntax checks RFC host syntax without changing flex parsing.
+func TestStrictEndpointSyntax(t *testing.T) {
+	for _, tc := range []struct {
+		address string // host and port under test
+		valid   bool   // expected strict-mode acceptance
+	}{
+		{"example.com:5319", true}, {"example.com.:5319", true}, {"127.0.0.1:5319", true}, {"[::1]:5319", true},
+		{"bad host:5319", false}, {"foo/bar:5319", false}, {"-bad.example:5319", false}, {"bad-.example:5319", false},
+		{"bad..example:5319", false}, {"bad_name.example:5319", false}, {strings.Repeat("x", 64) + ".example:5319", false},
+	} {
+		s := roughtime.Server{Name: "endpoint", Version: "1", PublicKey: make([]byte, 32), Addresses: []roughtime.Address{{Transport: "tcp", Address: tc.address}}}
+		data, err := roughtime.MarshalEcosystem([]roughtime.Server{s})
+		if (err == nil) != tc.valid {
+			t.Fatalf("strict %q: %v", tc.address, err)
+		}
+		if err == nil {
+			if _, err := roughtime.ParseEcosystem(data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := roughtime.MarshalEcosystemWithMode([]roughtime.Server{s}, protocol.Flex); err != nil {
+			t.Fatalf("changed flex address acceptance %q: %v", tc.address, err)
+		}
+	}
 }

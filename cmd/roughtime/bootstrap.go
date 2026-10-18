@@ -27,13 +27,16 @@ import (
 	"go.uber.org/zap"
 )
 
-// Seed-file headers bind a seed to its scheme. Ed25519 still accepts legacy
-// bare hex while PQ files must carry the header.
+// Seed-file headers bind a seed to its scheme. Ed25519 accepts legacy bare hex
+// while PQ files must carry the header.
 const (
 	// ed25519SeedHeader identifies an Ed25519 seed file.
 	ed25519SeedHeader = "roughtime-ed25519-seed-v1"
 	// mldsa44SeedHeader identifies an ML-DSA-44 seed file.
 	mldsa44SeedHeader = "roughtime-mldsa44-seed-v1"
+	// maxPrivateKeyFileBytes bounds seed files, including headers and
+	// whitespace.
+	maxPrivateKeyFileBytes = 4096
 )
 
 // Certificate validity window relative to now.
@@ -292,9 +295,14 @@ func readPrivateKeyFile(path, role string) ([]byte, error) {
 	if mode := info.Mode().Perm(); mode&0o077 != 0 {
 		return nil, fmt.Errorf("%s key file %s has insecure mode %#o (must be 0600 or stricter)", role, path, mode)
 	}
-	raw, err := io.ReadAll(f)
+	raw, err := io.ReadAll(io.LimitReader(f, maxPrivateKeyFileBytes+1))
 	if err != nil {
+		clear(raw)
 		return nil, fmt.Errorf("reading %s signing key file: %w", role, err)
+	}
+	if len(raw) > maxPrivateKeyFileBytes {
+		clear(raw)
+		return nil, fmt.Errorf("%s key file exceeds %d bytes", role, maxPrivateKeyFileBytes)
 	}
 	return raw, nil
 }
@@ -370,7 +378,7 @@ func provisionCertificateKey() (*protocol.Certificate, ed25519.PublicKey, ed2551
 
 	now := wallClockNow()
 	expiry := now.Add(certEndOffset)
-	cert, err := protocol.NewCertificate(now.Add(certStartOffset), expiry, onlineSK, rootSK)
+	cert, err := protocol.NewCertificateWithVersions(now.Add(certStartOffset), expiry, onlineSK, rootSK, ed25519Versions())
 	if err != nil {
 		return nil, nil, nil, time.Time{}, fmt.Errorf("generating online certificate: %w", err)
 	}

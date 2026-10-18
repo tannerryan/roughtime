@@ -97,7 +97,7 @@ func testCert(t testing.TB) (*Certificate, ed25519.PrivateKey) {
 	t.Helper()
 	rootSK, onlineSK := testKeys(t)
 	now := time.Now()
-	cert, err := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,23 +131,23 @@ func verifyRoundTrip(t *testing.T, versions []Version, ver Version) {
 	cert, _ := testCert(t)
 	rootPK := cert.edRootPK
 
-	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions(versions, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	now := time.Now()
-	replies, err := CreateReplies(ver, []Request{*parsed}, now, time.Second, cert)
+	replies, err := CreateRepliesWithOptions(ver, []Request{*parsed}, now, time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil || len(replies) != 1 {
 		t.Fatal("expected one reply")
 	}
 
-	midpoint, radius, err := VerifyReply(versions, replies[0], rootPK, nonce, req)
+	midpoint, radius, err := VerifyReplyWithOptions(versions, replies[0], rootPK, nonce, req, VerifyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,15 +168,15 @@ func validReply(t *testing.T, ver Version, versions []Version) (reply, rootPK, n
 	cert, _ := testCert(t)
 	rootPK = cert.edRootPK
 
-	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions(versions, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies, err := CreateReplies(ver, []Request{*parsed}, time.Now(), time.Second, cert)
+	replies, err := CreateRepliesWithOptions(ver, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,17 +236,7 @@ func longVersionList(first Version, n int) []Version {
 	versions := make([]Version, n)
 	versions[0] = first
 	for i := 1; i < n; i++ {
-		versions[i] = Version(0xf0000100 + i)
+		versions[i] = Version(0xf0000100) + Version(i)
 	}
 	return versions
-}
-
-// mustRadiSeconds encodes radius or fails the test.
-func mustRadiSeconds(t testing.TB, radius time.Duration) uint32 {
-	t.Helper()
-	value, err := radiSeconds(radius)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return value
 }

@@ -18,10 +18,8 @@ import (
 // shutdown.
 const udpWriteTimeout = 2 * time.Second
 
-// listenNetworks returns the networks to bind. OpenBSD lacks IPv4-mapped IPv6,
-// so a wildcard needs one socket per family. It is a variable so tests can
-// force the split off OpenBSD.
-var listenNetworks = func(network, addr string) []string {
+// listenNetworks splits wildcard binds on systems without IPv4-mapped IPv6.
+func listenNetworks(network, addr string) []string {
 	if runtime.GOOS != "openbsd" {
 		return []string{network}
 	}
@@ -34,9 +32,13 @@ var listenNetworks = func(network, addr string) []string {
 
 // applyReadBuffer sets SO_RCVBUF and logs if the kernel clamps its size.
 func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
-	if err := conn.SetReadBuffer(socketRecvBuffer); err != nil {
+	requested := socketRecvBuffer
+	if runtime.GOOS == "openbsd" {
+		requested = min(requested, 2*1024*1024)
+	}
+	if err := conn.SetReadBuffer(requested); err != nil {
 		log.Warn("setting UDP receive buffer failed",
-			zap.Int("requested", socketRecvBuffer),
+			zap.Int("requested", requested),
 			zap.Error(err),
 		)
 		return
@@ -64,7 +66,7 @@ func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 	if runtime.GOOS == "linux" {
 		effective /= 2
 	}
-	if effective < socketRecvBuffer {
+	if effective < requested {
 		level := zap.WarnLevel
 		// Non-Linux limits are commonly below the requested size, so avoid an
 		// alarming warning there.
@@ -73,7 +75,7 @@ func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 		}
 		if ce := log.Check(level, "kernel truncated UDP receive buffer"); ce != nil {
 			ce.Write(
-				zap.Int("requested", socketRecvBuffer),
+				zap.Int("requested", requested),
 				zap.Int("effective", effective),
 				zap.String("remediation", "raise the operating system's UDP receive-buffer limit"),
 			)
@@ -81,6 +83,6 @@ func applyReadBuffer(log *zap.Logger, conn *net.UDPConn) {
 		return
 	}
 	if ce := log.Check(zap.DebugLevel, "UDP receive buffer applied"); ce != nil {
-		ce.Write(zap.Int("requested", socketRecvBuffer), zap.Int("effective", effective))
+		ce.Write(zap.Int("requested", requested), zap.Int("effective", effective))
 	}
 }

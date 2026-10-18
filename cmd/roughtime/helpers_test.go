@@ -86,7 +86,7 @@ func newUnitCertState(t *testing.T) (ed25519.PublicKey, *certState) {
 		t.Fatalf("gen online: %v", err)
 	}
 	now := time.Now()
-	cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, ed25519Versions())
 	if err != nil {
 		t.Fatalf("NewCertificate: %v", err)
 	}
@@ -106,7 +106,7 @@ func newCertState(t *testing.T) (ed25519.PublicKey, *atomic.Pointer[certState]) 
 		t.Fatalf("ed25519 online: %v", err)
 	}
 	now := time.Now()
-	cert, err := protocol.NewCertificate(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateWithVersions(now.Add(certStartOffset), now.Add(certEndOffset), onlineSK, rootSK, ed25519Versions())
 	if err != nil {
 		t.Fatalf("NewCertificate: %v", err)
 	}

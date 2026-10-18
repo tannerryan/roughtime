@@ -19,6 +19,7 @@ import (
 	"github.com/tannerryan/roughtime/protocol"
 )
 
+// TestDebugRetryState checks backoff growth, limits, reset, and cancellation.
 func TestDebugRetryState(t *testing.T) {
 	var waits []time.Duration
 	state := &debugRetryState{wait: func(_ context.Context, delay time.Duration) error {
@@ -89,9 +90,9 @@ func TestDefaultScanBudget(t *testing.T) {
 					t.Fatal("nonresponsive peer marked supported")
 				}
 			}
-			wantAttempts := 78
+			wantAttempts := 81
 			if transport == "tcp" {
-				wantAttempts = 39
+				wantAttempts = 42
 			}
 			if attempts != wantAttempts || len(waits) != attempts-1 {
 				t.Fatalf("attempts=%d waits=%d, want %d attempts and a shared wait before every retry", attempts, len(waits), wantAttempts)
@@ -112,6 +113,7 @@ func TestDefaultScanBudget(t *testing.T) {
 	}
 }
 
+// TestProbeFallsBackToStandardSizedUDP checks flex UDP padding fallback.
 func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
 	restoreProbeGlobals(t)
 	*retries = 1
@@ -121,7 +123,7 @@ func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
 	onlineSK := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
 	rootPK := rootSK.Public().(ed25519.PublicKey)
 	now := time.Date(2026, time.September, 7, 12, 0, 0, 0, time.UTC)
-	cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, protocol.ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +137,7 @@ func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
 		if len(request) == 1024 {
 			return nil, 0, time.Time{}, errors.New("strict peer ignored legacy-sized request")
 		}
-		parsed, err := protocol.ParseRequest(request)
+		parsed, err := protocol.ParseRequestWithMode(request, protocol.Flex)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,7 +147,7 @@ func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
 		if want := protocol.ComputeSRV(rootPK); !bytes.Equal(parsed.SRV, want) {
 			t.Fatalf("SRV = %x, want %x", parsed.SRV, want)
 		}
-		replies, err := protocol.CreateReplies(protocol.VersionDraft11, []protocol.Request{*parsed}, now, time.Second, cert)
+		replies, err := protocol.CreateRepliesWithOptions(protocol.VersionDraft11, []protocol.Request{*parsed}, now, time.Second, cert, protocol.ReplyOptions{Mode: protocol.Flex})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -176,6 +178,7 @@ func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
 	}
 }
 
+// TestProbeSharesBackoffAcrossForms checks retry state across version probes.
 func TestProbeSharesBackoffAcrossForms(t *testing.T) {
 	restoreProbeGlobals(t)
 	*retries = 1
@@ -203,6 +206,62 @@ func TestProbeSharesBackoffAcrossForms(t *testing.T) {
 	}
 }
 
+// TestProbeRetryResponseFreshness checks replay rejection in both modes.
+func TestProbeRetryResponseFreshness(t *testing.T) {
+	for name, mode := range map[string]protocol.Mode{"strict": protocol.Strict, "flex": protocol.Flex} {
+		t.Run(name, func(t *testing.T) {
+			restoreProbeGlobals(t)
+			*flex = mode == protocol.Flex
+			*retries = 3
+			*timeout = time.Second
+			rootSK := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{1}, ed25519.SeedSize))
+			onlineSK := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{2}, ed25519.SeedSize))
+			rootPK := rootSK.Public().(ed25519.PublicKey)
+			now := time.Now()
+			cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var requests [][]byte
+			var firstReply []byte
+			probeRoundTrip = func(_ context.Context, request []byte, _ time.Duration, _ string) ([]byte, time.Duration, time.Time, error) {
+				requests = append(requests, bytes.Clone(request))
+				parsed, err := protocol.ParseRequest(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replies, err := protocol.CreateReplies(protocol.Version1, []protocol.Request{*parsed}, now, time.Second, cert)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reply := replies[0]
+				switch len(requests) {
+				case 1:
+					firstReply = bytes.Clone(reply)
+					reply[0] ^= 1
+				case 2:
+					reply = firstReply
+				}
+				return reply, time.Millisecond, now, nil
+			}
+			state := &debugRetryState{wait: func(context.Context, time.Duration) error { return nil }}
+			result := probe(context.Background(), rootPK, probePlan{version: protocol.Version1}, "udp", state)
+			wantAttempts := 3
+			if result.err != nil || len(requests) != wantAttempts {
+				t.Fatalf("probe attempts=%d error=%v, want %d successful attempts", len(requests), result.err, wantAttempts)
+			}
+			if same := bytes.Equal(requests[0], requests[1]); same {
+				t.Fatalf("retry request unchanged=%t for %s", same, name)
+			}
+			if !bytes.Equal(result.request, requests[len(requests)-1]) {
+				t.Fatal("probe retained a different request")
+			}
+		})
+	}
+}
+
+// TestProbeRetainsInvalidReplyAcrossLaterTimeout preserves evidence after a
+// timeout.
 func TestProbeRetainsInvalidReplyAcrossLaterTimeout(t *testing.T) {
 	restoreProbeGlobals(t)
 	*retries = 2
@@ -247,16 +306,21 @@ func TestProbeRetainsInvalidReplyAcrossLaterTimeout(t *testing.T) {
 	}
 }
 
+// restoreProbeGlobals enables flex probes and restores settings after the test.
 func restoreProbeGlobals(t *testing.T) {
 	t.Helper()
 	oldRetries, oldTimeout, oldRoundTrip := *retries, *timeout, probeRoundTrip
+	oldFlex := *flex
+	*flex = true
 	t.Cleanup(func() {
+		*flex = oldFlex
 		*retries = oldRetries
 		*timeout = oldTimeout
 		probeRoundTrip = oldRoundTrip
 	})
 }
 
+// captureStdout returns the text printed by fn.
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	reader, writer, err := os.Pipe()

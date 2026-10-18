@@ -1,10 +1,10 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-// Command roughtime-bench is a closed-loop Roughtime load generator. It has no
-// rate limit or reconnect backoff and must only target servers you control.
-// Latency percentiles use a run-wide bounded reservoir. -verify excludes
-// unauthenticated replies from it. ML-DSA-44 always uses TCP.
+// Command roughtime-bench is a closed-loop load generator for servers you
+// control. Strict mode authenticates RFC responses and applies client backoff.
+// Flex mode uses persistent sockets with optional verification. Latency
+// percentiles use a run-wide bounded reservoir. ML-DSA-44 requires TCP.
 package main
 
 import (
@@ -25,14 +25,15 @@ import (
 )
 
 var (
+	flex = flag.Bool("flex", false, "use draft compatibility and persistent load-generator sockets")
 	// addr is the target endpoint flag.
-	addr = flag.String("addr", "127.0.0.1:2002", "server host:port")
+	addr = flag.String("addr", "127.0.0.1:5319", "server host:port (flex default: 127.0.0.1:2002)")
 	// pubkey is the root public-key flag.
 	pubkey = flag.String("pubkey", "", "root public key (base64 or hex). 32 bytes selects Ed25519, 1312 bytes selects ML-DSA-44")
 	// useTCP selects TCP for Ed25519.
 	useTCP = flag.Bool("tcp", false, "use TCP transport. ML-DSA-44 keys always use TCP")
-	// workers sets concurrent client sockets.
-	workers = flag.Int("workers", 64, "concurrent client sockets")
+	// workers sets concurrent query workers.
+	workers = flag.Int("workers", 64, "concurrent query workers")
 	// duration sets the measurement period.
 	duration = flag.Duration("duration", 10*time.Second, "measurement duration")
 	// warmup sets the unmeasured warmup period.
@@ -40,7 +41,7 @@ var (
 	// timeout bounds each request.
 	timeout = flag.Duration("timeout", 500*time.Millisecond, "per-request read/write timeout")
 	// verify enables response authentication.
-	verify = flag.Bool("verify", false, "verify every reply's signature and Merkle proof (slower, client-bound)")
+	verify = flag.Bool("verify", false, "authenticate replies in flex mode (strict mode always verifies)")
 	// showVersion requests version output and exit.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -68,6 +69,9 @@ type workerResult struct {
 
 // benchConfig is immutable configuration shared by workers.
 type benchConfig struct {
+	// client authenticates strict queries and shares retry backoff across
+	// workers.
+	client    *roughtime.Client
 	addr      string
 	transport string
 	rootPK    []byte
@@ -94,9 +98,9 @@ func main() {
 	fmt.Fprintln(os.Stderr, "WARNING: closed-loop load generator. Do not target servers you do not own.")
 
 	// Verification can be CPU-bound, so cap default workers.
-	if *verify && !flagSet("workers") {
-		if maxW := runtime.NumCPU() * 2; *workers > maxW {
-			fmt.Fprintf(os.Stderr, "bench: -verify can be CPU-bound. Capping workers %d -> %d (override with -workers)\n", *workers, maxW)
+	if (*verify || !*flex) && !flagSet("workers") {
+		if maxW := runtime.GOMAXPROCS(0) * 2; *workers > maxW {
+			fmt.Fprintf(os.Stderr, "bench: verification can be CPU-bound. Capping workers %d -> %d (override with -workers)\n", *workers, maxW)
 			*workers = maxW
 		}
 	}
@@ -113,7 +117,17 @@ func main() {
 	}
 	srv := protocol.ComputeSRV(rootPK)
 
-	versions := roughtime.VersionsForScheme(sch)
+	if !*flex && sch != roughtime.SchemeEd25519 {
+		fmt.Fprintln(os.Stderr, "bench: ML-DSA-44 requires -flex")
+		os.Exit(1)
+	}
+	versions := roughtime.VersionsForSchemeWithMode(sch, protocolMode())
+	if !*flex {
+		*verify = true
+	}
+	if *flex && !flagSet("addr") {
+		*addr = "127.0.0.1:2002"
+	}
 	transport := "udp"
 	if sch == roughtime.SchemeMLDSA44 || *useTCP {
 		transport = "tcp"
@@ -152,8 +166,11 @@ func main() {
 		verify:    *verify,
 		udpAddr:   udpAddr,
 	}
+	if !*flex {
+		cfg.client = &roughtime.Client{Timeout: *timeout, MaxAttempts: 1}
+	}
 
-	// run warmup and measurement in one pass so sockets stay open across the
+	// Run warmup and measurement in one pass so workers stay active across the
 	// boundary
 	runFor := *warmup + *duration
 	totalCtx, totalCancel := context.WithTimeout(ctx, runFor)
@@ -170,7 +187,7 @@ func main() {
 	// canceled partial run does not understate throughput.
 	elapsed := min(max((<-stopTime).Sub(collectAfter), 0), *duration)
 
-	report(runMeta{workers: *workers, verify: *verify}, results, latencies, elapsed)
+	report(runMeta{workers: *workers, verify: *verify, strict: !*flex}, results, latencies, elapsed)
 }
 
 // flagSet reports whether name was set on the command line.
@@ -248,4 +265,12 @@ func runWorkers(ctx context.Context, cfg benchConfig, n int, collectAfter time.T
 	default:
 	}
 	return results, reservoir.values, nil
+}
+
+// protocolMode returns the mode selected by -flex.
+func protocolMode() protocol.Mode {
+	if *flex {
+		return protocol.Flex
+	}
+	return protocol.Strict
 }

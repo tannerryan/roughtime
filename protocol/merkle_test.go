@@ -87,7 +87,7 @@ func TestMerkleNodeFirstConvention(t *testing.T) {
 		t.Fatal("groupD08: expected node-first")
 	}
 
-	// groupD14 reverted to hash-first in draft 16+
+	// groupD14 defaults to the hash-first convention used by drafts 16-19.
 	tree14 := newMerkleTreeWithOrder(groupD14, [][]byte{d0, d1}, merkleNodeFirst(groupD14))
 	h0_14, h1_14 := leafHash(groupD14, d0), leafHash(groupD14, d1)
 	if !bytes.Equal(tree14.rootHash, nodeHash(groupD14, h0_14, h1_14)) {

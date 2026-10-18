@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Tanner Ryan. All rights reserved. Use of this source code
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
-//go:build unix && !linux && !openbsd
+//go:build unix && !linux
 
 package main
 
@@ -21,52 +21,83 @@ import (
 // socketRecvBuffer is the requested receive-buffer size for each UDP socket.
 const socketRecvBuffer = 8 * 1024 * 1024
 
-// listen runs a single-socket UDP server with inline validation and a
-// channel-fed batcher.
-func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
-	listenLog := logger.Named("listener")
-	maxSize := batchMaxSize
-	maxLatency := batchMaxLatency
-
-	addr, err := net.ResolveUDPAddr("udp", serverListenAddr())
-	if err != nil {
-		return fmt.Errorf("resolving UDP listen address: %w", err)
+// listen serves UDP sockets through the portable path and drains them on
+// cancellation.
+func listen(ctx context.Context, state *atomic.Pointer[certState], listenPort int) error {
+	log := logger.Named("listener")
+	addr := serverListenAddr(listenPort)
+	networks := listenNetworks("udp", addr)
+	conns := make([]*net.UDPConn, 0, len(networks))
+	// closeAll also releases sockets bound before a startup failure.
+	closeAll := func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
 	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return fmt.Errorf("starting UDP server: %w", err)
+	for _, network := range networks {
+		udpAddr, err := net.ResolveUDPAddr(network, addr)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("resolving %s listen address: %w", network, err)
+		}
+		conn, err := net.ListenUDP(network, udpAddr)
+		if err != nil {
+			closeAll()
+			return fmt.Errorf("starting %s server: %w", network, err)
+		}
+		applyReadBuffer(log, conn)
+		conns = append(conns, conn)
 	}
-	applyReadBuffer(listenLog, conn)
-
-	batchCh := make(chan validatedRequest, batchQueueSize)
-
-	var batcherWg sync.WaitGroup
-	batcherLog := logger.Named("batcher")
-	// per-iteration recovery lives inside batcher so batches persist and
-	// close(batchCh) on shutdown isn't raced by a restart
-	batcherWg.Go(func() {
-		batcher(ctx, batcherLog, udpConnReplyWriter{conn: conn}, state, batchCh, maxSize, maxLatency)
-	})
-
-	listenLog.Info("listening",
-		zap.String("addr", conn.LocalAddr().String()),
-		zap.Int("port", *port),
+	log.Info("listening",
+		zap.String("addr", addr),
+		zap.Strings("networks", networks),
+		zap.Int("port", listenPort),
 		zap.Int("queue_size", batchQueueSize),
 	)
 
-	// past deadline unblocks the read loop without closing the socket while
-	// in-flight work still holds it
+	// Deadlines unblock reads while queued replies retain socket ownership.
 	go func() {
 		<-ctx.Done()
-		listenLog.Info("shutdown initiated, unblocking reads")
-		_ = conn.SetDeadline(time.Unix(1, 0))
+		for _, conn := range conns {
+			_ = conn.SetDeadline(time.Unix(1, 0))
+		}
 	}()
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		wg.Go(func() {
+			serveUDP(ctx, log.With(zap.Stringer("addr", conn.LocalAddr())), state, conn, isFlexPort(listenPort))
+		})
+	}
+	<-ctx.Done()
+	drainStart := time.Now()
+	wg.Wait()
+	closeAll()
+	log.Info("shutdown complete",
+		zap.Uint64("received_total", requestsReceived.total()),
+		zap.Uint64("responded_total", requestsResponded.total()),
+		zap.Uint64("dropped_total", requestsDropped.total()),
+		zap.Uint64("amp_suppressed_total", statsAmpDropped.Load()),
+		zap.Uint64("panics_total", statsPanics.Load()),
+		zap.Uint64("batches_total", statsBatches.Load()),
+		zap.Uint64("batched_reqs_total", statsBatchedReqs.Load()),
+		zap.Uint64("batch_errs_total", statsBatchErrs.Load()),
+		zap.Duration("drain_duration", time.Since(drainStart)),
+	)
+	return nil
+}
 
+// serveUDP validates one socket's datagrams and drains its batcher on shutdown.
+func serveUDP(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], conn *net.UDPConn, allowDrafts bool) {
+	batchCh := make(chan validatedRequest, batchQueueSize)
+	var batcherWg sync.WaitGroup
+	batcherWg.Go(func() {
+		batcher(ctx, log.Named("batcher"), udpConnReplyWriter{conn: conn}, state, batchCh, batchMaxSize, batchMaxLatency)
+	})
 	// readOne does one read-dispatch iteration and returns true on shutdown. A
 	// recovered panic discards the in-flight pooled buffer. The garbage
 	// collector can reclaim it.
 	readOne := func() bool {
-		defer recoverGoroutine(listenLog, "listen")
+		defer recoverGoroutine(log, "listen")
 
 		bufPtr := bufPool.Get().(*[]byte)
 		reqLen, _, flags, peer, err := conn.ReadMsgUDP(*bufPtr, nil)
@@ -75,7 +106,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			if ctx.Err() != nil {
 				return true
 			}
-			listenLog.Warn("UDP read error", zap.Error(err))
+			log.Warn("UDP read error", zap.Error(err))
 			// throttle so a wedged socket can't spin a core, ctx.Done preempts
 			select {
 			case <-ctx.Done():
@@ -87,21 +118,21 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 		if flags&unix.MSG_TRUNC != 0 || reqLen > maxPacketSize {
 			bufPool.Put(bufPtr)
 			incDropped(transportUDP, dropOversize)
-			if ce := listenLog.Check(zap.DebugLevel, "dropped truncated UDP request"); ce != nil {
+			if ce := log.Check(zap.DebugLevel, "dropped truncated UDP request"); ce != nil {
 				ce.Write(zap.Stringer("peer", peer), zap.Int("reported_size", reqLen), zap.Int("buffer_size", len(*bufPtr)))
 			}
 			return false
 		}
-		// undersize packets are always droppable per the drafts
+		// Responses to undersized requests are optional.
 		if reqLen < minRequestSize {
 			bufPool.Put(bufPtr)
 			incDropped(transportUDP, dropUndersize)
-			if ce := listenLog.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
+			if ce := log.Check(zap.DebugLevel, "dropped undersize request"); ce != nil {
 				ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen))
 			}
 			return false
 		}
-		vr, reason, ok := validateRequest(listenLog, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, state.Load())
+		vr, reason, ok := validateRequest(log, (*bufPtr)[:reqLen], peer, reqLen, bufPtr, state.Load(), allowDrafts)
 		if !ok {
 			bufPool.Put(bufPtr)
 			incDropped(transportUDP, reason)
@@ -115,7 +146,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			incDropped(transportUDP, dropQueue)
 			// hot path under overload, so gate the per-drop log. The dropQueue
 			// metric is the source of truth
-			if ce := listenLog.Check(zap.DebugLevel, "dropped request: batcher queue full"); ce != nil {
+			if ce := log.Check(zap.DebugLevel, "dropped request: batcher queue full"); ce != nil {
 				ce.Write(zap.Stringer("peer", peer), zap.Int("size", reqLen), zap.Int("queue_size", batchQueueSize))
 			}
 		}
@@ -124,22 +155,8 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 	for !readOne() {
 	}
 
-	drainStart := time.Now()
 	close(batchCh)
 	batcherWg.Wait()
-	_ = conn.Close()
-	listenLog.Info("shutdown complete",
-		zap.Uint64("received_total", requestsReceived.total()),
-		zap.Uint64("responded_total", requestsResponded.total()),
-		zap.Uint64("dropped_total", requestsDropped.total()),
-		zap.Uint64("amp_suppressed_total", statsAmpDropped.Load()),
-		zap.Uint64("panics_total", statsPanics.Load()),
-		zap.Uint64("batches_total", statsBatches.Load()),
-		zap.Uint64("batched_reqs_total", statsBatchedReqs.Load()),
-		zap.Uint64("batch_errs_total", statsBatchErrs.Load()),
-		zap.Duration("drain_duration", time.Since(drainStart)),
-	)
-	return nil
 }
 
 // udpConnReplyWriter is the portable one-datagram-at-a-time writer.

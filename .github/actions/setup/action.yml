@@ -1,5 +1,5 @@
 name: Set up Go
-description: Configure Go from go.mod, optionally installing Makefile dev tools.
+description: Configure Go, optionally installing Makefile dev tools.
 
 inputs:
   install-tools:
@@ -11,7 +11,7 @@ runs:
   steps:
     - uses: actions/setup-go@v7
       with:
-        go-version-file: go.mod
+        go-version: "1.27.x"
         check-latest: true
 
     - if: inputs.install-tools == 'true'

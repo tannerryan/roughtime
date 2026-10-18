@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/protocol"
 )
 
@@ -116,10 +117,41 @@ func closeOnCancel(ctx context.Context, conn net.Conn) func() {
 
 // worker dispatches to a transport driver. Cancellation is not an error.
 func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) error {
+	if cfg.client != nil {
+		return workerStrict(ctx, cfg, out, collectAfter)
+	}
 	if cfg.transport == "tcp" {
 		return workerTCP(ctx, cfg, out, collectAfter)
 	}
 	return workerUDP(ctx, cfg, out, collectAfter)
+}
+
+// workerStrict uses the shared client to authenticate replies and retain backoff.
+func workerStrict(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) error {
+	server := roughtime.Server{PublicKey: cfg.rootPK, Addresses: []roughtime.Address{{Transport: cfg.transport, Address: cfg.addr}}}
+	for !contextStopped(ctx) {
+		start := time.Now()
+		response, err := cfg.client.Query(ctx, server)
+		if contextStopped(ctx) {
+			return nil
+		}
+		bumpAfter(start, collectAfter, &out.sent)
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
+				bumpAfter(start, collectAfter, &out.timeouts)
+			} else {
+				bumpAfter(start, collectAfter, &out.errRead)
+			}
+			continue
+		}
+		if !start.Before(collectAfter) {
+			out.received++
+			recordLatency(out, response.RTT)
+			out.successes++
+			cfg.latencies.record(response.RTT)
+		}
+	}
+	return nil
 }
 
 // workerUDP runs one UDP loop until cancellation or a fatal initialization or
@@ -138,7 +170,7 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		_ = conn.Close()
 	}()
 
-	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
+	nonce, req, err := protocol.CreateRequestWithOptions(cfg.versions, rand.Reader, cfg.srv, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		return fmt.Errorf("create UDP request: %w", err)
 	}
@@ -221,7 +253,7 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 		}
 
 		if verify {
-			if _, _, err := protocol.VerifyReply(cfg.versions, buf[:n], cfg.rootPK, nonce, req); err != nil {
+			if _, _, err := protocol.VerifyReplyWithOptions(cfg.versions, buf[:n], cfg.rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 				// grease and genuine faults share this bucket
 				if collect {
 					out.errVerify++
@@ -258,7 +290,7 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	}()
 	setTCPNoDelay(conn)
 
-	nonce, req, err := protocol.CreateRequest(cfg.versions, rand.Reader, cfg.srv)
+	nonce, req, err := protocol.CreateRequestWithOptions(cfg.versions, rand.Reader, cfg.srv, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		return fmt.Errorf("create TCP request: %w", err)
 	}
@@ -268,9 +300,8 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	}
 
 	// reconnect detaches the old connection's cancellation callback before
-	// closing it, then installs a callback that captures the replacement. No
-	// exponential backoff: this bench is a load generator, not a conformant
-	// client.
+	// closing it, then installs a callback that captures the replacement.
+	// Flex load generation reconnects without backoff.
 	reconnect := func() error {
 		stopClose()
 		_ = conn.Close()
@@ -359,7 +390,7 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 			out.received++
 		}
 		if verify {
-			if _, _, err := protocol.VerifyReply(cfg.versions, pkt, cfg.rootPK, nonce, req); err != nil {
+			if _, _, err := protocol.VerifyReplyWithOptions(cfg.versions, pkt, cfg.rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 				if collect {
 					out.errVerify++
 				}

@@ -12,6 +12,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -102,22 +104,22 @@ func makeGoogleProof(t *testing.T) []byte {
 			t.Fatalf("ed25519 online: %v", err)
 		}
 		now := time.Now()
-		cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+		cert, err := protocol.NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, protocol.ServerPreferenceEd25519)
 		if err != nil {
 			t.Fatalf("NewCertificate: %v", err)
 		}
 		rootPK := rootSK.Public().(ed25519.PublicKey)
-		var c protocol.Chain
+		c := protocol.Chain{Mode: protocol.Flex}
 		for i := range 2 {
 			link, err := c.NextRequest([]protocol.Version{protocol.VersionGoogle}, rootPK, rand.Reader)
 			if err != nil {
 				t.Fatalf("NextRequest: %v", err)
 			}
-			req, err := protocol.ParseRequest(link.Request)
+			req, err := protocol.ParseRequestWithMode(link.Request, protocol.Flex)
 			if err != nil {
 				t.Fatalf("ParseRequest: %v", err)
 			}
-			replies, err := protocol.CreateReplies(protocol.VersionGoogle, []protocol.Request{*req}, now.Add(time.Duration(i)*time.Second), time.Second, cert)
+			replies, err := protocol.CreateRepliesWithOptions(protocol.VersionGoogle, []protocol.Request{*req}, now.Add(time.Duration(i)*time.Second), time.Second, cert, protocol.ReplyOptions{Mode: protocol.Flex})
 			if err != nil {
 				t.Fatalf("CreateReplies: %v", err)
 			}
@@ -136,7 +138,7 @@ func makeGoogleProof(t *testing.T) []byte {
 
 // TestProofLinksGoogleChain covers Google-Roughtime proof links.
 func TestProofLinksGoogleChain(t *testing.T) {
-	p, err := roughtime.ParseProof(makeGoogleProof(t))
+	p, err := roughtime.ParseProofWithMode(makeGoogleProof(t), protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseProof: %v", err)
 	}
@@ -322,6 +324,23 @@ func TestParseProofGzipBomb(t *testing.T) {
 	}
 }
 
+// TestParseProofEntryLimitAllocations checks that a compressed, oversized array
+// is rejected without allocating storage for every entry.
+func TestParseProofEntryLimitAllocations(t *testing.T) {
+	data := gzipReport(t, []byte(`{"responses":[`+strings.Repeat(`{},`, 249999)+`{}]}`))
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := roughtime.ParseProof(data)
+	runtime.ReadMemStats(&after)
+	if err == nil || !strings.Contains(err.Error(), "max") {
+		t.Fatalf("ParseProof: %v, want entry-limit error", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8*1024*1024 {
+		t.Fatalf("allocated %d bytes before rejecting excess entries, want at most 8 MiB", allocated)
+	}
+}
+
 // TestParseProofBadJSON covers malformed proof JSON.
 func TestParseProofBadJSON(t *testing.T) {
 	if _, err := roughtime.ParseProof([]byte("not a malfeasance report")); err == nil {
@@ -331,6 +350,11 @@ func TestParseProofBadJSON(t *testing.T) {
 
 // FuzzParseProof exercises compressed and raw proof parsing.
 func FuzzParseProof(f *testing.F) {
+	rfc, err := os.ReadFile("protocol/testdata/rfc10049-appendix-b.json")
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(rfc)
 	f.Add([]byte(""))
 	f.Add([]byte("{}"))
 	f.Add([]byte(`{"responses":[]}`))
@@ -356,7 +380,10 @@ func FuzzParseProof(f *testing.F) {
 	f.Add(buf.Bytes())
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		p, err := roughtime.ParseProof(data)
+		if strict, err := roughtime.ParseProof(data); err == nil {
+			_ = strict.Verify()
+		}
+		p, err := roughtime.ParseProofWithMode(data, protocol.Flex)
 		if err != nil {
 			return
 		}

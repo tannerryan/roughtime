@@ -93,7 +93,7 @@ func batcher(ctx context.Context, log *zap.Logger, writer udpReplyWriter, state 
 				}
 				return true
 			}
-			key := batchKey{version: vr.version, hasType: vr.req.HasType}
+			key := batchKey{version: vr.version, hasType: vr.req.HasType, rfcOnly: vr.rfcOnly}
 			b, exists := batches[key]
 			if !exists {
 				b = &pending{items: make([]validatedRequest, 0, maxSize), start: time.Now()}

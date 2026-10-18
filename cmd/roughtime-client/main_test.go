@@ -4,7 +4,11 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -39,7 +43,42 @@ func TestClientFlags(t *testing.T) {
 	}
 	*standardSize = false
 	if c := newClient(); c.StandardPacketSize {
-		t.Fatal("newClient changed the legacy sizing default")
+		t.Fatal("newClient enabled -standard-size by default")
+	}
+}
+
+// TestStrictEcosystemMinimum requires three witnesses for strict measurements.
+func TestStrictEcosystemMinimum(t *testing.T) {
+	origFile, origName := *serversFile, *nameFilter
+	origFlex, origTwoPass := *flex, *twoPass
+	t.Cleanup(func() {
+		*serversFile, *nameFilter = origFile, origName
+		*flex, *twoPass = origFlex, origTwoPass
+	})
+	data, err := roughtime.MarshalEcosystem([]roughtime.Server{{
+		Name: "only", Version: "1", PublicKey: make([]byte, 32),
+		Addresses: []roughtime.Address{{Transport: "udp", Address: "localhost:5319"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*serversFile = t.TempDir() + "/servers.json"
+	if err := os.WriteFile(*serversFile, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	*flex, *twoPass, *nameFilter = false, false, ""
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := run(ctx); err == nil || !strings.Contains(err.Error(), "at least 3") {
+		t.Fatalf("strict single-entry measurement: %v", err)
+	}
+	*nameFilter = "only"
+	if err := run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("named single-server query: %v", err)
+	}
+	*flex, *nameFilter = true, ""
+	if err := run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("flex single-server query: %v", err)
 	}
 }
 
@@ -58,7 +97,7 @@ func TestNormalizeServersBeforeSampling(t *testing.T) {
 		},
 		{
 			Name:      "too-old",
-			Version:   "1",
+			Version:   "0",
 			PublicKey: key,
 			Addresses: []roughtime.Address{{Transport: "udp", Address: "old.example:2002"}},
 		},
@@ -147,5 +186,62 @@ func TestTerminalErrorSanitizes(t *testing.T) {
 	got = terminalError(errors.New(strings.Repeat("界", maxCLIErrorRunes+1)))
 	if len([]rune(got)) != maxCLIErrorRunes {
 		t.Fatalf("terminalError length = %d runes, want %d", len([]rune(got)), maxCLIErrorRunes)
+	}
+}
+
+// TestLoadMixedEcosystemInStrictMode separates list syntax from wire support.
+func TestLoadMixedEcosystemInStrictMode(t *testing.T) {
+	origFile, origName := *serversFile, *nameFilter
+	origFlex, origTCP, origAll := *flex, *useTCP, *all
+	t.Cleanup(func() {
+		*serversFile, *nameFilter = origFile, origName
+		*flex, *useTCP, *all = origFlex, origTCP, origAll
+	})
+	*flex, *useTCP, *all = false, false, false
+	data, err := json.Marshal(map[string]any{"servers": []map[string]any{
+		{
+			"name": "rfc", "version": "1", "publicKeyType": "ed25519",
+			"publicKey": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+			"addresses": []map[string]string{{"protocol": "udp", "address": "rfc.example:5319"}},
+		},
+		{
+			"name": "pq", "version": "ml-dsa-44", "publicKeyType": "ml-dsa-44",
+			"publicKey": base64.StdEncoding.EncodeToString(make([]byte, protocol.MLDSA44PublicKeySize)),
+			"addresses": []map[string]string{{"protocol": "tcp", "address": "pq.example:5319"}},
+		},
+		{
+			"name": "google", "version": "Google-Roughtime", "publicKeyType": "ed25519",
+			"publicKey": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+			"addresses": []map[string]string{{"protocol": "udp", "address": "google.example:2002"}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*serversFile = t.TempDir() + "/servers.json"
+	if err := os.WriteFile(*serversFile, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	*nameFilter = "rfc"
+	servers, err := loadServers()
+	if err != nil || len(servers) != 1 || servers[0].Version != "1" {
+		t.Fatalf("named RFC query: %v, %v", servers, err)
+	}
+	if newClient().Mode != protocol.Strict {
+		t.Fatal("mixed list enabled flex wire support")
+	}
+	*nameFilter = "pq"
+	if _, err := loadServers(); err == nil || !strings.Contains(err.Error(), "requires flex mode") {
+		t.Fatalf("named PQ query without -flex: %v", err)
+	}
+	*nameFilter, *all = "", true
+	servers, err = loadServers()
+	if err != nil || len(servers) != 1 || servers[0].Name != "rfc" {
+		t.Fatalf("strict filtering: %v, %v", servers, err)
+	}
+	*flex = true
+	servers, err = loadServers()
+	if err != nil || len(servers) != 3 {
+		t.Fatalf("flex filtering: %v, %v", servers, err)
 	}
 }

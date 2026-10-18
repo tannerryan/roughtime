@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 )
 
@@ -41,15 +42,19 @@ type ChainLink struct {
 // Chain accumulates sequential Roughtime queries for causal ordering and
 // malfeasance reporting. It is not safe for concurrent use.
 type Chain struct {
+	// Mode selects strict or flex protocol support.
+	Mode Mode
 	// Links holds the chain's queries in order.
 	Links []ChainLink
 }
 
 // ChainNonce derives the next link's nonce, returning random bytes for the
-// first link. Later links use H(prevResponse || rand), except draft-01, which
-// specifies H(H(prevResponse) || rand).
+// first link. Later links use H(prevResponse || rand), except Google and
+// draft-01, which specify H(H(prevResponse) || rand). Offers mixing draft 01
+// with drafts 02-04 are rejected when those versions share the selected nonce
+// size.
 func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (nonce, rand []byte, err error) {
-	_, g, err := clientVersionPreference(versions)
+	g, err := chainNonceGroup(versions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,10 +78,23 @@ func ChainNonce(prevResponse []byte, entropy io.Reader, versions []Version) (non
 	return nonce, rand, nil
 }
 
+// chainNonceGroup rejects offers whose retained versions use incompatible nonce
+// derivations. Request construction omits versions with other nonce sizes.
+func chainNonceGroup(versions []Version) (wireGroup, error) {
+	_, g, err := clientVersionPreference(versions)
+	if err != nil {
+		return 0, err
+	}
+	if (g == groupD02 || g == groupD03) && slices.Contains(versions, VersionDraft01) {
+		return 0, errors.New("protocol: chain offer mixes incompatible nonce derivations")
+	}
+	return g, nil
+}
+
 // deriveChainNonce applies the version-specific chain hash.
 func deriveChainNonce(response, blind []byte, group wireGroup, size int) []byte {
 	h := sha512.New()
-	if group == groupD01 {
+	if group == groupD01 || group == groupGoogle {
 		sum := sha512.Sum512(response)
 		_, _ = h.Write(sum[:])
 	} else {
@@ -106,7 +124,7 @@ func (c *Chain) NextRequest(versions []Version, rootPK []byte, entropy io.Reader
 	if srv == nil {
 		return ChainLink{}, errors.New("protocol: unsupported root key length")
 	}
-	request, err := CreateRequestWithNonce(versions, nonce, srv)
+	request, err := CreateRequestWithNonceOptions(versions, nonce, srv, RequestOptions{Mode: c.Mode})
 	if err != nil {
 		return ChainLink{}, fmt.Errorf("protocol: create chained request: %w", err)
 	}
@@ -129,7 +147,7 @@ func (c *Chain) NextRequestWithNonce(versions []Version, rootPK, nonce []byte) (
 	if srv == nil {
 		return ChainLink{}, errors.New("protocol: unsupported root key length")
 	}
-	request, err := CreateRequestWithNonce(versions, nonce, srv)
+	request, err := CreateRequestWithNonceOptions(versions, nonce, srv, RequestOptions{Mode: c.Mode})
 	if err != nil {
 		return ChainLink{}, fmt.Errorf("protocol: create chained request: %w", err)
 	}
@@ -149,7 +167,7 @@ func (c *Chain) Append(link ChainLink) {
 type Bound struct {
 	// Midpoint is the authenticated center of the server's time interval.
 	Midpoint time.Time
-	// Radius is the authenticated uncertainty around Midpoint.
+	// Radius covers authenticated uncertainty and any leap-second conversion.
 	Radius time.Duration
 }
 
@@ -174,7 +192,7 @@ func (c *Chain) VerifyBounds() ([]Bound, error) {
 
 	for i := range c.Links {
 		link := &c.Links[i]
-		req, err := ParseRequest(link.Request)
+		req, err := ParseRequestWithMode(link.Request, c.Mode)
 		if err != nil {
 			return nil, fmt.Errorf("protocol: chain link %d: parse request: %w", i, err)
 		}
@@ -183,9 +201,10 @@ func (c *Chain) VerifyBounds() ([]Bound, error) {
 		if len(versions) == 0 {
 			versions = []Version{VersionGoogle}
 		}
+		versions = filterKnownVersions(versions, c.Mode)
 
 		if i > 0 {
-			_, g, err := clientVersionPreference(versions)
+			g, err := chainNonceGroup(versions)
 			if err != nil {
 				return nil, fmt.Errorf("protocol: chain link %d: %w", i, err)
 			}
@@ -194,12 +213,20 @@ func (c *Chain) VerifyBounds() ([]Bound, error) {
 				return nil, fmt.Errorf("protocol: chain link %d: %w: rand is %d bytes, want %d", i, ErrChainNonce, len(link.Rand), ns)
 			}
 			want := deriveChainNonce(c.Links[i-1].Response, link.Rand, g, ns)
+			if g == groupGoogle && !bytes.Equal(req.Nonce, want) {
+				// Preserve proofs created by this library's older single-hash
+				// format.
+				h := sha512.New()
+				_, _ = h.Write(c.Links[i-1].Response)
+				_, _ = h.Write(link.Rand)
+				want = h.Sum(nil)
+			}
 			if !bytes.Equal(req.Nonce, want) {
 				return nil, fmt.Errorf("protocol: chain link %d: %w", i, ErrChainNonce)
 			}
 		}
 
-		midpoint, radius, err := VerifyReply(versions, link.Response, link.PublicKey, req.Nonce, link.Request)
+		midpoint, radius, err := VerifyReplyWithOptions(versions, link.Response, link.PublicKey, req.Nonce, link.Request, VerifyOptions{Mode: c.Mode})
 		if err != nil {
 			return nil, fmt.Errorf("protocol: chain link %d: verify: %w", i, err)
 		}

@@ -26,7 +26,7 @@ func TestWireGroupOf(t *testing.T) {
 		{VersionDraft08, false, groupD08},
 		{VersionDraft09, false, groupD08},
 		{VersionDraft10, false, groupD10},
-		{VersionDraft11, false, groupD10},
+		{VersionDraft11, false, groupD11},
 		{VersionDraft12, false, groupD12},
 		{VersionDraft12, true, groupD14},
 	}
@@ -89,7 +89,7 @@ func TestSigningContextsMatchSpec(t *testing.T) {
 	}{
 		{"delegation old (Google, drafts 01-06/08-11)", delegationCtxOld, []byte("RoughTime v1 delegation signature--\x00")},
 		{"delegation new (draft 07, drafts 12+)", delegationCtxNew, []byte("RoughTime v1 delegation signature\x00")},
-		{"response (all versions)", responseCtx, []byte("RoughTime v1 response signature\x00")},
+		{"response (Google and drafts)", responseCtx, []byte("RoughTime v1 response signature\x00")},
 	}
 	for _, tt := range tests {
 		if !bytes.Equal(tt.got, tt.want) {

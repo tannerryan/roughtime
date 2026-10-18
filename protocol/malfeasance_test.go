@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -19,7 +21,7 @@ func TestMalfeasanceReportRoundTrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	parsed, err := ParseMalfeasanceReport(data)
+	parsed, err := ParseMalfeasanceReportWithMode(data, Flex)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -49,7 +51,7 @@ func TestMalfeasanceReportRoundTrip(t *testing.T) {
 
 // TestParseMalfeasanceReportRejectsMalformed covers invalid reports.
 func TestParseMalfeasanceReportRejectsMalformed(t *testing.T) {
-	if _, err := ParseMalfeasanceReport([]byte(`not json`)); err == nil {
+	if _, err := ParseMalfeasanceReportWithMode([]byte(`not json`), Flex); err == nil {
 		t.Fatal("expected error for malformed JSON")
 	}
 }
@@ -74,7 +76,7 @@ func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 		t.Fatalf("legacy arrays length mismatch: nonces=%d want=%d responses=%d want=%d",
 			len(probe.Nonces), len(c.Links)-1, len(probe.Responses), len(c.Links))
 	}
-	parsed, err := ParseMalfeasanceReport(data)
+	parsed, err := ParseMalfeasanceReportWithMode(data, Flex)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -93,13 +95,13 @@ func TestMalfeasanceReportRoundTripDraft10(t *testing.T) {
 		}
 	}
 
-	// Accept the equal-length shape emitted by earlier versions.
+	// Accept the compatible equal-length shape.
 	probe.Nonces = append([]string{""}, probe.Nonces...)
 	oldData, err := json.Marshal(probe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ParseMalfeasanceReport(oldData); err != nil {
+	if _, err := ParseMalfeasanceReportWithMode(oldData, Flex); err != nil {
 		t.Fatalf("parse compatible legacy shape: %v", err)
 	}
 }
@@ -118,7 +120,7 @@ func TestMalfeasanceReportRoundTripDraft01(t *testing.T) {
 	if len(report) != 2 || report[0].Blind == "" {
 		t.Fatal("invalid early report shape")
 	}
-	parsed, err := ParseMalfeasanceReport(data)
+	parsed, err := ParseMalfeasanceReportWithMode(data, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +131,11 @@ func TestMalfeasanceReportRoundTripDraft01(t *testing.T) {
 
 // FuzzParseMalfeasanceReport exercises historical report parsing.
 func FuzzParseMalfeasanceReport(f *testing.F) {
+	rfc, err := os.ReadFile("testdata/rfc10049-appendix-b.json")
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(rfc)
 	// seedResponse is one response in the valid fuzzer seed.
 	type seedResponse struct {
 		Rand      string `json:"rand,omitempty"`
@@ -171,7 +178,17 @@ func FuzzParseMalfeasanceReport(f *testing.F) {
 	f.Add([]byte(`{"responses":[{"publicKey":"!!!","request":"!!!","response":"!!!"}]}`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		chain, err := ParseMalfeasanceReport(data)
+		if strict, err := ParseMalfeasanceReport(data); err == nil {
+			out, err := strict.MalfeasanceReport()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ParseMalfeasanceReport(out); err != nil {
+				t.Fatal(err)
+			}
+			_ = strict.Verify()
+		}
+		chain, err := ParseMalfeasanceReportWithMode(data, Flex)
 		if err != nil {
 			return
 		}
@@ -179,21 +196,24 @@ func FuzzParseMalfeasanceReport(f *testing.F) {
 		if err != nil {
 			return
 		}
-		chain2, err := ParseMalfeasanceReport(out)
+		chain2, err := ParseMalfeasanceReportWithMode(out, Flex)
 		if err != nil {
 			t.Fatalf("round-trip failed: %v", err)
 		}
 		if len(chain2.Links) != len(chain.Links) {
 			t.Fatalf("link count mismatch: %d vs %d", len(chain2.Links), len(chain.Links))
 		}
+		// Historical formats omit request/key metadata and the first link's
+		// unused blind.
+		preservesMetadata := chain.inferMalfeasanceFormat() == malfeasanceFormatModern
 		for i := range chain.Links {
-			if !bytes.Equal(chain.Links[i].Rand, chain2.Links[i].Rand) {
+			if (preservesMetadata || i > 0) && !bytes.Equal(chain.Links[i].Rand, chain2.Links[i].Rand) {
 				t.Fatalf("link %d rand mismatch", i)
 			}
-			if !bytes.Equal(chain.Links[i].PublicKey, chain2.Links[i].PublicKey) {
+			if preservesMetadata && !bytes.Equal(chain.Links[i].PublicKey, chain2.Links[i].PublicKey) {
 				t.Fatalf("link %d publicKey mismatch", i)
 			}
-			if !bytes.Equal(chain.Links[i].Request, chain2.Links[i].Request) {
+			if preservesMetadata && !bytes.Equal(chain.Links[i].Request, chain2.Links[i].Request) {
 				t.Fatalf("link %d request mismatch", i)
 			}
 			if !bytes.Equal(chain.Links[i].Response, chain2.Links[i].Response) {
@@ -210,20 +230,40 @@ func TestParseMalfeasanceReportRejectsTooManyLinks(t *testing.T) {
 	for i := range entries {
 		entries[i] = `""`
 	}
-	data := []byte(`{"nonces":[` + joinStrings(entries) + `],"responses":[` + joinStrings(entries) + `]}`)
-	if _, err := ParseMalfeasanceReport(data); err == nil {
+	data := []byte(`{"nonces":[` + strings.Join(entries, ",") + `],"responses":[` + strings.Join(entries, ",") + `]}`)
+	if _, err := ParseMalfeasanceReportWithMode(data, Flex); err == nil {
 		t.Fatal("expected error for too many links")
 	}
 }
 
-// joinStrings joins JSON fragments with commas.
-func joinStrings(parts []string) string {
-	var b []byte
-	for i, p := range parts {
-		if i > 0 {
-			b = append(b, ',')
+// TestReportArrayLimitBeforeDecode rejects excess entries before decoding their
+// fields.
+func TestReportArrayLimitBeforeDecode(t *testing.T) {
+	for _, data := range []string{
+		`[` + strings.Repeat(`{},`, MaxChainLinks) + `false]`,
+		`{"nonces":[` + strings.Repeat(`"",`, MaxChainLinks) + `false],"responses":["AA=="]}`,
+	} {
+		if _, err := ParseMalfeasanceReportWithMode([]byte(data), Flex); err == nil || !strings.Contains(err.Error(), "max") {
+			t.Fatalf("expected entry-limit error before decoding excess value, got %v", err)
 		}
-		b = append(b, p...)
 	}
-	return string(b)
+}
+
+// TestReportArrayJSONCompatibility preserves null and duplicate-key behavior.
+func TestReportArrayJSONCompatibility(t *testing.T) {
+	var report malfeasanceReportLegacy
+	if err := json.Unmarshal([]byte(`{"responses":["old"],"responses":["new"],"nonces":null}`), &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Responses) != 1 || report.Responses[0] != "new" || report.Nonces != nil {
+		t.Fatalf("unexpected replacement: %+v", report)
+	}
+	if err := json.Unmarshal([]byte(`{"responses":null}`), &report); err != nil || report.Responses != nil {
+		t.Fatalf("null did not clear array: %+v, %v", report, err)
+	}
+	for _, value := range []string{`{}`, `false`, `1`, `"value"`} {
+		if err := json.Unmarshal([]byte(`{"responses":`+value+`}`), &report); err == nil {
+			t.Fatalf("accepted non-array %s", value)
+		}
+	}
 }

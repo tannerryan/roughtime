@@ -75,6 +75,20 @@ func TestDecodeTimestampUnixSeconds(t *testing.T) {
 	}
 }
 
+// TestTimestampTimeRange rejects values that overflow Go's time representation.
+func TestTimestampTimeRange(t *testing.T) {
+	var buf [8]byte
+	for _, sec := range []uint64{math.MaxInt64, math.MaxUint64} {
+		binary.LittleEndian.PutUint64(buf[:], sec)
+		if _, err := DecodeTimestamp(Version1, buf[:]); err == nil {
+			t.Fatalf("accepted timestamp %d", sec)
+		}
+	}
+	if err := validateTimestampEncoding(time.Unix(math.MaxInt64, 0), groupRFC); err == nil {
+		t.Fatal("accepted an unrepresentable timestamp for encoding")
+	}
+}
+
 // TestDecodeTimestampPublic covers the exported decoder's validation and
 // version-specific dispatch.
 func TestDecodeTimestampPublic(t *testing.T) {

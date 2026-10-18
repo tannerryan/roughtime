@@ -3,8 +3,9 @@
 
 // Package roughtime provides a concurrent high-level Roughtime client,
 // multi-server consensus and causal chains, ecosystem parsing, and offline
-// timestamp proofs. The zero [Client] is ready for use. Wire-level callers
-// should use the protocol subpackage.
+// timestamp proofs. The zero [Client] uses strict RFC 10049 mode. Set its Mode
+// to protocol.Flex for draft and extension interoperability. Wire-level callers
+// can use the protocol subpackage.
 package roughtime
 
 import (
@@ -38,9 +39,9 @@ var retryInitMu sync.Mutex
 type Server struct {
 	// Name identifies the server for logs and error messages.
 	Name string
-	// Version is an optional ecosystem label. [VersionLabelGoogle] and the
-	// numeric Google ecosystem version select Google-Roughtime. Other numeric
-	// values cap advertised scheme-compatible versions.
+	// Version is an optional server-list version cap or textual ecosystem
+	// label. [VersionLabelGoogle] and its numeric equivalent select
+	// Google-Roughtime in flex mode.
 	Version string
 	// PublicKey is the server's long-term root public key (32 bytes Ed25519 or
 	// 1312 bytes ML-DSA-44).
@@ -98,28 +99,29 @@ func (cr *ChainResult) Proof() (*Proof, error) {
 // Client runs Roughtime queries and is safe for concurrent use with a usable
 // zero value.
 type Client struct {
+	// Mode selects strict RFC 10049 or flex protocol support.
+	Mode protocol.Mode
 	// Timeout bounds each request/response exchange and defaults to
-	// [DefaultTimeout] when non-positive.
+	// [DefaultTimeout] when non-positive. For caller-bound nonces it includes
+	// earlier attempts and retry backoff in both modes.
 	Timeout time.Duration
 	// MaxAttempts caps attempts per query. Backoff starts at 1s, grows by 1.5,
 	// persists by root key across calls, and resets after a verified response.
-	// Zero tries each configured endpoint once. Negative values mean one
-	// attempt.
+	// Zero tries each usable endpoint once, including strict-mode TCP fallback.
+	// Negative values mean one attempt.
 	MaxAttempts int
 	// Concurrency caps in-flight queries in [Client.QueryAll] and defaults to
 	// [MaxQueryAllConcurrency] when non-positive.
 	Concurrency int
-	// StandardPacketSize pads framed requests to a 1024-byte message body plus
-	// the 12-byte header (an 8192-byte body for ML-DSA-44). The default false
-	// value retains the historical 1024-byte total packet size, or 8192-byte
-	// total for ML-DSA-44, for deployed interoperability.
+	// StandardPacketSize selects a 1024-byte body plus framing in flex mode, or
+	// an 8192-byte body for ML-DSA-44. False selects total-packet padding in
+	// that mode. Strict mode always uses the full 1024-byte body.
 	StandardPacketSize bool
 
 	retry *retryTracker
 }
 
-// retryState is the persistent per-server backoff recommended by drafts 16-17
-// and required by drafts 18-19.
+// retryState tracks persistent per-root exponential backoff.
 type retryState struct {
 	interval   time.Duration
 	notBefore  time.Time
@@ -177,7 +179,7 @@ const DefaultTimeout = 2 * time.Second
 // [Client.QueryAll].
 const MaxQueryAllConcurrency = 64
 
-// Retry backoff schedule from the drafts 16-19 transport guidance.
+// Retry backoff schedule recommended by RFC 10049.
 const (
 	// retryBackoffInitial is the first backoff interval.
 	retryBackoffInitial = 1 * time.Second
@@ -189,7 +191,7 @@ const (
 
 // Query queries s using the client's retry policy.
 func (c *Client) Query(ctx context.Context, s Server) (*Response, error) {
-	plan, err := resolveServer(s)
+	plan, err := resolveServerWithMode(s, c.Mode)
 	if err != nil {
 		return nil, err
 	}
@@ -207,13 +209,14 @@ func (c *Client) queryPlanned(ctx context.Context, s Server, plan serverPlan) (*
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
-	return c.runQuery(ctx, s, plan, nonce, request)
+	return c.runQuery(ctx, s, plan, nonce, request, true)
 }
 
 // QueryWithNonce queries using a caller-supplied nonce (32 bytes IETF, 64 bytes
-// Google-Roughtime).
+// Google-Roughtime). Callers control nonce freshness. Retries retain the nonce
+// and count elapsed time from the first attempt against Timeout.
 func (c *Client) QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*Response, error) {
-	plan, err := resolveServer(s)
+	plan, err := resolveServerWithMode(s, c.Mode)
 	if err != nil {
 		return nil, err
 	}
@@ -225,14 +228,22 @@ func (c *Client) QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*R
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
-	return c.runQuery(ctx, s, plan, nonce, request)
+	return c.runQuery(ctx, s, plan, nonce, request, false)
 }
 
 // runQuery dispatches the prepared request, verifies the reply, and assembles a
 // Response.
-func (c *Client) runQuery(ctx context.Context, s Server, plan serverPlan, nonce, request []byte) (*Response, error) {
-	addr, reply, rtt, localNow, midpoint, radius, err := c.sendWithRetry(ctx, s, plan, request, func(reply []byte) (time.Time, time.Duration, error) {
-		return protocol.VerifyReply(plan.versions, reply, s.PublicKey, nonce, request)
+func (c *Client) runQuery(ctx context.Context, s Server, plan serverPlan, nonce, request []byte, freshNonce bool) (*Response, error) {
+	var refresh func() error
+	if freshNonce {
+		refresh = func() error {
+			var err error
+			nonce, request, err = protocol.CreateRequestWithOptions(plan.versions, rand.Reader, protocol.ComputeSRV(s.PublicKey), c.requestOptions())
+			return err
+		}
+	}
+	addr, reply, rtt, localNow, midpoint, radius, err := c.sendWithRetry(ctx, s, plan, &request, refresh, func(reply []byte) (time.Time, time.Duration, error) {
+		return protocol.VerifyReplyWithOptions(plan.versions, reply, s.PublicKey, nonce, request, protocol.VerifyOptions{Mode: c.Mode})
 	})
 	if err != nil {
 		return nil, err
@@ -253,15 +264,20 @@ func QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*Response, err
 	return defaultClient.QueryWithNonce(ctx, s, nonce)
 }
 
-// requestOptions preserves legacy packet sizing for Client's zero value.
+// requestOptions selects request encoding for the client's mode.
 func (c *Client) requestOptions() protocol.RequestOptions {
-	return protocol.RequestOptions{LegacyPacketSize: !c.StandardPacketSize}
+	return protocol.RequestOptions{Mode: c.Mode, LegacyPacketSize: c.Mode == protocol.Flex && !c.StandardPacketSize}
 }
 
 // Verify re-validates a stored request/reply pair against the server's
 // long-term public key.
 func Verify(pubkey, request, reply []byte) (midpoint time.Time, radius time.Duration, err error) {
-	parsed, err := protocol.ParseRequest(request)
+	return VerifyWithMode(pubkey, request, reply, protocol.Strict)
+}
+
+// VerifyWithMode authenticates a stored exchange under the selected mode.
+func VerifyWithMode(pubkey, request, reply []byte, mode protocol.Mode) (midpoint time.Time, radius time.Duration, err error) {
+	parsed, err := protocol.ParseRequestWithMode(request, mode)
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("roughtime: parse request: %w", err)
 	}
@@ -271,7 +287,8 @@ func Verify(pubkey, request, reply []byte) (midpoint time.Time, radius time.Dura
 	if len(versions) == 0 {
 		versions = []protocol.Version{protocol.VersionGoogle}
 	}
-	return protocol.VerifyReply(versions, reply, pubkey, parsed.Nonce, request)
+	versions = knownVersions(versions, mode)
+	return protocol.VerifyReplyWithOptions(versions, reply, pubkey, parsed.Nonce, request, protocol.VerifyOptions{Mode: mode})
 }
 
 // QueryAll queries each server concurrently and returns slot-aligned Results
@@ -300,7 +317,7 @@ func (c *Client) QueryAll(ctx context.Context, servers []Server) []Result {
 		}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			plan, err := resolveServer(out[i].Server)
+			plan, err := resolveServerWithMode(out[i].Server, c.Mode)
 			if err != nil {
 				out[i].Err = err
 				return
@@ -317,17 +334,17 @@ func (c *Client) QueryAll(ctx context.Context, servers []Server) []Result {
 	return out
 }
 
-// QueryChain queries servers sequentially with causal nonce chaining and
-// per-server errors landing in Results.
+// QueryChain queries servers once in the supplied order with causal nonce
+// chaining. Errors are stored in Results. For a complete RFC measurement,
+// supply two identical passes across at least three independent operators.
 func (c *Client) QueryChain(ctx context.Context, servers []Server) (*ChainResult, error) {
 	return c.queryChain(ctx, servers, nil)
 }
 
-// QueryChainWithNonce is [Client.QueryChain] with the first successful link's
-// nonce set to seed for document timestamping. The seed must be 32 bytes for
-// IETF versions or 64 bytes for Google-Roughtime. Before that link, an
-// otherwise usable server incompatible with the seed aborts the remaining
-// chain.
+// QueryChainWithNonce is [Client.QueryChain] with seed as the first successful
+// link's nonce. Use 32 bytes for IETF or 64 for Google-Roughtime. A seed-size
+// mismatch aborts the chain. Seed retries include prior attempts and backoff in
+// Timeout.
 func (c *Client) QueryChainWithNonce(ctx context.Context, servers []Server, seed []byte) (*ChainResult, error) {
 	if len(seed) == 0 {
 		return nil, errors.New("roughtime: chain seed nonce is empty")
@@ -341,7 +358,7 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 	if len(servers) > protocol.MaxChainLinks {
 		return nil, fmt.Errorf("roughtime: %d servers exceeds max chain length %d", len(servers), protocol.MaxChainLinks)
 	}
-	chain := &protocol.Chain{}
+	chain := &protocol.Chain{Mode: c.Mode}
 	results := make([]Result, len(servers))
 	for i, s := range servers {
 		results[i].Server = s
@@ -349,7 +366,7 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 			results[i].Err = err
 			continue
 		}
-		plan, err := resolveServer(s)
+		plan, err := resolveServerWithMode(s, c.Mode)
 		if err != nil {
 			results[i].Err = err
 			continue
@@ -378,8 +395,23 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 			return &ChainResult{Results: results, chain: chain}, err
 		}
 
-		addr, reply, rtt, localNow, midpoint, radius, err := c.sendWithRetry(ctx, s, plan, link.Request, func(reply []byte) (time.Time, time.Duration, error) {
-			return protocol.VerifyReply(plan.versions, reply, s.PublicKey, link.Nonce, link.Request)
+		var refresh func() error
+		if firstNonce == nil || len(chain.Links) > 0 {
+			refresh = func() error {
+				var previous []byte
+				if len(chain.Links) > 0 {
+					previous = chain.Links[len(chain.Links)-1].Response
+				}
+				var err error
+				link.Nonce, link.Rand, err = protocol.ChainNonce(previous, rand.Reader, plan.versions)
+				if err == nil {
+					link.Request, err = protocol.CreateRequestWithNonceOptions(plan.versions, link.Nonce, protocol.ComputeSRV(s.PublicKey), c.requestOptions())
+				}
+				return err
+			}
+		}
+		addr, reply, rtt, localNow, midpoint, radius, err := c.sendWithRetry(ctx, s, plan, &link.Request, refresh, func(reply []byte) (time.Time, time.Duration, error) {
+			return protocol.VerifyReplyWithOptions(plan.versions, reply, s.PublicKey, link.Nonce, link.Request, protocol.VerifyOptions{Mode: c.Mode})
 		})
 		if err != nil {
 			results[i].Err = err
@@ -394,8 +426,9 @@ func (c *Client) queryChain(ctx context.Context, servers []Server, firstNonce []
 }
 
 // sendWithRetry dispatches and verifies request under the configured retry
-// policy. Backoff persists across calls and resets after a verified response.
-func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, request []byte, verify func([]byte) (time.Time, time.Duration, error)) (addr Address, reply []byte, rtt time.Duration, localNow, midpoint time.Time, radius time.Duration, err error) {
+// policy. refresh supplies a fresh request for retries when the nonce is not
+// caller-bound. Backoff resets after a verified response.
+func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, request *[]byte, refresh func() error, verify func([]byte) (time.Time, time.Duration, error)) (addr Address, reply []byte, rtt time.Duration, localNow, midpoint time.Time, radius time.Duration, err error) {
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -407,6 +440,7 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 		attempts = 1
 	}
 	key := string(s.PublicKey)
+	var firstAttempt time.Time
 	for i := range attempts {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
@@ -415,8 +449,26 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 		if !ok {
 			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctx.Err()
 		}
+		if i > 0 && refresh != nil {
+			if err := refresh(); err != nil {
+				c.releaseRetry(attempt)
+				return Address{}, nil, 0, time.Time{}, time.Time{}, 0, fmt.Errorf("refreshing request: %w", err)
+			}
+		}
+		if i == 0 {
+			firstAttempt = time.Now()
+		}
 		addr = plan.addresses[i%len(plan.addresses)]
-		reply, rtt, localNow, err = roundTrip(ctx, addr, request, timeout)
+		reply, rtt, localNow, err = roundTrip(ctx, addr, *request, timeout)
+		if i > 0 && refresh == nil {
+			rtt = max(rtt, time.Since(firstAttempt))
+		}
+		if err == nil && rtt > timeout {
+			err = errors.New("roughtime: round-trip delay exceeds timeout")
+		}
+		if err == nil && c.Mode == protocol.Strict && strings.EqualFold(addr.Transport, "udp") && len(reply) > len(*request) {
+			err = errors.New("roughtime: UDP response exceeds request size")
+		}
 		if err == nil {
 			midpoint, radius, err = verify(reply)
 			if err == nil {
@@ -589,7 +641,7 @@ func roundTrip(ctx context.Context, addr Address, request []byte, timeout time.D
 	}
 }
 
-// nextBackoff returns the next retry interval per the draft's schedule.
+// nextBackoff returns the next interval in the exponential retry schedule.
 func nextBackoff(cur time.Duration) time.Duration {
 	next := time.Duration(float64(cur) * retryBackoffFactor)
 	if next > retryBackoffMax {
@@ -604,11 +656,16 @@ type serverPlan struct {
 	versions  []protocol.Version
 }
 
-// NormalizeServer checks client compatibility without network I/O. It returns
-// a copy with usable addresses ordered as [Client.Query] will try them.
-// The address slice is cloned, but PublicKey still shares the input's storage.
+// NormalizeServer checks client compatibility without network I/O. It returns a
+// copy with usable addresses ordered as [Client.Query] will try them. The
+// address slice is cloned, but PublicKey still shares the input's storage.
 func NormalizeServer(s Server) (Server, error) {
-	plan, err := resolveServer(s)
+	return NormalizeServerWithMode(s, protocol.Strict)
+}
+
+// NormalizeServerWithMode checks compatibility and orders usable endpoints.
+func NormalizeServerWithMode(s Server, mode protocol.Mode) (Server, error) {
+	plan, err := resolveServerWithMode(s, mode)
 	if err != nil {
 		return Server{}, err
 	}
@@ -617,9 +674,11 @@ func NormalizeServer(s Server) (Server, error) {
 	return out, nil
 }
 
-// resolveServer derives the scheme, orders usable addresses, and returns the
-// VER list to advertise.
-func resolveServer(s Server) (serverPlan, error) {
+// resolveServerWithMode orders usable endpoints and selects the VER offer.
+func resolveServerWithMode(s Server, mode protocol.Mode) (serverPlan, error) {
+	if mode != protocol.Strict && mode != protocol.Flex {
+		return serverPlan{}, errors.New("roughtime: invalid mode")
+	}
 	if len(s.Addresses) == 0 {
 		return serverPlan{}, errors.New("roughtime: server has no addresses")
 	}
@@ -627,11 +686,27 @@ func resolveServer(s Server) (serverPlan, error) {
 	if err != nil {
 		return serverPlan{}, err
 	}
+	if mode == protocol.Strict && (sch != SchemeEd25519 || isGoogleEcosystemVersion(s.Version)) {
+		return serverPlan{}, errors.New("roughtime: server requires flex mode")
+	}
 	addrs, err := pickAddresses(s, sch)
 	if err != nil {
 		return serverPlan{}, err
 	}
-	versions, err := versionsForServer(s, sch)
+	if mode == protocol.Strict {
+		for _, a := range slices.Clone(addrs) {
+			if !strings.EqualFold(a.Transport, "udp") {
+				continue
+			}
+			tcp := Address{Transport: "tcp", Address: a.Address}
+			if !slices.ContainsFunc(addrs, func(existing Address) bool {
+				return strings.EqualFold(existing.Transport, "tcp") && existing.Address == a.Address
+			}) {
+				addrs = append(addrs, tcp)
+			}
+		}
+	}
+	versions, err := versionsForServerWithMode(s, sch, mode)
 	if err != nil {
 		return serverPlan{}, err
 	}
@@ -679,13 +754,12 @@ func isGoogleOnly(vs []protocol.Version) bool {
 	return len(vs) == 1 && vs[0] == protocol.VersionGoogle
 }
 
-// versionsForServer returns s's VER list, honoring textual and numeric Google
-// labels and numeric version caps.
-func versionsForServer(s Server, sch Scheme) ([]protocol.Version, error) {
+// versionsForServerWithMode applies server-list labels and version caps.
+func versionsForServerWithMode(s Server, sch Scheme, mode protocol.Mode) ([]protocol.Version, error) {
 	if sch == SchemeEd25519 && isGoogleEcosystemVersion(s.Version) {
 		return []protocol.Version{protocol.VersionGoogle}, nil
 	}
-	versions := VersionsForScheme(sch)
+	versions := VersionsForSchemeWithMode(sch, mode)
 	limit, err := strconv.ParseUint(s.Version, 10, 32)
 	if err != nil {
 		return versions, nil
@@ -695,4 +769,10 @@ func versionsForServer(s Server, sch Scheme) ([]protocol.Version, error) {
 		return nil, fmt.Errorf("roughtime: server version %d has no supported compatible wire version", limit)
 	}
 	return versions, nil
+}
+
+// knownVersions copies the versions supported by mode.
+func knownVersions(versions []protocol.Version, mode protocol.Mode) []protocol.Version {
+	supported := protocol.SupportedWithMode(mode)
+	return slices.DeleteFunc(slices.Clone(versions), func(v protocol.Version) bool { return !slices.Contains(supported, v) })
 }

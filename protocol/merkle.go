@@ -73,9 +73,8 @@ type merkleTree struct {
 }
 
 // merkleNodeFirst reports whether the sibling precedes the running hash when
-// the INDX bit is 0. Drafts 05-15 specify node-first, but drafts 16-19 changed
-// back to hash-first without changing the shared version or TYPE value. The
-// ambiguous groupD14 defaults to the current hash-first convention.
+// the INDX bit is 0. Untyped drafts 05-13 use node-first. Typed draft replies
+// default to the hash-first convention shared by RFC and drafts 16-19.
 func merkleNodeFirst(g wireGroup) bool {
 	return g >= groupD05 && g <= groupD12
 }

@@ -67,13 +67,14 @@ func TestQueryChainSkipsFailedMiddleServer(t *testing.T) {
 func TestClientNumericVersionCaps(t *testing.T) {
 	server := newFakeServer(t)
 	defer server.Close()
-	client := new(roughtime.Client)
+	client := &roughtime.Client{Mode: protocol.Flex}
 	for _, want := range []protocol.Version{
 		protocol.VersionDraft10,
 		protocol.VersionDraft11,
 		protocol.VersionDraft12,
 	} {
 		t.Run(want.ShortString(), func(t *testing.T) {
+			server.setVersions(want)
 			s := server.server()
 			s.Version = strconv.FormatUint(uint64(want), 10)
 			response, err := client.Query(context.Background(), s)
@@ -87,8 +88,8 @@ func TestClientNumericVersionCaps(t *testing.T) {
 	}
 
 	tooOld := server.server()
-	tooOld.Version = strconv.FormatUint(uint64(protocol.VersionDraft05)-1, 10)
-	if _, err := roughtime.NormalizeServer(tooOld); err == nil || !strings.Contains(err.Error(), "no supported compatible wire version") {
+	tooOld.Version = "0"
+	if _, err := roughtime.NormalizeServerWithMode(tooOld, protocol.Flex); err == nil || !strings.Contains(err.Error(), "no supported compatible wire version") {
 		t.Fatalf("NormalizeServer below minimum error=%v", err)
 	}
 }

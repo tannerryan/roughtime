@@ -24,22 +24,39 @@ type scriptedTCPConn struct {
 	written int
 }
 
+// Read consumes the scripted request bytes.
 func (c *scriptedTCPConn) Read(p []byte) (int, error) { return c.read.Read(p) }
+
+// Write counts calls and returns the scripted result.
 func (c *scriptedTCPConn) Write(p []byte) (int, error) {
 	c.written++
 	return c.write(p)
 }
-func (*scriptedTCPConn) Close() error                     { return nil }
-func (*scriptedTCPConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
-func (*scriptedTCPConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
-func (*scriptedTCPConn) SetDeadline(time.Time) error      { return nil }
-func (*scriptedTCPConn) SetReadDeadline(time.Time) error  { return nil }
+
+// Close is a no-op for the in-memory connection.
+func (*scriptedTCPConn) Close() error { return nil }
+
+// LocalAddr returns a placeholder TCP address.
+func (*scriptedTCPConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
+
+// RemoteAddr returns a placeholder TCP address.
+func (*scriptedTCPConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
+
+// SetDeadline accepts deadlines without scheduling I/O.
+func (*scriptedTCPConn) SetDeadline(time.Time) error { return nil }
+
+// SetReadDeadline accepts deadlines without scheduling reads.
+func (*scriptedTCPConn) SetReadDeadline(time.Time) error { return nil }
+
+// SetWriteDeadline accepts deadlines without scheduling writes.
 func (*scriptedTCPConn) SetWriteDeadline(time.Time) error { return nil }
 
+// tcpTestRequest returns a draft-12 request bound to rootPK.
 func tcpTestRequest(t *testing.T, rootPK []byte) []byte {
 	t.Helper()
-	_, request, err := protocol.CreateRequest(
-		[]protocol.Version{protocol.VersionDraft12}, rand.Reader, protocol.ComputeSRV(rootPK))
+	_, request, err := protocol.CreateRequestWithOptions(
+		[]protocol.Version{protocol.VersionDraft12}, rand.Reader, protocol.ComputeSRV(rootPK), protocol.RequestOptions{Mode: protocol.Flex},
+	)
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}

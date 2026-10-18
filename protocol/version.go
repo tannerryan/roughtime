@@ -12,8 +12,38 @@ import (
 // Version identifies a Roughtime protocol version on the wire.
 type Version uint32
 
+// Mode controls protocol compatibility. Its zero value accepts RFC 10049 only.
+type Mode uint8
+
+const (
+	// Strict accepts RFC 10049 version 1.
+	Strict Mode = iota
+	// Flex also accepts the implemented drafts and experimental formats.
+	Flex
+)
+
+// allows reports whether the mode accepts v.
+func (m Mode) allows(v Version) bool {
+	return v == Version1 || m == Flex && isRecognizedVersion(v)
+}
+
+// checkVersions rejects invalid modes and versions unavailable in that mode.
+func checkVersions(mode Mode, versions []Version) error {
+	if mode != Strict && mode != Flex {
+		return errors.New("protocol: invalid mode")
+	}
+	for _, v := range versions {
+		if !mode.allows(v) {
+			return fmt.Errorf("protocol: version %s requires flex mode", v)
+		}
+	}
+	return nil
+}
+
 // Roughtime protocol versions.
 const (
+	// Version1 is RFC 10049.
+	Version1 Version = 1
 	// VersionGoogle is Google-Roughtime (no VER tag).
 	VersionGoogle Version = 0
 	// VersionDraft01 is draft-ietf-ntp-roughtime-01.
@@ -41,13 +71,16 @@ const (
 	// VersionDraft12 is drafts 12-19 (shared wire version).
 	VersionDraft12 Version = 0x8000000c
 
-	// VersionMLDSA44 is the experimental ML-DSA-44 post-quantum wire variant.
+	// VersionMLDSA44 is the experimental RFC version 1 extension using
+	// ML-DSA-44.
 	VersionMLDSA44 Version = 0x90000001
 )
 
 // String returns a recognized version name or a hexadecimal unknown value.
 func (v Version) String() string {
 	switch v {
+	case Version1:
+		return "RFC 10049 v1"
 	case VersionGoogle:
 		return "Google-Roughtime"
 	case VersionDraft01:
@@ -81,9 +114,11 @@ func (v Version) String() string {
 	}
 }
 
-// ShortString returns a compact version label.
+// ShortString returns a display label, abbreviating draft and extension names.
 func (v Version) ShortString() string {
 	switch v {
+	case Version1:
+		return v.String()
 	case VersionGoogle:
 		return "Google"
 	case VersionDraft12:
@@ -98,9 +133,13 @@ func (v Version) ShortString() string {
 	}
 }
 
-// ParseShortVersion is the inverse of [Version.ShortString] over [Supported].
+// ParseShortVersion parses a display label, also accepting v1 for RFC version
+// 1.
 func ParseShortVersion(s string) (Version, error) {
-	for _, v := range Supported() {
+	if s == "v1" {
+		return Version1, nil
+	}
+	for _, v := range SupportedWithMode(Flex) {
 		if v.ShortString() == s {
 			return v, nil
 		}
@@ -108,9 +147,10 @@ func ParseShortVersion(s string) (Version, error) {
 	return 0, fmt.Errorf("protocol: unknown version %q", s)
 }
 
-// ServerPreferenceEd25519 lists Ed25519 versions in descending negotiation
-// preference.
+// ServerPreferenceEd25519 lists flex Ed25519 negotiation preferences, starting
+// with RFC version 1. Strict servers use only [Version1].
 var ServerPreferenceEd25519 = []Version{
+	Version1,
 	VersionDraft12,
 	VersionDraft11, VersionDraft10,
 	VersionDraft09, VersionDraft08,
@@ -125,6 +165,7 @@ var ServerPreferenceMLDSA44 = []Version{VersionMLDSA44}
 // supportedVersionsEd25519 lists Ed25519 IETF versions in ascending order for
 // SREP VERS.
 var supportedVersionsEd25519 = []Version{
+	Version1,
 	VersionDraft01, VersionDraft02, VersionDraft03, VersionDraft04,
 	VersionDraft05, VersionDraft06, VersionDraft07,
 	VersionDraft08, VersionDraft09,
@@ -135,11 +176,20 @@ var supportedVersionsEd25519 = []Version{
 // supportedVersionsMLDSA44 is the scheme-scoped VERS list for ML-DSA-44.
 var supportedVersionsMLDSA44 = []Version{VersionMLDSA44}
 
-// Supported returns all recognized protocol versions: newest IETF first,
-// Google, then post-quantum.
+// Supported returns the versions accepted in strict mode.
 func Supported() []Version {
+	return SupportedWithMode(Strict)
+}
+
+// SupportedWithMode returns versions in negotiation preference order.
+func SupportedWithMode(mode Mode) []Version {
+	if mode != Flex {
+		return []Version{Version1}
+	}
 	out := slices.Clone(supportedVersionsEd25519)
 	slices.Reverse(out)
+	out = slices.DeleteFunc(out, func(v Version) bool { return v == Version1 })
+	out = append([]Version{Version1}, out...)
 	out = append(out, VersionGoogle)
 	out = append(out, supportedVersionsMLDSA44...)
 	return out
@@ -168,7 +218,8 @@ func SelectVersion(clientVersions []Version, nonceLen int, serverVersions []Vers
 	return 0, errors.New("protocol: no mutually supported version")
 }
 
-// clientVersionPreference returns the highest version and its wire group.
+// clientVersionPreference prefers RFC version 1, then the highest draft
+// version.
 func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 	if len(versions) == 0 {
 		return 0, 0, errors.New("protocol: empty version list")
@@ -179,6 +230,9 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 		}
 	}
 	best := slices.Max(versions)
+	if slices.Contains(versions, Version1) {
+		best = Version1
+	}
 	return best, wireGroupOf(best, true), nil
 }
 
@@ -186,7 +240,7 @@ func clientVersionPreference(versions []Version) (Version, wireGroup, error) {
 // package. Unknown versions can still be parsed from peer offers, but builders
 // and verifiers must not guess their wire format.
 func isRecognizedVersion(v Version) bool {
-	return v == VersionGoogle ||
+	return v == Version1 || v == VersionGoogle ||
 		(v >= VersionDraft01 && v <= VersionDraft12) ||
 		v == VersionMLDSA44
 }
@@ -194,4 +248,9 @@ func isRecognizedVersion(v Version) bool {
 // versionOffered reports whether ver appears in the client's version list.
 func versionOffered(ver Version, versions []Version) bool {
 	return slices.Contains(versions, ver)
+}
+
+// filterKnownVersions copies the versions accepted by mode.
+func filterKnownVersions(versions []Version, mode Mode) []Version {
+	return slices.DeleteFunc(slices.Clone(versions), func(v Version) bool { return !mode.allows(v) })
 }

@@ -72,8 +72,8 @@ func validateTimestampEncoding(t time.Time, g wireGroup) error {
 			return errors.New("protocol: timestamp outside 24-bit MJD microsecond range")
 		}
 	default:
-		if sec < 0 {
-			return errors.New("protocol: timestamp precedes Unix epoch")
+		if sec < 0 || t.Before(time.Unix(0, 0)) {
+			return errors.New("protocol: timestamp outside Unix-second range")
 		}
 	}
 	return nil
@@ -114,6 +114,13 @@ func ceilDurationUnits(d, unit time.Duration) uint64 {
 
 // encodeRadius applies the wire group's RADI unit and floor.
 func encodeRadius(d time.Duration, g wireGroup) (uint32, error) {
+	if usesRFCFormat(g) {
+		units := max(ceilDurationUnits(d, time.Second), 1)
+		if units > math.MaxUint32 {
+			return 0, errors.New("protocol: radius exceeds 32-bit second range")
+		}
+		return uint32(units), nil
+	}
 	if g == groupGoogle || usesMJDMicroseconds(g) {
 		return radiMicroseconds(d)
 	}
@@ -155,7 +162,11 @@ func decodeTimestamp(buf []byte, g wireGroup) (time.Time, error) {
 		if v > math.MaxInt64 {
 			return time.Time{}, fmt.Errorf("protocol: timestamp 0x%x exceeds int64", v)
 		}
-		return time.Unix(int64(v), 0).UTC(), nil
+		t := time.Unix(int64(v), 0).UTC()
+		if t.Before(time.Unix(0, 0)) {
+			return time.Time{}, errors.New("protocol: timestamp outside Go time range")
+		}
+		return t, nil
 	}
 }
 
@@ -172,6 +183,7 @@ func decodeRadius(buf []byte, g wireGroup) (time.Duration, error) {
 }
 
 // DecodeTimestamp decodes an 8-byte wire timestamp per ver's encoding rules.
+// The timestamp must fit in [time.Time].
 func DecodeTimestamp(ver Version, buf []byte) (time.Time, error) {
 	if !isRecognizedVersion(ver) {
 		return time.Time{}, fmt.Errorf("protocol: unsupported timestamp version %s", ver)

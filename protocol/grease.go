@@ -109,8 +109,7 @@ func greaseDropTag(reply []byte, ver Version) []byte {
 	}
 	scopes := []uint32{0, TagSREP, TagCERT}
 	mrand.Shuffle(len(scopes), func(i, j int) { scopes[i], scopes[j] = scopes[j], scopes[i] })
-	// drop only tags whose absence breaks verification. NONC echo and TYPE are
-	// tolerated, so neither is a valid drop target
+	// These tags are mandatory across all supported response formats.
 	for _, scope := range scopes {
 		if scope == 0 {
 			candidates := []uint32{TagSIG, TagSREP, TagCERT, TagPATH, TagINDX}

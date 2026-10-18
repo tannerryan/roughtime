@@ -44,17 +44,14 @@ type certCacheKey struct {
 	mjd   bool
 }
 
-// NewCertificate creates and signs an Ed25519 delegation certificate enabled
-// for every recognized Ed25519 version. Use [NewCertificateWithVersions] when
-// the server supports a subset.
+// NewCertificate creates an Ed25519 delegation for RFC 10049.
 func NewCertificate(mint, maxt time.Time, onlineSK, rootSK ed25519.PrivateKey) (*Certificate, error) {
-	versions := append([]Version{VersionGoogle}, supportedVersionsEd25519...)
-	return NewCertificateWithVersions(mint, maxt, onlineSK, rootSK, versions)
+	return NewCertificateWithVersions(mint, maxt, onlineSK, rootSK, []Version{Version1})
 }
 
 // NewCertificateWithVersions creates an Ed25519 delegation certificate whose
-// signed SREP VERS lists contain exactly the configured IETF versions. The
-// support set may also contain [VersionGoogle], which has no VERS tag.
+// default signed SREP VERS lists contain the configured RFC and draft versions.
+// The support set may also contain [VersionGoogle], which has no VERS tag.
 func NewCertificateWithVersions(mint, maxt time.Time, onlineSK, rootSK ed25519.PrivateKey, versions []Version) (*Certificate, error) {
 	if len(onlineSK) != ed25519.PrivateKeySize || len(rootSK) != ed25519.PrivateKeySize {
 		return nil, errors.New("protocol: invalid key size")
@@ -115,9 +112,13 @@ func NewCertificateWithVersions(mint, maxt time.Time, onlineSK, rootSK ed25519.P
 }
 
 // NewCertificateMLDSA44 creates and signs an ML-DSA-44 delegation certificate.
+// It uses RFC version 1 fields and signature prefixes under [VersionMLDSA44].
 func NewCertificateMLDSA44(mint, maxt time.Time, onlineSK, rootSK *mldsa.PrivateKey) (*Certificate, error) {
 	if onlineSK == nil || rootSK == nil {
 		return nil, errors.New("protocol: nil ML-DSA key")
+	}
+	if onlineSK.PublicKey().Parameters() != mldsa.MLDSA44() || rootSK.PublicKey().Parameters() != mldsa.MLDSA44() {
+		return nil, errors.New("protocol: certificate keys must use ML-DSA-44")
 	}
 	if !mint.Before(maxt) {
 		return nil, errors.New("protocol: MINT must be before MAXT")

@@ -7,10 +7,90 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestVerifyReplyUnsignedDelegationBounds checks signed bounds without
+// requiring delegation endpoints to fit Go time. RFC 10049 sections 4.1.4 and
+// 5.2.6 use uint64.
+func TestVerifyReplyUnsignedDelegationBounds(t *testing.T) {
+	cert, rootSK := testCert(t)
+	defer cert.Wipe()
+	midpoint := time.Now().Truncate(time.Second)
+	for _, version := range []Version{Version1, VersionGoogle, VersionDraft08, VersionDraft12} {
+		t.Run(version.ShortString(), func(t *testing.T) {
+			versions := []Version{version}
+			nonce, request, err := CreateRequestWithOptions(versions, rand.Reader, nil, RequestOptions{Mode: Flex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := ParseRequestWithMode(request, Flex)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replies, err := CreateRepliesWithOptions(version, []Request{*parsed}, midpoint, 3*time.Second, cert, ReplyOptions{Mode: Flex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			group := wireGroupOf(version, parsed.HasType)
+			encodedMidpoint := encodeTimestamp(midpoint, group)
+			value := binary.LittleEndian.Uint64(encodedMidpoint[:])
+			for _, bounds := range []struct {
+				minimum uint64 // inclusive native lower bound
+				maximum uint64 // inclusive native upper bound
+				valid   bool   // whether the delegation contains MIDP
+			}{
+				{value, value, true},
+				{0, math.MaxInt64, true},
+				{0, uint64(math.MaxInt64) + 1, true},
+				{0, math.MaxUint64, true},
+				{value + 1, math.MaxUint64, false},
+				{math.MaxUint64, math.MaxUint64, false},
+				{0, value - 1, false},
+			} {
+				reply := corruptReplyTag(t, replies[0], version != VersionGoogle, func(tags map[uint32][]byte) {
+					certificate, err := Decode(tags[TagCERT])
+					if err != nil {
+						t.Fatal(err)
+					}
+					delegation, err := Decode(certificate[TagDELE])
+					if err != nil {
+						t.Fatal(err)
+					}
+					delegation[TagMINT] = binary.LittleEndian.AppendUint64(nil, bounds.minimum)
+					delegation[TagMAXT] = binary.LittleEndian.AppendUint64(nil, bounds.maximum)
+					certificate[TagDELE], err = encode(delegation)
+					if err != nil {
+						t.Fatal(err)
+					}
+					certificate[TagSIG] = signEd25519(rootSK, certificate[TagDELE], delegationContext(group))
+					tags[TagCERT], err = encode(certificate)
+					if err != nil {
+						t.Fatal(err)
+					}
+				})
+				modes := []Mode{Flex}
+				if version == Version1 {
+					modes = append(modes, Strict)
+				}
+				for _, mode := range modes {
+					got, radius, err := VerifyReplyWithOptions(versions, reply, cert.edRootPK, nonce, request, VerifyOptions{Mode: mode})
+					if bounds.valid {
+						if err != nil || !got.Equal(midpoint) || radius != 3*time.Second {
+							t.Fatalf("mode=%d bounds=%+v: %v, %v, %v", mode, bounds, got, radius, err)
+						}
+					} else if !errors.Is(err, ErrDelegationWindow) {
+						t.Fatalf("mode=%d bounds=%+v: expected delegation-window error, got %v", mode, bounds, err)
+					}
+				}
+			}
+		})
+	}
+}
 
 // TestVerifyReplyAllVersions covers Google and recognized Ed25519 versions.
 func TestVerifyReplyAllVersions(t *testing.T) {
@@ -24,12 +104,12 @@ func TestVerifyReplyAllVersions(t *testing.T) {
 // TestVerifyReplyRejectsBadRootPK covers root-key authentication.
 func TestVerifyReplyRejectsBadRootPK(t *testing.T) {
 	cert, _ := testCert(t)
-	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
-	parsed, _ := ParseRequest(req)
-	replies, _ := CreateReplies(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert)
+	nonce, req, _ := CreateRequestWithOptions([]Version{VersionGoogle}, rand.Reader, nil, RequestOptions{Mode: Flex})
+	parsed, _ := ParseRequestWithMode(req, Flex)
+	replies, _ := CreateRepliesWithOptions(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 
 	badPK := make([]byte, ed25519.PublicKeySize)
-	if _, _, err := VerifyReply([]Version{VersionGoogle}, replies[0], badPK, nonce, req); err == nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionGoogle}, replies[0], badPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil {
 		t.Fatal("expected error for bad root PK")
 	}
 }
@@ -38,15 +118,15 @@ func TestVerifyReplyRejectsBadRootPK(t *testing.T) {
 func TestVerifyReplyRejectsBadNonce(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.edRootPK
-	nonce, req, _ := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
-	parsed, _ := ParseRequest(req)
-	replies, _ := CreateReplies(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert)
+	nonce, req, _ := CreateRequestWithOptions([]Version{VersionGoogle}, rand.Reader, nil, RequestOptions{Mode: Flex})
+	parsed, _ := ParseRequestWithMode(req, Flex)
+	replies, _ := CreateRepliesWithOptions(VersionGoogle, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 
 	badNonce := make([]byte, len(nonce))
 	copy(badNonce, nonce)
 	badNonce[0] ^= 0xff
 
-	if _, _, err := VerifyReply([]Version{VersionGoogle}, replies[0], rootPK, badNonce, req); err == nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionGoogle}, replies[0], rootPK, badNonce, req, VerifyOptions{Mode: Flex}); err == nil {
 		t.Fatal("expected error for bad nonce")
 	}
 }
@@ -59,52 +139,21 @@ func TestVerifyReplyRejectsUnofferedVersion(t *testing.T) {
 		binary.LittleEndian.PutUint32(vBuf[:], uint32(VersionDraft10))
 		tags[TagVER] = vBuf[:]
 	})
-	if _, _, err := VerifyReply([]Version{VersionDraft08}, corrupted, rootPK, nonce, req); err == nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionDraft08}, corrupted, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil {
 		t.Fatal("expected error for unoffered version")
 	}
 }
 
 // TestVerifyReplyRejectsResponseTYPENot1 covers invalid response types.
 func TestVerifyReplyRejectsResponseTYPENot1(t *testing.T) {
-	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
 	clientVers := []Version{VersionDraft12}
-	nonce, req, _ := CreateRequest(clientVers, rand.Reader, nil)
-	parsed, _ := ParseRequest(req)
-	g := groupD14
-	tree := newMerkleTreeWithOrder(g, [][]byte{parsed.RawPacket}, merkleNodeFirst(g))
-	midpBuf := encodeTimestamp(time.Now(), g)
-	var radiBuf [4]byte
-	binary.LittleEndian.PutUint32(radiBuf[:], mustRadiSeconds(t, time.Second))
-	var verBuf [4]byte
-	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
-	srepTags := map[uint32][]byte{
-		TagRADI: radiBuf[:],
-		TagMIDP: midpBuf[:],
-		TagROOT: tree.rootHash,
-		TagVER:  verBuf[:],
-		TagVERS: testVersionBytes(supportedVersionsEd25519),
-	}
-	srepBytes, _ := encode(srepTags)
-	toSign := make([]byte, len(responseCtx)+len(srepBytes))
-	copy(toSign, responseCtx)
-	copy(toSign[len(responseCtx):], srepBytes)
-	srepSig := ed25519.Sign(cert.edOnlineSK, toSign)
+	valid, rootPK, nonce, req := validReply(t, VersionDraft12, clientVers)
 	for _, badType := range []uint32{0, 2, 0xFFFFFFFF} {
-		typeBuf := make([]byte, 4)
-		binary.LittleEndian.PutUint32(typeBuf, badType)
-		resp := map[uint32][]byte{
-			TagSIG:  srepSig,
-			TagSREP: srepBytes,
-			TagCERT: cert.certBytes(g),
-			TagPATH: nil,
-			TagINDX: make([]byte, 4),
-			TagNONC: nonce,
-			TagTYPE: typeBuf,
-		}
-		replyMsg, _ := encode(resp)
-		reply := wrapPacket(replyMsg)
-		if _, _, err := VerifyReply(clientVers, reply, rootPK, nonce, req); err == nil {
+		reply := corruptReplyTag(t, valid, true, func(tags map[uint32][]byte) {
+			tags[TagTYPE] = make([]byte, 4)
+			binary.LittleEndian.PutUint32(tags[TagTYPE], badType)
+		})
+		if _, _, err := VerifyReplyWithOptions(clientVers, reply, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil {
 			t.Fatalf("expected error for response TYPE=%d", badType)
 		}
 	}
@@ -115,41 +164,41 @@ func TestVerifyReplyMidpointAtDELEBoundary(t *testing.T) {
 	rootSK, onlineSK := testKeys(t)
 	rootPK := rootSK.Public().(ed25519.PublicKey)
 	now := time.Now().Truncate(time.Second)
-	cert, err := NewCertificate(now, now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := NewCertificateWithVersions(now, now.Add(time.Hour), onlineSK, rootSK, ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionDraft08}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies, err := CreateReplies(VersionDraft08, []Request{*parsed}, now, time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionDraft08, []Request{*parsed}, now, time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := VerifyReply([]Version{VersionDraft08}, replies[0], rootPK, nonce, req); err != nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionDraft08}, replies[0], rootPK, nonce, req, VerifyOptions{Mode: Flex}); err != nil {
 		t.Fatalf("midpoint=MINT should pass: %v", err)
 	}
 
 	maxtTime := now.Add(time.Hour)
-	nonce2, req2, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
+	nonce2, req2, err := CreateRequestWithOptions([]Version{VersionDraft08}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed2, err := ParseRequest(req2)
+	parsed2, err := ParseRequestWithMode(req2, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies2, err := CreateReplies(VersionDraft08, []Request{*parsed2}, maxtTime, time.Second, cert)
+	replies2, err := CreateRepliesWithOptions(VersionDraft08, []Request{*parsed2}, maxtTime, time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := VerifyReply([]Version{VersionDraft08}, replies2[0], rootPK, nonce2, req2); err != nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionDraft08}, replies2[0], rootPK, nonce2, req2, VerifyOptions{Mode: Flex}); err != nil {
 		t.Fatalf("midpoint=MAXT should pass: %v", err)
 	}
 }
@@ -158,15 +207,15 @@ func TestVerifyReplyMidpointAtDELEBoundary(t *testing.T) {
 func TestVerifyReplyToleratesUnknownTags(t *testing.T) {
 	cert, _ := testCert(t)
 	rootPK := cert.edRootPK
-	nonce, req, err := CreateRequest([]Version{VersionDraft08}, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionDraft08}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies, err := CreateReplies(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +235,7 @@ func TestVerifyReplyToleratesUnknownTags(t *testing.T) {
 	}
 	tamperedReply := wrapPacket(tampered)
 
-	if _, _, err := VerifyReply([]Version{VersionDraft08}, tamperedReply, rootPK, nonce, req); err != nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionDraft08}, tamperedReply, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err != nil {
 		t.Fatalf("unknown tag should not break verification: %v", err)
 	}
 }
@@ -241,26 +290,28 @@ func TestVerifyReplyVersionListCompatibility(t *testing.T) {
 		{"typed 33", 33, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := RequestOptions{OmitTYPE: !tc.withType}
+			opts := RequestOptions{Mode: Flex, OmitTYPE: !tc.withType}
 			nonce, request, err := CreateRequestWithOptions(
 				[]Version{VersionDraft12}, rand.Reader, nil, opts)
 			if err != nil {
 				t.Fatal(err)
 			}
-			parsed, err := ParseRequest(request)
+			parsed, err := ParseRequestWithMode(request, Flex)
 			if err != nil {
 				t.Fatal(err)
 			}
-			replies, err := CreateReplies(
-				VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+			replies, err := CreateRepliesWithOptions(
+				VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex},
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
 			reply := resignSREP(t, replies[0], cert.edOnlineSK, func(srep map[uint32][]byte) {
 				srep[TagVERS] = testVersionBytes(longVersionList(VersionDraft12, tc.count))
 			})
-			_, _, err = VerifyReply(
-				[]Version{VersionDraft12}, reply, cert.edRootPK, nonce, request)
+			_, _, err = VerifyReplyWithOptions(
+				[]Version{VersionDraft12}, reply, cert.edRootPK, nonce, request, VerifyOptions{Mode: Flex},
+			)
 			if tc.wantReject {
 				if err == nil || !strings.Contains(err.Error(), "max 32") {
 					t.Fatalf("VerifyReply error = %v, want 32-entry limit", err)
@@ -278,16 +329,17 @@ func TestVerifyReplyVersionListCompatibility(t *testing.T) {
 // after a valid online-key signature, rather than failing at authentication.
 func TestVerifyReplyRejectsSignedMalformedSREPFields(t *testing.T) {
 	cert, _ := testCert(t)
-	nonce, request, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	nonce, request, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := ParseRequest(request)
+	parsed, err := ParseRequestWithMode(request, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies, err := CreateReplies(
-		VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+	replies, err := CreateRepliesWithOptions(
+		VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,8 +358,9 @@ func TestVerifyReplyRejectsSignedMalformedSREPFields(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reply := resignSREP(t, replies[0], cert.edOnlineSK, tc.mutate)
-			if _, _, err := VerifyReply(
-				[]Version{VersionDraft12}, reply, cert.edRootPK, nonce, request); err == nil ||
+			if _, _, err := VerifyReplyWithOptions(
+				[]Version{VersionDraft12}, reply, cert.edRootPK, nonce, request, VerifyOptions{Mode: Flex},
+			); err == nil ||
 				!strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("VerifyReply error = %v, want %q", err, tc.wantErr)
 			}
@@ -338,7 +391,11 @@ func resignSREP(t *testing.T, reply []byte, onlineSK ed25519.PrivateKey, mutate 
 		t.Fatal(err)
 	}
 	resp[TagSREP] = srepBytes
-	resp[TagSIG] = signEd25519(onlineSK, srepBytes, responseCtx)
+	ctx := responseCtx
+	if ver, _ := ExtractVersion(reply); ver == Version1 {
+		ctx = responseContext(groupRFC)
+	}
+	resp[TagSIG] = signEd25519(onlineSK, srepBytes, ctx)
 	inner, err = encode(resp)
 	if err != nil {
 		t.Fatal(err)
@@ -351,15 +408,15 @@ func TestVerifyReplyRejectsMismatchedNONCInSREP(t *testing.T) {
 	for _, ver := range []Version{VersionDraft01, VersionDraft02} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
 			cert, _ := testCert(t)
-			nonce, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+			nonce, req, err := CreateRequestWithOptions([]Version{ver}, rand.Reader, nil, RequestOptions{Mode: Flex})
 			if err != nil {
 				t.Fatal(err)
 			}
-			parsed, err := ParseRequest(req)
+			parsed, err := ParseRequestWithMode(req, Flex)
 			if err != nil {
 				t.Fatal(err)
 			}
-			replies, err := CreateReplies(ver, []Request{*parsed}, time.Now(), time.Second, cert)
+			replies, err := CreateRepliesWithOptions(ver, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -367,7 +424,7 @@ func TestVerifyReplyRejectsMismatchedNONCInSREP(t *testing.T) {
 				srep[TagNONC][0] ^= 0xff
 			})
 
-			if _, _, err := VerifyReply([]Version{ver}, tampered, cert.edRootPK, nonce, req); err == nil ||
+			if _, _, err := VerifyReplyWithOptions([]Version{ver}, tampered, cert.edRootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil ||
 				!strings.Contains(err.Error(), "NONC in SREP does not match request nonce") {
 				t.Fatalf("VerifyReply error = %v, want signed NONC mismatch", err)
 			}
@@ -383,7 +440,7 @@ func TestVerifyReplyToleratesMissingNONC(t *testing.T) {
 			tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
 				delete(tags, TagNONC)
 			})
-			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err != nil {
+			if _, _, err := VerifyReplyWithOptions([]Version{ver}, tampered, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err != nil {
 				t.Fatalf("VerifyReply rejected missing NONC: %v", err)
 			}
 		})
@@ -396,7 +453,7 @@ func TestVerifyReplyToleratesMissingTYPE(t *testing.T) {
 	tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
 		delete(tags, TagTYPE)
 	})
-	if _, _, err := VerifyReply([]Version{VersionDraft12}, tampered, rootPK, nonce, req); err != nil {
+	if _, _, err := VerifyReplyWithOptions([]Version{VersionDraft12}, tampered, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err != nil {
 		t.Fatalf("expected graceful fallback without TYPE: %v", err)
 	}
 }
@@ -404,66 +461,25 @@ func TestVerifyReplyToleratesMissingTYPE(t *testing.T) {
 // TestVerifyReplyRejectsZeroRADI covers invalid zero uncertainty.
 func TestVerifyReplyRejectsZeroRADI(t *testing.T) {
 	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
 	for _, ver := range []Version{VersionDraft10, VersionDraft12} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
 			versions := []Version{ver}
-			nonce, req, err := CreateRequest(versions, rand.Reader, nil)
+			nonce, req, err := CreateRequestWithOptions(versions, rand.Reader, nil, RequestOptions{Mode: Flex})
 			if err != nil {
 				t.Fatal(err)
 			}
-			parsed, err := ParseRequest(req)
+			parsed, err := ParseRequestWithMode(req, Flex)
 			if err != nil {
 				t.Fatal(err)
 			}
-			g := wireGroupOf(ver, parsed.HasType)
-			leaf := parsed.Nonce
-			if usesFullPacketLeaf(g) {
-				leaf = parsed.RawPacket
-			}
-			tree := newMerkleTreeWithOrder(g, [][]byte{leaf}, merkleNodeFirst(g))
-			midpBuf := encodeTimestamp(time.Now(), g)
-			srepTags := map[uint32][]byte{
-				TagRADI: make([]byte, 4),
-				TagMIDP: midpBuf[:],
-				TagROOT: tree.rootHash,
-			}
-			if hasSREPVERS(g) {
-				var verBuf [4]byte
-				binary.LittleEndian.PutUint32(verBuf[:], uint32(ver))
-				srepTags[TagVER] = verBuf[:]
-				srepTags[TagVERS] = testVersionBytes(supportedVersionsEd25519)
-			}
-			srepBytes, err := encode(srepTags)
+			replies, err := CreateRepliesWithOptions(ver, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp := map[uint32][]byte{
-				TagSIG:  signEd25519(cert.edOnlineSK, srepBytes, responseCtx),
-				TagSREP: srepBytes,
-				TagCERT: cert.certBytes(g),
-				TagPATH: nil,
-				TagINDX: make([]byte, 4),
-			}
-			if hasResponseVER(g) {
-				var verBuf [4]byte
-				binary.LittleEndian.PutUint32(verBuf[:], uint32(ver))
-				resp[TagVER] = verBuf[:]
-			}
-			if hasResponseNONC(g) {
-				resp[TagNONC] = nonce
-			}
-			if g >= groupD14 {
-				resp[TagTYPE] = []byte{1, 0, 0, 0}
-			}
-			reply, err := encode(resp)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if usesRoughtimHeader(g) {
-				reply = wrapPacket(reply)
-			}
-			_, _, err = VerifyReply(versions, reply, rootPK, nonce, req)
+			reply := resignSREP(t, replies[0], cert.edOnlineSK, func(tags map[uint32][]byte) {
+				tags[TagRADI] = make([]byte, 4)
+			})
+			_, _, err = VerifyReplyWithOptions(versions, reply, cert.edRootPK, nonce, req, VerifyOptions{Mode: Flex})
 			if err == nil || !strings.Contains(err.Error(), "RADI must not be zero") {
 				t.Fatalf("VerifyReply error = %v, want zero-RADI error", err)
 			}
@@ -477,7 +493,7 @@ func TestVerifyReplyRejectsBadNonceLengthWithoutRequest(t *testing.T) {
 		t.Run(ver.ShortString(), func(t *testing.T) {
 			reply, rootPK, nonce, _ := validReply(t, ver, []Version{ver})
 			nonce = append(nonce, 0)
-			if _, _, err := VerifyReply([]Version{ver}, reply, rootPK, nonce, nil); err == nil || !strings.Contains(err.Error(), "nonce length") {
+			if _, _, err := VerifyReplyWithOptions([]Version{ver}, reply, rootPK, nonce, nil, VerifyOptions{Mode: Flex}); err == nil || !strings.Contains(err.Error(), "nonce length") {
 				t.Fatalf("VerifyReply error = %v, want nonce-length error", err)
 			}
 		})
@@ -492,7 +508,7 @@ func TestVerifyReplyRejectsMissingTopLevelVER(t *testing.T) {
 			tampered := corruptReplyTag(t, reply, true, func(tags map[uint32][]byte) {
 				delete(tags, TagVER)
 			})
-			if _, _, err := VerifyReply([]Version{ver}, tampered, rootPK, nonce, req); err == nil {
+			if _, _, err := VerifyReplyWithOptions([]Version{ver}, tampered, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil {
 				t.Fatal("expected error for missing top-level VER")
 			}
 		})
@@ -509,7 +525,7 @@ func TestPQRoundTrip(t *testing.T) {
 	}
 
 	versions := []Version{VersionMLDSA44}
-	nonce, req, err := CreateRequest(versions, rand.Reader, srv)
+	nonce, req, err := CreateRequestWithOptions(versions, rand.Reader, srv, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
@@ -517,13 +533,13 @@ func TestPQRoundTrip(t *testing.T) {
 		t.Fatalf("nonce length %d, want 32", len(nonce))
 	}
 
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 
 	now := time.Now()
-	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, now, 5*time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionMLDSA44, []Request{*parsed}, now.Truncate(time.Second), 5*time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}
@@ -531,7 +547,7 @@ func TestPQRoundTrip(t *testing.T) {
 		t.Fatalf("got %d replies, want 1", len(replies))
 	}
 
-	mid, radius, err := VerifyReply(versions, replies[0], rootPK, nonce, req)
+	mid, radius, err := VerifyReplyWithOptions(versions, replies[0], rootPK, nonce, req, VerifyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("VerifyReply: %v", err)
 	}
@@ -547,15 +563,15 @@ func TestPQRoundTrip(t *testing.T) {
 func TestPQTamperedSREPFailsVerify(t *testing.T) {
 	cert, rootPK := testPQCert(t)
 	versions := []Version{VersionMLDSA44}
-	nonce, req, err := CreateRequest(versions, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions(versions, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
-	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}
@@ -568,7 +584,7 @@ func TestPQTamperedSREPFailsVerify(t *testing.T) {
 		srep[lo] ^= 0xff
 		resp[TagSREP] = srep
 	})
-	if _, _, err := VerifyReply(versions, reply, rootPK, nonce, req); err == nil ||
+	if _, _, err := VerifyReplyWithOptions(versions, reply, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil ||
 		!strings.Contains(err.Error(), "SREP signature verification failed") {
 		t.Fatalf("VerifyReply error = %v, want SREP authentication failure", err)
 	}
@@ -578,22 +594,22 @@ func TestPQTamperedSREPFailsVerify(t *testing.T) {
 func TestPQVERSMixedOfferAccepted(t *testing.T) {
 	cert, rootPK := testPQCert(t)
 	offered := []Version{VersionDraft12, VersionMLDSA44}
-	nonce, req, err := CreateRequest(offered, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions(offered, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
 	if len(parsed.Versions) != 2 || parsed.Versions[0] != VersionDraft12 || parsed.Versions[1] != VersionMLDSA44 {
 		t.Fatalf("wire offer = %v, want %v", parsed.Versions, offered)
 	}
-	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionMLDSA44, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}
-	if _, _, err := VerifyReply(offered, replies[0], rootPK, nonce, req); err != nil {
+	if _, _, err := VerifyReplyWithOptions(offered, replies[0], rootPK, nonce, req, VerifyOptions{Mode: Flex}); err != nil {
 		t.Fatalf("PQ-only VERS with mixed client offer unexpectedly rejected: %v", err)
 	}
 }
@@ -601,67 +617,47 @@ func TestPQVERSMixedOfferAccepted(t *testing.T) {
 // TestVersCrossSchemeInflationRejected covers cross-scheme VERS claims.
 func TestVersCrossSchemeInflationRejected(t *testing.T) {
 	cert, _ := testCert(t)
-	rootPK := cert.edRootPK
 	clientVers := []Version{VersionDraft12, VersionMLDSA44}
-	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	parsed, _ := ParseRequest(req)
-	g := groupD14
-	tree := newMerkleTreeWithOrder(g, [][]byte{parsed.RawPacket}, merkleNodeFirst(g))
-	midpBuf := encodeTimestamp(time.Now(), g)
-	var radiBuf [4]byte
-	binary.LittleEndian.PutUint32(radiBuf[:], mustRadiSeconds(t, time.Second))
-	var verBuf [4]byte
-	binary.LittleEndian.PutUint32(verBuf[:], uint32(VersionDraft12))
-
-	// inflated VERS: Ed25519 versions plus a bogus MLDSA44 claim
-	inflated := testVersionBytes(supportedVersionsEd25519)
-
-	var pqBuf [4]byte
-	binary.LittleEndian.PutUint32(pqBuf[:], uint32(VersionMLDSA44))
-	inflated = append(inflated, pqBuf[:]...)
-
-	srepBytes, _ := encode(map[uint32][]byte{
-		TagRADI: radiBuf[:],
-		TagMIDP: midpBuf[:],
-		TagROOT: tree.rootHash,
-		TagVER:  verBuf[:],
-		TagVERS: inflated,
-	})
-	srepSig := signEd25519(cert.edOnlineSK, srepBytes, responseCtx)
-	resp := map[uint32][]byte{
-		TagSIG:  srepSig,
-		TagSREP: srepBytes,
-		TagCERT: cert.certBytes(g),
-		TagPATH: nil,
-		TagINDX: make([]byte, 4),
-		TagNONC: nonce,
-		TagTYPE: func() []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, 1); return b }(),
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
+	if err != nil {
+		t.Fatal(err)
 	}
-	replyMsg, _ := encode(resp)
-	reply := wrapPacket(replyMsg)
-	if _, _, err := VerifyReply(clientVers, reply, rootPK, nonce, req); err == nil {
-		t.Fatal("expected rejection of inflated VERS claiming cross-scheme support")
+	parsed, err := ParseRequestWithMode(req, Flex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies, err := CreateRepliesWithOptions(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := resignSREP(t, replies[0], cert.edOnlineSK, func(tags map[uint32][]byte) {
+		tags[TagVERS] = testVersionBytes(clientVers)
+	})
+	if _, _, err := VerifyReplyWithOptions(clientVers, reply, cert.edRootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil || !strings.Contains(err.Error(), "incompatible signature schemes") {
+		t.Fatalf("expected cross-scheme VERS rejection, got %v", err)
 	}
 }
 
 // FuzzVerifyReply exercises response authentication on arbitrary input.
 func FuzzVerifyReply(f *testing.F) {
+	vector := loadDraft07Vector(f)
+	f.Add(vector.Reply, vector.RootKey, vector.Nonce, vector.Request)
 	edCert, _ := testCert(f)
 	pqCert, pqRootKey := testPQCert(f)
-	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12, VersionMLDSA44} {
+	for _, ver := range []Version{Version1, VersionGoogle, VersionDraft08, VersionDraft12, VersionMLDSA44} {
 		cert, rootKey := edCert, []byte(edCert.edRootPK)
 		if ver == VersionMLDSA44 {
 			cert, rootKey = pqCert, pqRootKey
 		}
-		nonce, request, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+		nonce, request, err := CreateRequestWithOptions([]Version{ver}, rand.Reader, nil, RequestOptions{Mode: Flex})
 		if err != nil {
 			f.Fatal(err)
 		}
-		parsed, err := ParseRequest(request)
+		parsed, err := ParseRequestWithMode(request, Flex)
 		if err != nil {
 			f.Fatal(err)
 		}
-		replies, err := CreateReplies(ver, []Request{*parsed}, time.Now(), time.Second, cert)
+		replies, err := CreateRepliesWithOptions(ver, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 		if err != nil {
 			f.Fatal(err)
 		}
@@ -669,7 +665,8 @@ func FuzzVerifyReply(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, reply, rootKey, nonce, request []byte) {
-		parsed, err := ParseRequest(request)
+		_, _, _ = VerifyReply([]Version{Version1}, reply, rootKey, nonce, request)
+		parsed, err := ParseRequestWithMode(request, Flex)
 		if err != nil {
 			return
 		}
@@ -677,13 +674,13 @@ func FuzzVerifyReply(f *testing.F) {
 		if len(versions) == 0 {
 			versions = []Version{VersionGoogle}
 		}
-		midA, radA, errA := VerifyReply(versions, reply, rootKey, nonce, request)
+		midA, radA, errA := VerifyReplyWithOptions(versions, reply, rootKey, nonce, request, VerifyOptions{Mode: Flex})
 		if errA != nil {
 			return
 		}
 		// idempotency: a second call with identical bytes must match, catching
 		// stateful or time-dependent bugs
-		midB, radB, errB := VerifyReply(versions, reply, rootKey, nonce, request)
+		midB, radB, errB := VerifyReplyWithOptions(versions, reply, rootKey, nonce, request, VerifyOptions{Mode: Flex})
 		if errB != nil {
 			t.Fatalf("non-idempotent: first ok, second err=%v", errB)
 		}
@@ -692,7 +689,7 @@ func FuzzVerifyReply(f *testing.F) {
 		}
 		badNonce := append([]byte(nil), nonce...)
 		badNonce[0] ^= 0xff
-		if _, _, err := VerifyReply(versions, reply, rootKey, badNonce, request); err == nil {
+		if _, _, err := VerifyReplyWithOptions(versions, reply, rootKey, badNonce, request, VerifyOptions{Mode: Flex}); err == nil {
 			t.Fatal("authenticated reply accepted a mutated nonce")
 		}
 	})
@@ -705,16 +702,16 @@ func TestVerifyReplyRejectsEpochMisdecode(t *testing.T) {
 	offered := []Version{VersionDraft05, VersionDraft08}
 
 	// honest draft-05 (MJD) reply with the current time verifies
-	nonce, req, _ := CreateRequest(offered, rand.Reader, nil)
-	parsed, _ := ParseRequest(req)
-	honest, _ := CreateReplies(VersionDraft05, []Request{*parsed}, time.Now(), time.Second, cert)
-	if _, _, err := VerifyReply(offered, honest[0], rootPK, nonce, req); err != nil {
+	nonce, req, _ := CreateRequestWithOptions(offered, rand.Reader, nil, RequestOptions{Mode: Flex})
+	parsed, _ := ParseRequestWithMode(req, Flex)
+	honest, _ := CreateRepliesWithOptions(VersionDraft05, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
+	if _, _, err := VerifyReplyWithOptions(offered, honest[0], rootPK, nonce, req, VerifyOptions{Mode: Flex}); err != nil {
 		t.Fatalf("honest draft-05 reply should verify: %v", err)
 	}
 
 	// forge a draft-08 (Unix) reply down to draft-05 so its timestamp decodes
 	// as MJD, giving the year 1858
-	forged, _ := CreateReplies(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert)
+	forged, _ := CreateRepliesWithOptions(VersionDraft08, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	reply := forged[0]
 	body, _ := unwrapPacket(reply)
 	lo, _, ok := findTagRange(body, TagVER)
@@ -722,7 +719,7 @@ func TestVerifyReplyRejectsEpochMisdecode(t *testing.T) {
 		t.Fatal("no top-level VER in draft-08 reply")
 	}
 	binary.LittleEndian.PutUint32(reply[PacketHeaderSize+lo:], uint32(VersionDraft05))
-	if _, _, err := VerifyReply(offered, reply, rootPK, nonce, req); err == nil {
+	if _, _, err := VerifyReplyWithOptions(offered, reply, rootPK, nonce, req, VerifyOptions{Mode: Flex}); err == nil {
 		t.Fatal("forged epoch-crossing VER should be rejected")
 	}
 }

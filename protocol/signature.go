@@ -95,17 +95,23 @@ func verifyEd25519(pk ed25519.PublicKey, msg, ctx, sig []byte) bool {
 	return ed25519.Verify(pk, toVerify, sig)
 }
 
-// signMLDSA44 signs msg with sk under the given FIPS 204 context.
+// signMLDSA44 signs ctx || msg with an empty FIPS 204 context.
 func signMLDSA44(sk *mldsa.PrivateKey, msg, ctx []byte) ([]byte, error) {
-	return sk.Sign(nil, msg, &mldsa.Options{Context: string(ctx)})
+	toSign := make([]byte, len(ctx)+len(msg))
+	copy(toSign, ctx)
+	copy(toSign[len(ctx):], msg)
+	return sk.Sign(nil, toSign, &mldsa.Options{})
 }
 
-// verifyMLDSA44 verifies sig over msg under the given context.
+// verifyMLDSA44 verifies sig over ctx || msg with an empty FIPS 204 context.
 func verifyMLDSA44(pk *mldsa.PublicKey, msg, ctx, sig []byte) bool {
 	if pk == nil || len(sig) != mldsa.MLDSA44SignatureSize {
 		return false
 	}
-	return mldsa.Verify(pk, msg, sig, &mldsa.Options{Context: string(ctx)}) == nil
+	toVerify := make([]byte, len(ctx)+len(msg))
+	copy(toVerify, ctx)
+	copy(toVerify[len(ctx):], msg)
+	return mldsa.Verify(pk, toVerify, sig, &mldsa.Options{}) == nil
 }
 
 // errSchemeNotSupported is returned for an unimplemented scheme.

@@ -13,6 +13,7 @@ func TestVersionString(t *testing.T) {
 		ver  Version
 		want string
 	}{
+		{Version1, "RFC 10049 v1"},
 		{VersionGoogle, "Google-Roughtime"},
 		{VersionDraft01, "draft-ietf-ntp-roughtime-01"},
 		{VersionDraft02, "draft-ietf-ntp-roughtime-02"},
@@ -38,7 +39,10 @@ func TestVersionString(t *testing.T) {
 
 // TestParseShortVersion covers compact version parsing.
 func TestParseShortVersion(t *testing.T) {
-	for _, v := range Supported() {
+	if got, err := ParseShortVersion("v1"); err != nil || got != Version1 {
+		t.Fatalf("ParseShortVersion(v1) = %v, %v", got, err)
+	}
+	for _, v := range SupportedWithMode(Flex) {
 		got, err := ParseShortVersion(v.ShortString())
 		if err != nil {
 			t.Fatalf("ParseShortVersion(%q): %v", v.ShortString(), err)

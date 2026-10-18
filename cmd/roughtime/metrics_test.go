@@ -7,12 +7,48 @@ package main
 
 import (
 	"bytes"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestMetricsShutdownClosesPartialRequest checks cleanup after the shutdown
+// timeout.
+func TestMetricsShutdownClosesPartialRequest(t *testing.T) {
+	edPath, _ := withSeedFile(t)
+	withFlagGlobals(t, edPath, "", "error", 2002, 0)
+	done, cancel, address := startServeForTest(t)
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("GET /metrics HTTP/1.1\r\nHost: ")); err != nil {
+		t.Fatal(err)
+	}
+	// A complete request confirms that the listener has accepted connections.
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Get("http://" + address + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	client.CloseIdleConnections()
+	cancel()
+	if err := awaitTest(t, done, 4*time.Second, "metrics shutdown"); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	var buf [1]byte
+	if n, err := conn.Read(buf[:]); err == nil || n != 0 {
+		t.Fatalf("partial request remained open: n=%d error=%v", n, err)
+	} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatal("shutdown left the partial request open")
+	}
+}
 
 // TestMetricsRegistry covers counters and build/certificate metadata.
 func TestMetricsRegistry(t *testing.T) {

@@ -29,6 +29,7 @@ import (
 func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease float64) {
 	t.Helper()
 	origPort := *port
+	origFlexPort := *flexPort
 	origListenAddress := *listenAddress
 	origEd := *rootKeySeedHexFile
 	origPQ := *pqRootKeySeedHexFile
@@ -44,6 +45,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 	origOfflineDelegation := *offlineDelegation
 	t.Cleanup(func() {
 		*port = origPort
+		*flexPort = origFlexPort
 		*listenAddress = origListenAddress
 		*rootKeySeedHexFile = origEd
 		*pqRootKeySeedHexFile = origPQ
@@ -59,6 +61,7 @@ func withFlagGlobals(t *testing.T, edKey, pqKey, level string, p int, grease flo
 		*offlineDelegation = origOfflineDelegation
 	})
 	*port = p
+	*flexPort = 0
 	*listenAddress = ""
 	*rootKeySeedHexFile = edKey
 	*pqRootKeySeedHexFile = pqKey
@@ -177,8 +180,14 @@ func startServeForTest(t *testing.T) (chan error, context.CancelFunc, string) {
 attempts:
 	for range maxAttempts {
 		*port = pickFreeTCPPort(t)
+		if *flexPort != 0 {
+			*flexPort = pickFreeTCPPort(t)
+			if *flexPort == *port {
+				continue
+			}
+		}
 		metricsPort := pickFreeTCPPort(t)
-		if metricsPort == *port {
+		if metricsPort == *port || metricsPort == *flexPort {
 			continue
 		}
 		metricsHostPort := net.JoinHostPort("127.0.0.1", strconv.Itoa(metricsPort))
@@ -197,11 +206,14 @@ attempts:
 			}
 		})
 
-		addresses := [...]string{
+		addresses := []string{
 			net.JoinHostPort("::1", strconv.Itoa(*port)),
 			metricsHostPort,
 		}
-		var ready [len(addresses)]bool
+		if *flexPort != 0 {
+			addresses = append(addresses, net.JoinHostPort("::1", strconv.Itoa(*flexPort)))
+		}
+		ready := make([]bool, len(addresses))
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
 			select {
@@ -224,7 +236,11 @@ attempts:
 					_ = conn.Close()
 				}
 			}
-			if ready[0] && ready[1] {
+			allReady := true
+			for _, listening := range ready {
+				allReady = allReady && listening
+			}
+			if allReady {
 				return done, cancel, metricsHostPort
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -237,31 +253,69 @@ attempts:
 	return nil, nil, ""
 }
 
-// TestServeDualStack covers combined Ed25519 and ML-DSA-44 serving plus the
-// configured metrics listener.
+// TestServeDualStack checks both ports, signature schemes, metrics, and
+// shutdown.
 func TestServeDualStack(t *testing.T) {
 	edPath, edRootPK := withSeedFile(t)
 	pqPath, pqRootPK := withPQSeedFile(t)
 	withFlagGlobals(t, edPath, pqPath, "error", 2002, 0)
+	*flexPort = 2002
 	done, cancel, metricsHostPort := startServeForTest(t)
 
-	for _, test := range []struct {
-		version protocol.Version
-		rootPK  []byte
-	}{
-		{protocol.VersionDraft12, edRootPK},
-		{protocol.VersionMLDSA44, pqRootPK},
-	} {
-		srv := protocol.ComputeSRV(test.rootPK)
-		nonce, request, err := protocol.CreateRequest([]protocol.Version{test.version}, rand.Reader, srv)
-		if err != nil {
-			t.Fatalf("CreateRequest(%s): %v", test.version, err)
-		}
-		conn := dialTCP(t, *port)
-		reply := tcpRoundTrip(t, conn, request)
-		_ = conn.Close()
-		if _, _, err := protocol.VerifyReply([]protocol.Version{test.version}, reply, test.rootPK, nonce, request); err != nil {
-			t.Fatalf("VerifyReply(%s): %v", test.version, err)
+	for _, listenPort := range []int{*port, *flexPort} {
+		waitForServerReady(t, listenPort, edRootPK)
+		for _, ver := range protocol.SupportedWithMode(protocol.Flex) {
+			rootPK := edRootPK
+			if ver == protocol.VersionMLDSA44 {
+				rootPK = pqRootPK
+			}
+			offer := []protocol.Version{ver}
+			if ver == protocol.Version1 {
+				offer = append(offer, protocol.VersionDraft12)
+			}
+			nonce, request, err := protocol.CreateRequestWithOptions(offer, rand.Reader,
+				protocol.ComputeSRV(rootPK), protocol.RequestOptions{Mode: protocol.Flex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, network := range []string{"udp", "tcp"} {
+				if network == "udp" && ver == protocol.VersionMLDSA44 || network == "tcp" && ver == protocol.VersionGoogle {
+					continue
+				}
+				addr := net.JoinHostPort("::1", strconv.Itoa(listenPort))
+				accept := isFlexPort(listenPort) || ver == protocol.Version1 || ver == protocol.VersionMLDSA44
+				var reply []byte
+				if network == "udp" {
+					timeout := time.Second
+					if !accept {
+						timeout = 50 * time.Millisecond
+					}
+					reply, _, _, err = protocol.RoundTripUDP(context.Background(), addr, request, timeout)
+				} else {
+					reply, _, _, err = protocol.RoundTripTCP(context.Background(), addr, request, time.Second)
+				}
+				if !accept {
+					if network == "udp" {
+						var timeout net.Error
+						if !errors.As(err, &timeout) || !timeout.Timeout() {
+							t.Fatalf("primary UDP %s: expected silence, got %v", ver, err)
+						}
+					} else if !errors.Is(err, protocol.ErrPeerClosedNoReply) {
+						t.Fatalf("primary TCP %s: expected rejection, got %v", ver, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("%s port %d, %s: %v", network, listenPort, ver, err)
+				}
+				if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{ver}, reply, rootPK, nonce, request,
+					protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
+					t.Fatalf("%s port %d, %s: %v", network, listenPort, ver, err)
+				}
+				if ver == protocol.Version1 {
+					checkListenerVERS(t, reply, !isFlexPort(listenPort))
+				}
+			}
 		}
 	}
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -280,6 +334,24 @@ func TestServeDualStack(t *testing.T) {
 	cancel()
 	if err := awaitTest(t, done, 5*time.Second, "dual-stack server shutdown"); err != nil {
 		t.Fatalf("serve: %v", err)
+	}
+	for _, listenPort := range []int{*port, *flexPort} {
+		for _, network := range []string{"tcp", "udp"} {
+			addr := net.JoinHostPort("::1", strconv.Itoa(listenPort))
+			if network == "tcp" {
+				conn, err := net.Listen(network, addr)
+				if err != nil {
+					t.Fatalf("TCP port %d retained after shutdown: %v", listenPort, err)
+				}
+				_ = conn.Close()
+			} else {
+				conn, err := net.ListenPacket(network, addr)
+				if err != nil {
+					t.Fatalf("UDP port %d retained after shutdown: %v", listenPort, err)
+				}
+				_ = conn.Close()
+			}
+		}
 	}
 }
 
@@ -328,5 +400,28 @@ func TestServeRejectsBadPQKey(t *testing.T) {
 	err := serve(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "ML-DSA-44") {
 		t.Fatalf("serve: %v, want ML-DSA-44 provisioning error", err)
+	}
+}
+
+// checkListenerVERS checks the advertised profiles after the reply is
+// authenticated.
+func checkListenerVERS(t *testing.T, reply []byte, rfcOnly bool) {
+	t.Helper()
+	msg, err := protocol.Decode(reply[protocol.PacketHeaderSize:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	srep, err := protocol.Decode(msg[protocol.TagSREP])
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions := srep[protocol.TagVERS]
+	if rfcOnly {
+		if !bytes.Equal(versions, []byte{1, 0, 0, 0}) {
+			t.Fatalf("primary RFC VERS = %x, want version 1 only", versions)
+		}
+	} else if len(versions) != 4*(len(protocol.ServerPreferenceEd25519)-1) {
+		// Google has no signed VERS entry.
+		t.Fatalf("compatibility RFC VERS = %x, want all Ed25519 versions", versions)
 	}
 }

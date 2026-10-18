@@ -13,6 +13,7 @@ import (
 	"io"
 	mrand "math/rand/v2"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,6 +73,8 @@ type tcpBatchItem struct {
 	req     protocol.Request
 	version protocol.Version
 	hasType bool
+	// rfcOnly restricts RFC VERS for requests received on the primary port.
+	rfcOnly bool
 	peer    net.Addr
 	reply   chan<- tcpBatchReply
 }
@@ -114,30 +117,33 @@ func (s *activeConnSet) closeAll() {
 	}
 }
 
-// listenTCP serves Roughtime over a dual-stack TCP listener on *port. edState
-// and pqState are each nilable.
-func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState]) error {
+// listenTCP serves all ports with shared batchers and a shared connection
+// limit. edState and pqState are each nilable.
+func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState], ports []int) error {
 	if edState == nil && pqState == nil {
 		return errors.New("listenTCP: no certificate state configured")
 	}
-
-	prefs := tcpServerPrefs(edState, pqState)
+	if len(ports) == 0 {
+		return errors.New("listenTCP: no ports configured")
+	}
 
 	tcpLog := logger.Named("tcp")
-	addr := serverListenAddr()
+	addr := serverListenAddr(ports[0])
 	networks := listenNetworks("tcp", addr)
 
 	var lc net.ListenConfig
-	lns := make([]net.Listener, 0, len(networks))
-	for _, network := range networks {
-		ln, err := lc.Listen(ctx, network, addr)
-		if err != nil {
-			for _, prev := range lns {
-				_ = prev.Close()
+	lns := make([]net.Listener, 0, len(networks)*len(ports))
+	for _, listenPort := range ports {
+		for _, network := range networks {
+			ln, err := lc.Listen(ctx, network, serverListenAddr(listenPort))
+			if err != nil {
+				for _, prev := range lns {
+					_ = prev.Close()
+				}
+				return fmt.Errorf("binding %s: %w", network, err)
 			}
-			return fmt.Errorf("binding %s: %w", network, err)
+			lns = append(lns, ln)
 		}
-		lns = append(lns, ln)
 	}
 
 	var (
@@ -165,6 +171,7 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 
 	tcpLog.Info("listening TCP",
 		zap.String("addr", addr),
+		zap.Ints("ports", ports),
 		zap.Strings("networks", networks),
 		zap.Int32("max_conns", maxTCPConnections),
 		zap.Uint32("max_request_bytes", maxTCPRequestSize),
@@ -174,7 +181,6 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 		zap.Int("batch_max_size", batchMaxSize),
 		zap.Duration("batch_max_latency", batchMaxLatency),
 		zap.Int("batch_queue_size", tcpBatchQueueSize),
-		zap.Strings("offered_versions", versionNames(prefs)),
 	)
 
 	// close listeners on shutdown to unblock Accept
@@ -191,6 +197,8 @@ func listenTCP(ctx context.Context, edState, pqState *atomic.Pointer[certState])
 
 	// accept serves one listener until ctx is done or it stops accepting.
 	accept := func(ln net.Listener) {
+		prefs := tcpServerPrefs(edState, pqState, isFlexPort(ln.Addr().(*net.TCPAddr).Port))
+		tcpLog.Info("listener profiles", zap.Stringer("addr", ln.Addr()), zap.Strings("offered_versions", versionNames(prefs)))
 		for {
 			c, err := ln.Accept()
 			if err != nil {
@@ -405,7 +413,8 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 		}
 
 		_ = conn.SetWriteDeadline(time.Now().Add(tcpWriteTimeout))
-		if err := writeTCPReply(conn, br.bytes); err != nil {
+		replyLimit := min(maxTCPReplyBytes, len(pkt))
+		if err := writeTCPReply(conn, br.bytes, replyLimit); err != nil {
 			incDropped(transportTCP, dropWrite)
 			if ce := log.Check(zap.DebugLevel, "TCP write failed"); ce != nil {
 				ce.Write(zap.Stringer("peer", conn.RemoteAddr()), zap.Error(err))
@@ -421,7 +430,17 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 // tcpBatchItem and destination batch channel. On failure the dropReason
 // classifies the rejection. Success returns dropNone.
 func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pqState *atomic.Pointer[certState], edBatchCh, pqBatchCh chan<- tcpBatchItem, prefs []protocol.Version) (tcpBatchItem, chan<- tcpBatchItem, dropReason, error) {
-	req, err := protocol.ParseRequest(reqBytes)
+	rfcOnly := true
+	for _, v := range prefs {
+		if v != protocol.Version1 && v != protocol.VersionMLDSA44 {
+			rfcOnly = false
+		}
+	}
+	mode := protocol.Strict
+	if !rfcOnly || slices.Contains(prefs, protocol.VersionMLDSA44) {
+		mode = protocol.Flex
+	}
+	req, err := protocol.ParseRequestWithMode(reqBytes, mode)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "request parse failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Int("size", len(reqBytes)), zap.Error(err))
@@ -464,13 +483,13 @@ func prepareTCPItem(log *zap.Logger, peer net.Addr, reqBytes []byte, edState, pq
 		}
 		return tcpBatchItem{}, nil, dropSRV, errors.New("SRV mismatch")
 	}
-	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer}, ch, dropNone, nil
+	return tcpBatchItem{req: *req, version: ver, hasType: req.HasType, peer: peer, rfcOnly: rfcOnly}, ch, dropNone, nil
 }
 
-// tcpVersionUsesSRV reports whether ver belongs to a profile that introduced
-// long-term-key selection through SRV.
+// tcpVersionUsesSRV reports whether ver supports root-key selection through
+// SRV.
 func tcpVersionUsesSRV(ver protocol.Version) bool {
-	return ver == protocol.VersionMLDSA44 ||
+	return ver == protocol.Version1 || ver == protocol.VersionMLDSA44 ||
 		(ver >= protocol.VersionDraft10 && ver <= protocol.VersionDraft12)
 }
 
@@ -577,7 +596,7 @@ func tcpBatcher(log *zap.Logger, state *atomic.Pointer[certState], incoming <-ch
 				}
 				return
 			}
-			key := batchKey{version: it.version, hasType: it.hasType}
+			key := batchKey{version: it.version, hasType: it.hasType, rfcOnly: it.rfcOnly}
 			b, exists := batches[key]
 			if !exists {
 				b = &pending{items: make([]tcpBatchItem, 0, maxSize), start: time.Now()}
@@ -625,8 +644,8 @@ func flushTCPBatchCurrent(log *zap.Logger, state *atomic.Pointer[certState], ver
 	for i := range items {
 		reqs[i] = items[i].req
 	}
-	// zero midpoint defers timestamping to CreateReplies
-	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
+	midpoint := serverMidpoint(time.Now(), ver)
+	replies, err := protocol.CreateRepliesWithOptions(ver, reqs, midpoint, radius, st.cert, serverReplyOptions(ver, items[0].rfcOnly))
 	if err != nil {
 		log.Warn("batch CreateReplies failed",
 			zap.Stringer("version", ver),
@@ -640,7 +659,7 @@ func flushTCPBatchCurrent(log *zap.Logger, state *atomic.Pointer[certState], ver
 	statsBatchedReqs.Add(uint64(len(items)))
 	for i, reply := range replies {
 		if *greaseRate > 0 && mrand.Float64() < *greaseRate {
-			if greased := protocol.Grease(reply, ver); greased != nil {
+			if greased := protocol.Grease(reply, ver); greased != nil && len(greased) <= len(items[i].req.RawPacket) {
 				reply = greased
 				if ce := log.Check(zap.DebugLevel, "greased response"); ce != nil {
 					ce.Write(zap.Stringer("peer", items[i].peer))
@@ -666,15 +685,15 @@ func deliverTCPBatchError(items []tcpBatchItem, err error) {
 	}
 }
 
-// tcpServerPrefs builds the server's internal preference list with PQ first
-// when configured and VersionGoogle omitted.
-func tcpServerPrefs(edState, pqState *atomic.Pointer[certState]) []protocol.Version {
+// tcpServerPrefs builds a listener's preferences with configured PQ first and
+// Google omitted. Drafts are included only when allowDrafts is true.
+func tcpServerPrefs(edState, pqState *atomic.Pointer[certState], allowDrafts bool) []protocol.Version {
 	var prefs []protocol.Version
 	if pqState != nil {
 		prefs = append(prefs, protocol.ServerPreferenceMLDSA44...)
 	}
 	if edState != nil {
-		for _, v := range protocol.ServerPreferenceEd25519 {
+		for _, v := range ed25519VersionsForPort(allowDrafts) {
 			if v == protocol.VersionGoogle {
 				continue
 			}
@@ -684,10 +703,10 @@ func tcpServerPrefs(edState, pqState *atomic.Pointer[certState]) []protocol.Vers
 	return prefs
 }
 
-// writeTCPReply writes one bounded reply and rejects short writes.
-func writeTCPReply(conn net.Conn, reply []byte) error {
-	if len(reply) > maxTCPReplyBytes {
-		return fmt.Errorf("reply size %d exceeds sanity bound %d", len(reply), maxTCPReplyBytes)
+// writeTCPReply enforces the reply-size limit and rejects short writes.
+func writeTCPReply(conn net.Conn, reply []byte, limit int) error {
+	if len(reply) > limit {
+		return fmt.Errorf("reply size %d exceeds limit %d", len(reply), limit)
 	}
 	n, err := conn.Write(reply)
 	if err == nil && n != len(reply) {

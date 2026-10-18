@@ -15,7 +15,7 @@ import (
 
 // TestVersionsForScheme covers scheme-specific preference lists.
 func TestVersionsForScheme(t *testing.T) {
-	ed := roughtime.VersionsForScheme(roughtime.SchemeEd25519)
+	ed := roughtime.VersionsForSchemeWithMode(roughtime.SchemeEd25519, protocol.Flex)
 	if len(ed) == 0 {
 		t.Fatal("Ed25519 list empty")
 	}
@@ -25,7 +25,7 @@ func TestVersionsForScheme(t *testing.T) {
 		}
 	}
 
-	pq := roughtime.VersionsForScheme(roughtime.SchemeMLDSA44)
+	pq := roughtime.VersionsForSchemeWithMode(roughtime.SchemeMLDSA44, protocol.Flex)
 	if len(pq) != 1 || pq[0] != protocol.VersionMLDSA44 {
 		t.Fatalf("MLDSA44 list = %v, want [VersionMLDSA44]", pq)
 	}

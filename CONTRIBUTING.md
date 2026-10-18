@@ -20,14 +20,13 @@ make test
 
 - Keep changes focused, format Go code with `make fmt`, and add tests for
   behavior changes.
-- Protocol changes should identify the affected Google-Roughtime or IETF drafts,
-  transport, and signature scheme, and preserve existing interoperability unless
-  a compatibility break is intentional.
+- Protocol changes should identify the affected RFC or draft, transport, and
+  signature scheme. Keep strict mode aligned with RFC 10049 and preserve
+  interoperability in flex mode.
 - Parser and verifier fixes should include a regression case or fuzz seed when
   practical.
 - Do not edit `vendor/` by hand. Dependency changes should update `go.mod`,
-  `go.sum`, and the generated vendor tree with `go mod tidy` and `go mod
-vendor`.
+  `go.sum`, and the generated vendor tree with `go mod tidy` and `go mod vendor`.
 - For `ecosystem.json` changes, provide a working endpoint and an
   operator-published root public key in the pull request description.
 
@@ -41,7 +40,7 @@ make check
 
 `make check` formats files in place and checks dependencies, linting,
 vulnerabilities, builds, and race-enabled tests. Changes to untrusted-input
-paths should also run the retained fuzz targets:
+paths should also run the fuzz targets:
 
 ```sh
 make fuzz FUZZ_TIME=1m

@@ -13,23 +13,29 @@ import (
 	"time"
 )
 
-// responseCtx is the SREP signature context.
+// responseCtx is the draft and Google SREP signature context.
 var responseCtx = []byte("RoughTime v1 response signature\x00")
 
-// ReplyOptions controls wire choices that cannot be inferred from the shared
-// version number.
+// ReplyOptions selects compatibility mode, advertised versions, and draft Merkle ordering.
 type ReplyOptions struct {
+	// Mode selects strict or flex protocol support.
+	Mode Mode
+	// SupportedVersions restricts signed VERS to a nonempty subset of the
+	// certificate's versions that includes the selected version. Nil uses the
+	// certificate's full set. This supports listeners with different profiles
+	// sharing one delegation.
+	SupportedVersions []Version
 	// Draft14NodeFirst emits the node-first Merkle convention specified by
 	// drafts 14-15. Drafts 16-19 use hash-first under the same VersionDraft12
-	// and TYPE=1 identifiers, which remains the default for compatibility.
+	// and TYPE=1 identifiers. This option requires flex mode.
 	Draft14NodeFirst bool
 }
 
 // CreateReplies builds signed responses for a batch of requests. A zero
-// midpoint uses the current time. Radius is rounded up to the wire unit and its
-// required floor. Midpoints outside years 2000–3000 are rejected. For the
-// ambiguous TYPE=1 wire group it emits the draft-16+ hash-first Merkle form.
-// Use [CreateRepliesWithOptions] for a draft-14/15 peer.
+// midpoint uses the current time. Radius includes midpoint rounding and is
+// rounded up to whole seconds. The input radius must be positive.
+// This function accepts only RFC version 1. Use
+// [CreateRepliesWithOptions] for flex draft replies.
 func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate) ([][]byte, error) {
 	return CreateRepliesWithOptions(ver, requests, midpoint, radius, cert, ReplyOptions{})
 }
@@ -37,6 +43,9 @@ func CreateReplies(ver Version, requests []Request, midpoint time.Time, radius t
 // CreateRepliesWithOptions builds signed responses with explicit choices for
 // wire behavior that the negotiated version cannot disambiguate.
 func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Time, radius time.Duration, cert *Certificate, opts ReplyOptions) ([][]byte, error) {
+	if err := checkVersions(opts.Mode, []Version{ver}); err != nil {
+		return nil, err
+	}
 	if len(requests) == 0 {
 		return nil, errors.New("protocol: no requests")
 	}
@@ -57,9 +66,34 @@ func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Tim
 	if !cert.supportsVersion(ver) {
 		return nil, fmt.Errorf("protocol: certificate is not configured for version %s", ver)
 	}
+	supportedVERS := cert.signedVERS()
+	if opts.SupportedVersions != nil {
+		versions, err := normalizeCertificateVersions(opts.SupportedVersions, cert.scheme)
+		if err != nil {
+			return nil, err
+		}
+		if !slices.Contains(versions, ver) {
+			return nil, errors.New("protocol: advertised versions exclude selected version")
+		}
+		for _, v := range versions {
+			if !cert.supportsVersion(v) {
+				return nil, fmt.Errorf("protocol: advertised version %s is not configured", v)
+			}
+		}
+		supportedVERS = encodeCertificateVERS(versions)
+	}
 
 	ns := nonceSize(g)
 	for i := range requests {
+		if usesFullPacketLeaf(g) {
+			parsed, err := ParseRequestWithMode(requests[i].RawPacket, opts.Mode)
+			if err != nil {
+				return nil, fmt.Errorf("protocol: request %d: %w", i, err)
+			}
+			if !bytes.Equal(parsed.Nonce, requests[i].Nonce) || !slices.Equal(parsed.Versions, requests[i].Versions) || !bytes.Equal(parsed.SRV, requests[i].SRV) || parsed.HasType != requests[i].HasType {
+				return nil, fmt.Errorf("protocol: request %d fields do not match packet", i)
+			}
+		}
 		if i > 0 && wireGroupOf(ver, requests[i].HasType) != g {
 			return nil, errors.New("protocol: batch contains requests with incompatible wire groups")
 		}
@@ -91,21 +125,31 @@ func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Tim
 	if err := validateTimestampEncoding(midpoint, g); err != nil {
 		return nil, fmt.Errorf("protocol: invalid midpoint: %w", err)
 	}
-	if midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint) {
+	if !usesRFCFormat(g) && (midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint)) {
 		return nil, errors.New("protocol: midpoint outside plausible calendar range")
 	}
 	if radius < 0 {
 		return nil, errors.New("protocol: radius must not be negative")
 	}
 	if g >= groupD10 && radius == 0 {
-		return nil, errors.New("protocol: radius must not be zero for drafts 10+")
+		return nil, errors.New("protocol: second-based radius must not be zero")
 	}
-	if _, err := encodeRadius(radius, g); err != nil {
+	timeUnit := time.Second
+	if g == groupGoogle || usesMJDMicroseconds(g) {
+		timeUnit = time.Microsecond
+	}
+	loss := midpoint.Sub(midpoint.Truncate(timeUnit))
+	if radius > time.Duration(1<<63-1)-loss {
+		return nil, errors.New("protocol: radius overflow after midpoint rounding")
+	}
+	wireRadius, err := encodeRadius(radius+loss, g)
+	if err != nil {
 		return nil, err
 	}
+	encodedMidpoint := encodeTimestamp(midpoint, g)
 	certMint := encodeTimestamp(cert.mint, g)
 	certMaxt := encodeTimestamp(cert.maxt, g)
-	if _, _, err := validateDelegationWindow(midpoint, radius, certMint[:], certMaxt[:], g); err != nil {
+	if _, _, err := validateDelegationWindow(midpoint.Truncate(timeUnit), time.Duration(wireRadius)*timeUnit, encodedMidpoint[:], certMint[:], certMaxt[:], g); err != nil {
 		return nil, fmt.Errorf("protocol: refusing to sign unverifiable midpoint: %w", err)
 	}
 
@@ -119,7 +163,7 @@ func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Tim
 	}
 	tree := newMerkleTreeWithOrder(g, leafData, merkleNodeFirst(g) || opts.Draft14NodeFirst)
 
-	srepBytes, err := buildSREP(ver, g, requests, midpoint, radius, tree.rootHash, cert.signedVERS())
+	srepBytes, err := buildSREP(ver, g, requests, midpoint, wireRadius, tree.rootHash, supportedVERS)
 	if err != nil {
 		return nil, err
 	}
@@ -130,12 +174,12 @@ func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Tim
 		if len(cert.edOnlineSK) != ed25519.PrivateKeySize {
 			return nil, errors.New("protocol: invalid Ed25519 online signing key")
 		}
-		srepSig = signEd25519(cert.edOnlineSK, srepBytes, responseCtx)
+		srepSig = signEd25519(cert.edOnlineSK, srepBytes, responseContext(g))
 	case schemeMLDSA44:
 		if cert.pqOnlineSK == nil {
 			return nil, errors.New("protocol: nil ML-DSA-44 online signing key")
 		}
-		srepSig, err = signMLDSA44(cert.pqOnlineSK, srepBytes, responseCtx)
+		srepSig, err = signMLDSA44(cert.pqOnlineSK, srepBytes, responseContext(g))
 		if err != nil {
 			return nil, fmt.Errorf("protocol: ML-DSA-44 sign SREP: %w", err)
 		}
@@ -161,14 +205,10 @@ func CreateRepliesWithOptions(ver Version, requests []Request, midpoint time.Tim
 
 // buildSREP constructs the signed response carrying MIDP, RADI, ROOT, and
 // version tags.
-func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time, radius time.Duration, rootHash, supportedVERS []byte) ([]byte, error) {
+func buildSREP(ver Version, g wireGroup, requests []Request, midpoint time.Time, radius uint32, rootHash, supportedVERS []byte) ([]byte, error) {
 	midpBuf := encodeTimestamp(midpoint, g)
 	var radiBuf [4]byte
-	wireRadius, err := encodeRadius(radius, g)
-	if err != nil {
-		return nil, err
-	}
-	binary.LittleEndian.PutUint32(radiBuf[:], wireRadius)
+	binary.LittleEndian.PutUint32(radiBuf[:], radius)
 
 	srepTags := map[uint32][]byte{
 		TagRADI: radiBuf[:],
@@ -204,10 +244,7 @@ func validateRequestForReply(ver Version, req Request, cert *Certificate) error 
 		return errors.New("request SRV does not identify this certificate root")
 	}
 	if len(req.RawPacket) == 0 {
-		// Before draft 12 the Merkle leaf is the nonce, so the historical API
-		// permitted callers to construct Request values without retaining the
-		// encoded packet. Drafts 12+ authenticate the full packet and must have
-		// it.
+		// Nonce-leaf profiles allow caller-built requests without RawPacket.
 		if usesFullPacketLeaf(wireGroupOf(ver, req.HasType)) {
 			return errors.New("missing RawPacket for full-packet Merkle leaf")
 		}
@@ -217,8 +254,7 @@ func validateRequestForReply(ver Version, req Request, cert *Certificate) error 
 			}
 			return nil
 		}
-		// Historically Request{Nonce: ...} was sufficient for nonce-leaf IETF
-		// versions. If a caller supplies an offer list, keep validating it.
+		// An optional offer list must include the selected nonce-leaf version.
 		if len(req.Versions) > 0 && !slices.Contains(req.Versions, ver) {
 			return fmt.Errorf("selected version %s was not offered", ver)
 		}

@@ -15,6 +15,8 @@ import (
 type runMeta struct {
 	workers int
 	verify  bool
+	// strict selects authenticated reply counts in the report.
+	strict bool
 }
 
 // report aggregates per-worker results and prints a summary.
@@ -56,8 +58,12 @@ func report(meta runMeta, results []workerResult, latencies []time.Duration, ela
 	fmt.Printf("Duration:     %s\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("Workers:      %d\n", meta.workers)
 	fmt.Printf("Sent:         %d\n", sent)
-	fmt.Printf("Received:     %d\n", received)
-	if meta.verify {
+	if meta.strict {
+		fmt.Printf("Verified:     %d\n", successes)
+	} else {
+		fmt.Printf("Received:     %d\n", received)
+	}
+	if meta.verify && !meta.strict {
 		fmt.Printf("Verify fail:  %d (grease or fault)\n", errVerify)
 	}
 	if errAmp > 0 {

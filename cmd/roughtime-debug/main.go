@@ -2,8 +2,8 @@
 // is governed by a BSD-style license that can be found in the LICENSE file.
 
 // Command roughtime-debug probes a server's supported wire versions and prints
-// a concise authenticated response summary. Full scans probe draft 12 in typed
-// and untyped forms.
+// an authenticated response summary. Strict mode probes RFC version 1. Flex
+// scans also probe the draft and experimental variants.
 package main
 
 import (
@@ -26,6 +26,8 @@ import (
 )
 
 var (
+	// flex enables legacy and experimental wire profiles.
+	flex = flag.Bool("flex", false, "also probe implemented drafts, Google-Roughtime, and ML-DSA-44")
 	// addr is the server endpoint flag.
 	addr = flag.String("addr", "", "host:port of the Roughtime server")
 	// pubkey is the server root-key flag.
@@ -39,7 +41,7 @@ var (
 	// scanTimeout bounds the complete version scan, including retry backoff.
 	scanTimeout = flag.Duration("scan-timeout", defaultScanTimeout, "maximum duration for the complete version scan")
 	// forceVer selects one wire version.
-	forceVer = flag.String("ver", "", "probe one wire version (e.g. draft-12, Google, ml-dsa-44). Names are case-sensitive. draft-12 falls back to the untyped form")
+	forceVer = flag.String("ver", "", "probe one wire version (v1, or draft-12, Google, ml-dsa-44 with -flex). Names are case-sensitive")
 	// showVersion requests version output and exit.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -74,14 +76,12 @@ const (
 	defaultScanTimeout = 5 * time.Minute
 	// debugBackoffInitial is the delay after the first failed exchange.
 	debugBackoffInitial = 1 * time.Second
-	// debugBackoffMax lets a full diagnostic scan fit its default budget. Draft
-	// 19 section 5 permits alternate timer values. The high-level client keeps
-	// the recommended 24-hour cap.
+	// debugBackoffMax bounds diagnostic delays within the scan budget.
 	debugBackoffMax = 3 * time.Second
 )
 
-// debugRetryState applies the draft retry schedule across every request sent
-// during one run. A successful, fully verified response is the only reset.
+// debugRetryState applies exponential backoff across every request sent during
+// one run. A successful, fully verified response is the only reset.
 type debugRetryState struct {
 	delay time.Duration
 	wait  func(context.Context, time.Duration) error
@@ -181,11 +181,14 @@ func validateFlags() error {
 
 // defaultProbeVersions returns every implemented version compatible with sch.
 func defaultProbeVersions(sch roughtime.Scheme) []protocol.Version {
+	if !*flex {
+		return roughtime.VersionsForScheme(sch)
+	}
 	if sch == roughtime.SchemeMLDSA44 {
 		return []protocol.Version{protocol.VersionMLDSA44}
 	}
-	versions := make([]protocol.Version, 0, len(protocol.Supported()))
-	for _, candidate := range protocol.Supported() {
+	versions := make([]protocol.Version, 0, len(protocol.SupportedWithMode(protocol.Flex)))
+	for _, candidate := range protocol.SupportedWithMode(protocol.Flex) {
 		if candidate != protocol.VersionMLDSA44 {
 			versions = append(versions, candidate)
 		}
@@ -225,6 +228,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if !*flex && sch != roughtime.SchemeEd25519 {
+		return errors.New("ML-DSA-44 requires -flex")
+	}
 	plans := defaultProbePlans(sch)
 	transport := "udp"
 	if sch == roughtime.SchemeMLDSA44 || *useTCP {
@@ -237,6 +243,9 @@ func run(ctx context.Context) error {
 		ver, err := protocol.ParseShortVersion(*forceVer)
 		if err != nil {
 			return err
+		}
+		if !*flex && ver != protocol.Version1 {
+			return errors.New("draft and experimental versions require -flex")
 		}
 		pqKey := sch == roughtime.SchemeMLDSA44
 		pqVer := ver == protocol.VersionMLDSA44
@@ -271,11 +280,15 @@ func run(ctx context.Context) error {
 	fmt.Printf("Overall scan timeout: %s\n", *scanTimeout)
 	var supported []probePlan
 	var best *probeResult
+	labelWidth := 0
+	for _, plan := range plans {
+		labelWidth = max(labelWidth, len(plan.label))
+	}
 
 	for _, plan := range plans {
 		// Google-Roughtime is UDP-only, so a TCP probe would misreport it.
 		if transport == "tcp" && plan.version == protocol.VersionGoogle {
-			fmt.Printf("  %-48s %s\n", plan.label, "skipped (Google-Roughtime is UDP-only)")
+			fmt.Printf("  %-*s  %s\n", labelWidth, plan.label, "skipped (Google-Roughtime is UDP-only)")
 			continue
 		}
 		result := probe(scanCtx, rootPK, plan, transport, retryState)
@@ -283,7 +296,7 @@ func run(ctx context.Context) error {
 		if result.err != nil {
 			status = resultError(result).Error()
 		}
-		fmt.Printf("  %-48s %s\n", plan.label, roughtime.SanitizeForDisplay(status))
+		fmt.Printf("  %-*s  %s\n", labelWidth, plan.label, roughtime.SanitizeForDisplay(status))
 
 		if result.err != nil {
 			if err := scanCtx.Err(); err != nil {
@@ -344,20 +357,22 @@ func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string,
 	if plan.version != protocol.VersionGoogle {
 		srv = protocol.ComputeSRV(rootPK)
 	}
-	legacySize := plan.version != protocol.VersionDraft12 || plan.omitTYPE
+	legacySize := *flex && plan.version != protocol.Version1 && (plan.version != protocol.VersionDraft12 || plan.omitTYPE)
 	sizes := []bool{legacySize}
 	if transport == "udp" && legacySize && plan.version != protocol.VersionGoogle {
 		sizes = append(sizes, false)
 	}
 	for _, useLegacySize := range sizes {
-		nonce, request, err := protocol.CreateRequestWithOptions(versions, rand.Reader, srv, protocol.RequestOptions{
+		options := protocol.RequestOptions{
+			Mode:     protocolMode(),
 			OmitTYPE: plan.omitTYPE, LegacyPacketSize: useLegacySize,
-		})
+		}
+		nonce, request, err := protocol.CreateRequestWithOptions(versions, rand.Reader, srv, options)
 		if err != nil {
 			result.err = fmt.Errorf("request: %w", err)
 			return result
 		}
-		for range *retries {
+		for attempt := range *retries {
 			if err := retryState.beforeAttempt(ctx); err != nil {
 				if len(result.reply) == 0 {
 					result.request = request
@@ -366,6 +381,13 @@ func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string,
 					result.transportErr = err
 				}
 				return result
+			}
+			if attempt > 0 {
+				nonce, request, err = protocol.CreateRequestWithOptions(versions, rand.Reader, srv, options)
+				if err != nil {
+					result.err = fmt.Errorf("request: %w", err)
+					return result
+				}
 			}
 			reply, rtt, localNow, sendErr := probeRoundTrip(ctx, request, *timeout, transport)
 			if sendErr != nil {
@@ -380,6 +402,9 @@ func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string,
 			}
 
 			midpoint, radius, verifyErr := verifyProbeReply(plan, reply, rootPK, nonce, request)
+			if verifyErr == nil && (rtt > *timeout || !*flex && transport == "udp" && len(reply) > len(request)) {
+				verifyErr = errors.New("response exceeds delay or UDP size limit")
+			}
 			result.request = request
 			result.reply = reply
 			result.rtt = rtt
@@ -400,15 +425,14 @@ func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string,
 }
 
 // verifyProbeReply authenticates a reply and requires its TYPE form to match
-// the concrete draft-12 probe. The general protocol verifier remains
-// compatibility-oriented, but discovery must not conflate drafts 12/13 with
-// drafts 14+.
+// the concrete draft-12 probe. Flex discovery distinguishes typed and untyped
+// responses under the shared identifier.
 func verifyProbeReply(plan probePlan, reply, rootPK, nonce, request []byte) (midpoint time.Time, radius time.Duration, err error) {
 	versions := []protocol.Version{plan.version}
 	requireTYPE := plan.version == protocol.VersionDraft12 && !plan.omitTYPE
 	midpoint, radius, err = protocol.VerifyReplyWithOptions(
 		versions, reply, rootPK, nonce, request,
-		protocol.VerifyOptions{RequireTYPE: requireTYPE},
+		protocol.VerifyOptions{Mode: protocolMode(), RequireTYPE: requireTYPE},
 	)
 	if err != nil || plan.version != protocol.VersionDraft12 || !plan.omitTYPE {
 		return midpoint, radius, err
@@ -461,12 +485,20 @@ func msgBody(pkt []byte) []byte {
 	return pkt[protocol.PacketHeaderSize : protocol.PacketHeaderSize+int(bodyLen)]
 }
 
-// decode parses Roughtime tag-value data and prints decode errors.
-func decode(data []byte) map[uint32][]byte {
-	tags, err := protocol.Decode(data)
+// decode parses tag-value data under the version's rules and prints errors.
+func decode(data []byte, version protocol.Version) map[uint32][]byte {
+	tags, err := protocol.DecodeWithVersion(data, version)
 	if err != nil {
 		fmt.Printf("debug: decode: %s\n", roughtime.SanitizeForDisplay(err.Error()))
 		return nil
 	}
 	return tags
+}
+
+// protocolMode returns the mode selected by -flex.
+func protocolMode() protocol.Mode {
+	if *flex {
+		return protocol.Flex
+	}
+	return protocol.Strict
 }

@@ -23,12 +23,17 @@ type validatedRequest struct {
 	requestSize int
 	bufPtr      *[]byte
 	version     protocol.Version
+	// rfcOnly restricts advertised RFC support to the primary listener's
+	// profile.
+	rfcOnly bool
 }
 
 // batchKey groups requests that can share a single signing operation.
 type batchKey struct {
 	version protocol.Version
 	hasType bool
+	// rfcOnly separates primary-port replies from compatibility-port replies.
+	rfcOnly bool
 }
 
 // readyReply is a response awaiting send.
@@ -39,8 +44,12 @@ type readyReply struct {
 
 // validateRequest parses a request, validates SRV, and negotiates a version. On
 // failure the dropReason classifies the rejection.
-func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState) (validatedRequest, dropReason, bool) {
-	req, err := protocol.ParseRequest(requestBytes)
+func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, reqSize int, bufPtr *[]byte, st *certState, allowDrafts bool) (validatedRequest, dropReason, bool) {
+	mode := protocol.Strict
+	if allowDrafts {
+		mode = protocol.Flex
+	}
+	req, err := protocol.ParseRequestWithMode(requestBytes, mode)
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "request parse failed"); ce != nil {
 			ce.Write(
@@ -51,14 +60,14 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 		}
 		return validatedRequest{}, dropParse, false
 	}
-	// drafts 10+: reject when SRV does not address a long-term key
+	// A present SRV must identify the configured root.
 	if req.SRV != nil && !bytes.Equal(req.SRV, st.srvHash) {
 		if ce := log.Check(zap.DebugLevel, "SRV mismatch"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer))
 		}
 		return validatedRequest{}, dropSRV, false
 	}
-	responseVer, err := protocol.SelectVersion(req.Versions, len(req.Nonce), protocol.ServerPreferenceEd25519)
+	responseVer, err := protocol.SelectVersion(req.Versions, len(req.Nonce), ed25519VersionsForPort(allowDrafts))
 	if err != nil {
 		if ce := log.Check(zap.DebugLevel, "version negotiation failed"); ce != nil {
 			ce.Write(zap.Stringer("peer", peer), zap.Error(err))
@@ -71,6 +80,7 @@ func validateRequest(log *zap.Logger, requestBytes []byte, peer *net.UDPAddr, re
 		requestSize: reqSize,
 		bufPtr:      bufPtr,
 		version:     responseVer,
+		rfcOnly:     !allowDrafts,
 	}, dropNone, true
 }
 
@@ -108,8 +118,8 @@ func signAndBuildRepliesCurrent(log *zap.Logger, state *atomic.Pointer[certState
 		reqs[i] = items[i].req
 	}
 
-	// zero midpoint defers timestamping to CreateReplies
-	replies, err := protocol.CreateReplies(ver, reqs, time.Time{}, radius, st.cert)
+	midpoint := serverMidpoint(time.Now(), ver)
+	replies, err := protocol.CreateRepliesWithOptions(ver, reqs, midpoint, radius, st.cert, serverReplyOptions(ver, items[0].rfcOnly))
 	if err != nil {
 		statsBatchErrs.Add(1)
 		// per-item bumps keep dropped/batch_err parity with the TCP path
@@ -154,4 +164,26 @@ func signAndBuildRepliesCurrent(log *zap.Logger, state *atomic.Pointer[certState
 		out = append(out, readyReply{peer: items[i].peer, bytes: reply})
 	}
 	return out
+}
+
+// serverMidpoint aligns the timestamp to its wire precision so rounding stays
+// within the server's total radius. Legacy profiles retain microsecond
+// precision.
+func serverMidpoint(now time.Time, ver protocol.Version) time.Time {
+	unit := time.Second
+	if ver == protocol.VersionGoogle || ver >= protocol.VersionDraft01 && ver <= protocol.VersionDraft07 {
+		unit = time.Microsecond
+	}
+	return now.Truncate(unit)
+}
+
+// serverReplyOptions limits the primary port's RFC VERS without changing the
+// shared delegation or the format of draft and ML-DSA-44 replies.
+func serverReplyOptions(ver protocol.Version, rfcOnly bool) protocol.ReplyOptions {
+	opts := protocol.ReplyOptions{Mode: protocol.Flex}
+	if ver == protocol.Version1 && rfcOnly {
+		opts.Mode = protocol.Strict
+		opts.SupportedVersions = []protocol.Version{protocol.Version1}
+	}
+	return opts
 }

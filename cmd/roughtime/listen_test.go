@@ -26,6 +26,7 @@ import (
 func TestMain(m *testing.M) {
 	logger = zap.NewNop()
 	*greaseRate = 0
+	*flexPort = 2002
 	m.Run()
 }
 
@@ -86,7 +87,7 @@ func TestListenBatchesConcurrentRequests(t *testing.T) {
 				return
 			}
 			defer func() { _ = conn.Close() }()
-			nonce, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+			nonce, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 			if err != nil {
 				t.Errorf("CreateRequest: %v", err)
 				ready <- struct{}{}
@@ -105,7 +106,7 @@ func TestListenBatchesConcurrentRequests(t *testing.T) {
 				t.Errorf("read: %v", err)
 				return
 			}
-			if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12}, buf[:n], rootPK, nonce, req); err != nil {
+			if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{protocol.VersionDraft12}, buf[:n], rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 				t.Errorf("VerifyReply: %v", err)
 			}
 		})
@@ -138,16 +139,21 @@ func TestListenBatchesConcurrentRequests(t *testing.T) {
 // startListen launches listen on a free port, retrying on bind races.
 func startListen(t *testing.T, st *atomic.Pointer[certState]) (int, chan error, context.CancelFunc) {
 	t.Helper()
+	savedFlexPort := *flexPort
+	t.Cleanup(func() { *flexPort = savedFlexPort })
 	const maxAttempts = 5
 	var lastErr error
 	for range maxAttempts {
 		p := pickFreeUDPPort(t)
 		*port = p
+		if savedFlexPort != 0 {
+			*flexPort = p
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
 			defer close(done)
-			done <- listen(ctx, st)
+			done <- listen(ctx, st, p)
 		}()
 
 		// retry on fast failure (e.g. EADDRINUSE)
@@ -183,7 +189,7 @@ func waitForServerReady(t *testing.T, p int, rootPK ed25519.PublicKey) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		_, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
+		_, req, err := protocol.CreateRequestWithOptions(versions, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 		if err != nil {
 			t.Fatalf("CreateRequest: %v", err)
 		}
@@ -227,7 +233,7 @@ func TestListenMixedVersionBatch(t *testing.T) {
 			t.Fatalf("dial: %v", err)
 		}
 		defer func() { _ = conn.Close() }()
-		nonce, req, err := protocol.CreateRequest(vers, rand.Reader, srv)
+		nonce, req, err := protocol.CreateRequestWithOptions(vers, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 		if err != nil {
 			t.Fatalf("CreateRequest: %v", err)
 		}
@@ -240,7 +246,7 @@ func TestListenMixedVersionBatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if _, _, err := protocol.VerifyReply(vers, buf[:n], rootPK, nonce, req); err != nil {
+		if _, _, err := protocol.VerifyReplyWithOptions(vers, buf[:n], rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 			t.Fatalf("verify: %v", err)
 		}
 	}
@@ -278,7 +284,7 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 							t.Errorf("dial: %v", err)
 							return
 						}
-						nonce, req, err := protocol.CreateRequest([]protocol.Version{v}, rand.Reader, srv)
+						nonce, req, err := protocol.CreateRequestWithOptions([]protocol.Version{v}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 						if err != nil {
 							t.Errorf("CreateRequest: %v", err)
 							_ = conn.Close()
@@ -297,7 +303,7 @@ func TestListenNoncInSREPSingletons(t *testing.T) {
 							t.Errorf("read: %v", err)
 							return
 						}
-						if _, _, err := protocol.VerifyReply([]protocol.Version{v}, buf[:n], rootPK, nonce, req); err != nil {
+						if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{v}, buf[:n], rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 							t.Errorf("verify %s: %v", v, err)
 						}
 					}
@@ -397,7 +403,7 @@ func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 
 	buf := make([]byte, 1500)
 	for i := range n {
-		nonce, req, err := protocol.CreateRequest(versions, rand.Reader, srv)
+		nonce, req, err := protocol.CreateRequestWithOptions(versions, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 		if err != nil {
 			t.Fatalf("CreateRequest: %v", err)
 		}
@@ -409,7 +415,7 @@ func sendAndVerify(t *testing.T, p int, rootPK ed25519.PublicKey, n int) {
 		if err != nil {
 			t.Fatalf("read %d: %v", i, err)
 		}
-		if _, _, err := protocol.VerifyReply(versions, buf[:m], rootPK, nonce, req); err != nil {
+		if _, _, err := protocol.VerifyReplyWithOptions(versions, buf[:m], rootPK, nonce, req, protocol.VerifyOptions{Mode: protocol.Flex}); err != nil {
 			t.Fatalf("verify %d: %v", i, err)
 		}
 	}

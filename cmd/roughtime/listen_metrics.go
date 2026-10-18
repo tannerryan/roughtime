@@ -67,7 +67,7 @@ func listenMetrics(ctx context.Context, addr string) error {
 	)
 
 	// serveCtx fires on parent cancel or on Serve returning early. The deferred
-	// wait ensures Shutdown drains handlers before we return.
+	// wait ensures shutdown finishes before we return.
 	serveCtx, serveCancel := context.WithCancel(ctx)
 	shutdownDone := make(chan struct{})
 	defer func() {
@@ -81,6 +81,7 @@ func listenMetrics(ctx context.Context, addr string) error {
 		defer scancel()
 		if err := srv.Shutdown(sctx); err != nil {
 			log.Warn("metrics shutdown returned an error", zap.Error(err))
+			_ = srv.Close()
 		}
 	}()
 

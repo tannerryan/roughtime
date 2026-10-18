@@ -172,6 +172,7 @@ func TestWriteMalfeasance(t *testing.T) {
 // TestFilterCompatibleNormalizes covers the scheme/version filter, preferred
 // endpoint order used by operator sampling, and trust-root de-duplication.
 func TestFilterCompatibleNormalizes(t *testing.T) {
+	useFlexMode(t)
 	keyA := bytes.Repeat([]byte{1}, 32)
 	keyB := bytes.Repeat([]byte{2}, 32)
 	tests := []struct {
@@ -197,7 +198,7 @@ func TestFilterCompatibleNormalizes(t *testing.T) {
 		{
 			name: "old version dropped",
 			servers: []roughtime.Server{{
-				Version:   "1",
+				Version:   "0",
 				PublicKey: keyA,
 				Addresses: []roughtime.Address{{Transport: "udp", Address: "old.test:2002"}},
 			}},
@@ -245,7 +246,7 @@ func TestFilterCompatibleNormalizes(t *testing.T) {
 			name: "unusable root alias ignored",
 			servers: []roughtime.Server{
 				{PublicKey: keyB, Addresses: []roughtime.Address{{Transport: "udp", Address: "first.test:2002"}}},
-				{Version: "1", PublicKey: keyB, Addresses: []roughtime.Address{{Transport: "udp", Address: "second.test:2002"}}},
+				{Version: "0", PublicKey: keyB, Addresses: []roughtime.Address{{Transport: "udp", Address: "second.test:2002"}}},
 			},
 			want:      1,
 			wantFirst: "first.test:2002",
@@ -274,6 +275,7 @@ func TestFilterCompatibleNormalizes(t *testing.T) {
 // TestFilterCompatibleMatchesProofClassification ensures creation only selects
 // roots that verification can assign to endpoint-domain groups.
 func TestFilterCompatibleMatchesProofClassification(t *testing.T) {
+	useFlexMode(t)
 	keyA := bytes.Repeat([]byte{1}, 32)
 	keyC := bytes.Repeat([]byte{2}, 32)
 	keyD := bytes.Repeat([]byte{3}, 32)
@@ -321,6 +323,7 @@ func TestFilterCompatibleMatchesProofClassification(t *testing.T) {
 // TestAnalyzeProofNormalizedGroups covers same-order classification after
 // endpoint normalization and conservative handling of root aliases.
 func TestAnalyzeProofNormalizedGroups(t *testing.T) {
+	useFlexMode(t)
 	keyA := bytes.Repeat([]byte{1}, 32)
 	keyB := bytes.Repeat([]byte{2}, 32)
 	keyC := bytes.Repeat([]byte{3}, 32)
@@ -352,7 +355,7 @@ func TestAnalyzeProofNormalizedGroups(t *testing.T) {
 			"unusable alias ignored",
 			validLinks,
 			append(append([]roughtime.Server(nil), baseServers...), roughtime.Server{
-				Version:   "1",
+				Version:   "0",
 				PublicKey: keyA,
 				Addresses: []roughtime.Address{{Transport: "udp", Address: "198.51.100.1:2002"}},
 			}),
@@ -380,5 +383,50 @@ func TestAnalyzeProofNormalizedGroups(t *testing.T) {
 					got, tc.twoPass, tc.passSize, tc.groups)
 			}
 		})
+	}
+}
+
+// useFlexMode enables flex mode for the test.
+func useFlexMode(t *testing.T) {
+	t.Helper()
+	previous := *flex
+	*flex = true
+	t.Cleanup(func() { *flex = previous })
+}
+
+// TestLoadMixedEcosystemInStrictMode keeps legacy list syntax independent of
+// the signature suites permitted for RFC witnesses.
+func TestLoadMixedEcosystemInStrictMode(t *testing.T) {
+	previous := *flex
+	*flex = false
+	t.Cleanup(func() { *flex = previous })
+	data, err := roughtime.MarshalEcosystemWithMode([]roughtime.Server{
+		{
+			Name: "rfc", Version: "IETF-Roughtime", PublicKey: bytes.Repeat([]byte{1}, 32),
+			Addresses: []roughtime.Address{{Transport: "udp", Address: "rfc.example:5319"}},
+		},
+		{
+			Name: "pq", Version: "ml-dsa-44", PublicKey: bytes.Repeat([]byte{2}, protocol.MLDSA44PublicKeySize),
+			Addresses: []roughtime.Address{{Transport: "tcp", Address: "pq.example:5319"}},
+		},
+	}, protocol.Flex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "servers.json")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	servers, err := loadServers(path)
+	if err != nil || len(servers) != 2 {
+		t.Fatalf("mixed list: %v, %v", servers, err)
+	}
+	witnesses := filterCompatible(servers)
+	if len(witnesses) != 1 || witnesses[0].Name != "rfc" || protocolMode() != protocol.Strict {
+		t.Fatalf("strict witnesses: %v", witnesses)
+	}
+	*flex = true
+	if witnesses := filterCompatible(servers); len(witnesses) != 2 {
+		t.Fatalf("flex witnesses: %v", witnesses)
 	}
 }

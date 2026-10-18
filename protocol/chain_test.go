@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,7 +26,7 @@ func newChainServer(t *testing.T, ver Version) chainServer {
 	t.Helper()
 	rootSK, onlineSK := testKeys(t)
 	now := time.Now()
-	cert, err := NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,11 +40,11 @@ func newChainServer(t *testing.T, ver Version) chainServer {
 // respond builds a signed reply for a single request.
 func (s chainServer) respond(t *testing.T, request []byte) []byte {
 	t.Helper()
-	parsed, err := ParseRequest(request)
+	parsed, err := ParseRequestWithMode(request, Flex)
 	if err != nil {
 		t.Fatalf("parse request: %v", err)
 	}
-	replies, err := CreateReplies(s.ver, []Request{*parsed}, time.Now(), time.Second, s.cert)
+	replies, err := CreateRepliesWithOptions(s.ver, []Request{*parsed}, time.Now(), time.Second, s.cert, ReplyOptions{Mode: Flex})
 	if err != nil || len(replies) != 1 {
 		t.Fatalf("create reply: %v", err)
 	}
@@ -58,7 +59,7 @@ func buildChain(t *testing.T, ver Version, n int) (*Chain, []chainServer) {
 		servers[i] = newChainServer(t, ver)
 	}
 
-	var c Chain
+	c := Chain{Mode: Flex}
 	for _, srv := range servers {
 		link, err := c.NextRequest([]Version{ver}, srv.rootPK, rand.Reader)
 		if err != nil {
@@ -78,7 +79,7 @@ func TestChainNonce(t *testing.T) {
 		size    int
 		double  bool
 	}{
-		{VersionGoogle, 64, false},
+		{VersionGoogle, 64, true},
 		{VersionDraft01, 64, true},
 		{VersionDraft12, 32, false},
 	} {
@@ -102,11 +103,66 @@ func TestChainNonce(t *testing.T) {
 	}
 }
 
+// TestChainRejectsMixedNonceDerivations rejects offers that can negotiate an
+// incompatible draft-01 linkage, including chains built outside NextRequest.
+func TestChainRejectsMixedNonceDerivations(t *testing.T) {
+	srv := newChainServer(t, VersionDraft01)
+	t.Cleanup(srv.cert.Wipe)
+	chain := Chain{Mode: Flex}
+	first, err := chain.NextRequest([]Version{VersionDraft01}, srv.rootPK, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Response = srv.respond(t, first.Request)
+	chain.Append(first)
+
+	for _, other := range []Version{VersionDraft02, VersionDraft03, VersionDraft04} {
+		t.Run(other.ShortString(), func(t *testing.T) {
+			versions := []Version{VersionDraft01, other}
+			if _, _, err := ChainNonce(nil, rand.Reader, versions); err == nil {
+				t.Fatal("accepted incompatible chain offer")
+			}
+			if _, err := chain.NextRequest(versions, srv.rootPK, rand.Reader); err == nil {
+				t.Fatal("constructed request with incompatible chain offer")
+			}
+
+			// Recreate the old single-hash linkage and authenticate it as draft
+			// 01.
+			blind := bytes.Repeat([]byte{0x42}, 64)
+			nonce := sha512.Sum512(append(bytes.Clone(first.Response), blind...))
+			request, err := CreateRequestWithNonceOptions(versions, nonce[:], nil, RequestOptions{Mode: Flex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			second := ChainLink{
+				Rand: blind, PublicKey: srv.rootPK, Nonce: nonce[:],
+				Request: request, Response: srv.respond(t, request),
+			}
+			imported := Chain{Mode: Flex, Links: []ChainLink{first, second}}
+			if err := imported.Verify(); err == nil || !strings.Contains(err.Error(), "nonce derivations") {
+				t.Fatalf("mixed chain verification = %v", err)
+			}
+		})
+	}
+
+	// Offers that retain one derivation after nonce-size filtering remain
+	// valid.
+	for _, versions := range [][]Version{
+		{VersionDraft02, VersionDraft03, VersionDraft04},
+		{VersionDraft01, VersionDraft12},
+		{VersionDraft01, Version1},
+	} {
+		if _, _, err := ChainNonce(first.Response, rand.Reader, versions); err != nil {
+			t.Fatalf("compatible offer %v: %v", versions, err)
+		}
+	}
+}
+
 // TestNextRequestWithNonceFirstLink covers caller-supplied first nonces.
 func TestNextRequestWithNonceFirstLink(t *testing.T) {
 	srv := newChainServer(t, VersionDraft12)
 	seed := bytes.Repeat([]byte{0x42}, 32)
-	var c Chain
+	c := Chain{Mode: Flex}
 	link, err := c.NextRequestWithNonce([]Version{VersionDraft12}, srv.rootPK, seed)
 	if err != nil {
 		t.Fatalf("NextRequestWithNonce: %v", err)
@@ -132,17 +188,17 @@ func TestPQChainVerify(t *testing.T) {
 	cert, rootPK := testPQCert(t)
 	versions := []Version{VersionMLDSA44}
 
-	var chain Chain
+	chain := Chain{Mode: Flex}
 	for i := range 2 {
 		link, err := chain.NextRequest(versions, rootPK, rand.Reader)
 		if err != nil {
 			t.Fatalf("NextRequest %d: %v", i, err)
 		}
-		parsed, err := ParseRequest(link.Request)
+		parsed, err := ParseRequestWithMode(link.Request, Flex)
 		if err != nil {
 			t.Fatalf("ParseRequest %d: %v", i, err)
 		}
-		replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now().Add(time.Duration(i)*time.Second), time.Second, cert)
+		replies, err := CreateRepliesWithOptions(VersionMLDSA44, []Request{*parsed}, time.Now().Add(time.Duration(i)*time.Second), time.Second, cert, ReplyOptions{Mode: Flex})
 		if err != nil {
 			t.Fatalf("CreateReplies %d: %v", i, err)
 		}
@@ -164,7 +220,8 @@ func TestVerifyCausalOrderFiveLinks(t *testing.T) {
 		servers[i] = newChainServer(t, ver)
 	}
 
-	// link 2 is the peak. Link 4 drops below it, violating the running max
+	// Link 3's wide interval permits both adjacent pairs. Link 4 contradicts
+	// link 2, so checking adjacent links alone would miss the violation.
 	base := time.Now().Truncate(time.Second)
 	midpoints := []time.Time{
 		base.Add(-10 * time.Minute),
@@ -173,18 +230,19 @@ func TestVerifyCausalOrderFiveLinks(t *testing.T) {
 		base.Add(10 * time.Minute),
 		base.Add(-15 * time.Minute),
 	}
+	radii := []time.Duration{time.Second, time.Second, time.Second, 30 * time.Minute, time.Second}
 
-	var c Chain
+	c := Chain{Mode: Flex}
 	for i, srv := range servers {
 		link, err := c.NextRequest(versions, srv.rootPK, rand.Reader)
 		if err != nil {
 			t.Fatalf("next request %d: %v", i, err)
 		}
-		req, err := ParseRequest(link.Request)
+		req, err := ParseRequestWithMode(link.Request, Flex)
 		if err != nil {
 			t.Fatalf("parse %d: %v", i, err)
 		}
-		replies, err := CreateReplies(ver, []Request{*req}, midpoints[i], time.Second, srv.cert)
+		replies, err := CreateRepliesWithOptions(ver, []Request{*req}, midpoints[i], radii[i], srv.cert, ReplyOptions{Mode: Flex})
 		if err != nil {
 			t.Fatalf("create reply %d: %v", i, err)
 		}
@@ -219,7 +277,7 @@ func TestVerifyBoundsReturnsPerLinkBounds(t *testing.T) {
 			t.Errorf("link %d: non-positive radius %v", i, b.Radius)
 		}
 	}
-	over := &Chain{Links: make([]ChainLink, MaxChainLinks+1)}
+	over := &Chain{Mode: Flex, Links: make([]ChainLink, MaxChainLinks+1)}
 	if _, err := over.VerifyBounds(); err == nil {
 		t.Fatal("expected error for chain length > MaxChainLinks")
 	}
@@ -233,7 +291,7 @@ func TestChainMixedVersions(t *testing.T) {
 		servers[i] = newChainServer(t, ver)
 	}
 
-	var c Chain
+	c := Chain{Mode: Flex}
 	for i, srv := range servers {
 		ver := versions[i]
 		link, err := c.NextRequest([]Version{ver}, srv.rootPK, rand.Reader)

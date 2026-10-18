@@ -30,21 +30,26 @@ func VerifyReply(versions []Version, reply, rootPK, nonce, requestBytes []byte) 
 	return VerifyReplyWithOptions(versions, reply, rootPK, nonce, requestBytes, VerifyOptions{})
 }
 
-// VerifyOptions controls strict checks for wire behavior that the shared
-// version number cannot disambiguate.
+// VerifyOptions selects compatibility mode and draft-specific checks.
 type VerifyOptions struct {
+	// Mode selects strict or flex protocol support.
+	Mode Mode
 	// RequireTYPE requires TYPE=0 in a VersionDraft12 request and TYPE=1 in its
-	// response. Leave it false when draft-12/13 peers must remain acceptable.
-	// ML-DSA-44 always requires both tags.
+	// response in flex mode. RFC and ML-DSA-44 always require both tags.
 	RequireTYPE bool
 }
 
 // VerifyReplyWithOptions authenticates a response and returns its midpoint and
 // radius. versions must be nonempty and recognized, and nonce must have the
-// selected version's length and match the request. Drafts 12+ and ML-DSA-44
-// require requestBytes. Midpoints outside years 2000–3000 are rejected to
-// prevent unsigned legacy VER changes from relabeling the timestamp epoch.
+// selected version's length and match the request. RFC, drafts 12+, and
+// ML-DSA-44 require requestBytes. Flex legacy profiles reject midpoints outside
+// years 2000-3000 to guard against unsigned timestamp-epoch changes. MJD
+// leap-second replies include one extra second of uncertainty because Go time
+// cannot represent second 60.
 func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestBytes []byte, opts VerifyOptions) (midpoint time.Time, radius time.Duration, err error) {
+	if err := checkVersions(opts.Mode, versions); err != nil {
+		return time.Time{}, 0, err
+	}
 	bestVer, bestG, err := clientVersionPreference(versions)
 	if err != nil {
 		return time.Time{}, 0, err
@@ -52,7 +57,7 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 	offeredVersions := versions
 	var parsedRequest *Request
 	if len(requestBytes) != 0 {
-		parsedRequest, err = ParseRequest(requestBytes)
+		parsedRequest, err = ParseRequestWithMode(requestBytes, opts.Mode)
 		if err != nil {
 			return time.Time{}, 0, fmt.Errorf("protocol: parse request: %w", err)
 		}
@@ -72,14 +77,14 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 		return time.Time{}, 0, err
 	}
 
-	resp, err := Decode(respBytes)
+	resp, err := decodeMessage(respBytes, opts.Mode == Flex)
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("protocol: decode reply: %w", err)
 	}
 
 	var srep map[uint32][]byte
 	if srepBytes, ok := resp[TagSREP]; ok {
-		s, derr := Decode(srepBytes)
+		s, derr := decodeMessage(srepBytes, opts.Mode == Flex)
 		if derr != nil {
 			return time.Time{}, 0, fmt.Errorf("protocol: decode SREP: %w", derr)
 		}
@@ -97,7 +102,7 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 			}
 
 			hasRespType := false
-			if respVer == VersionDraft12 || respVer == VersionMLDSA44 {
+			if respVer == Version1 || respVer == VersionDraft12 || respVer == VersionMLDSA44 {
 				respTypeBytes, ok := resp[TagTYPE]
 				if ok {
 					if len(respTypeBytes) != 4 || binary.LittleEndian.Uint32(respTypeBytes) != 1 {
@@ -106,12 +111,12 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 					hasRespType = true
 				}
 				requestHasType := parsedRequest != nil && parsedRequest.HasType
-				if respVer == VersionMLDSA44 {
+				if respVer == Version1 || respVer == VersionMLDSA44 {
 					if !requestHasType {
-						return time.Time{}, 0, errors.New("protocol: missing TYPE in ML-DSA-44 request")
+						return time.Time{}, 0, errors.New("protocol: missing TYPE in request")
 					}
 					if !hasRespType {
-						return time.Time{}, 0, errors.New("protocol: missing TYPE in ML-DSA-44 response")
+						return time.Time{}, 0, errors.New("protocol: missing TYPE in response")
 					}
 				}
 				if opts.RequireTYPE && !requestHasType {
@@ -127,9 +132,16 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 	if len(nonce) != nonceSize(g) {
 		return time.Time{}, 0, fmt.Errorf("protocol: nonce length %d, want %d", len(nonce), nonceSize(g))
 	}
+	if err := validateMessage(respBytes, resp, g); err != nil {
+		return time.Time{}, 0, err
+	}
+	if srep != nil {
+		if err := validateMessage(resp[TagSREP], srep, g); err != nil {
+			return time.Time{}, 0, fmt.Errorf("protocol: invalid SREP: %w", err)
+		}
+	}
 
-	// Drafts 01-11 require top-level VER, while 12+ moved it into SREP. This
-	// checks structure only. Authentication follows below.
+	// Drafts 01-11 require a top-level VER. RFC and drafts 12+ use SREP.VER.
 	if hasResponseVER(g) {
 		vb, ok := resp[TagVER]
 		if !ok {
@@ -146,6 +158,11 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 	}
 
 	_, mintBuf, maxtBuf, err := verifyReplySigs(resp, rootPK, g)
+	if err != nil && g == groupRFC && opts.Mode == Flex {
+		// Flex mode also authenticates version-1 packets using the draft
+		// contexts.
+		_, mintBuf, maxtBuf, err = verifyReplySigs(resp, rootPK, groupD14)
+	}
 	if err != nil {
 		return time.Time{}, 0, err
 	}
@@ -160,13 +177,11 @@ func VerifyReplyWithOptions(versions []Version, reply, rootPK, nonce, requestByt
 		}
 	}
 
-	return validateDelegationWindow(midpoint, radius, mintBuf, maxtBuf, g)
+	return validateDelegationWindow(midpoint, radius, srep[TagMIDP], mintBuf, maxtBuf, g)
 }
 
-// verifySREPVersions validates the signed version declaration used by drafts
-// 12+ and ML-DSA-44. Selection need not use the highest numeric version.
-// Untyped draft-12/13 input may exceed 32 entries because those drafts share an
-// identifier and draft 12 had no limit. Typed modern input remains capped.
+// verifySREPVersions checks signed VER and VERS. Untyped draft input accepts
+// more than 32 versions for compatibility. Typed input has a 32-entry limit.
 func verifySREPVersions(srep map[uint32][]byte, clientVersions []Version, g wireGroup) error {
 	if srep == nil {
 		return errors.New("protocol: missing SREP for downgrade check")
@@ -196,7 +211,7 @@ func verifySREPVersions(srep map[uint32][]byte, clientVersions []Version, g wire
 		}
 		prev = v
 		serverSupports[v] = true
-		if isRecognizedVersion(v) && (v == VersionMLDSA44) != (chosen == VersionMLDSA44) {
+		if !usesRFCFormat(g) && isRecognizedVersion(v) && (v == VersionMLDSA44) != (chosen == VersionMLDSA44) {
 			return errors.New("protocol: VERS mixes incompatible signature schemes")
 		}
 	}
@@ -222,19 +237,18 @@ func extractResponseVER(resp, srep map[uint32][]byte) (Version, bool) {
 // ExtractVersion returns the version claimed by a raw server reply. It does not
 // authenticate the reply. Call [VerifyReply] before trusting the result.
 func ExtractVersion(reply []byte) (Version, bool) {
-	msg := reply
-	if len(reply) >= 12 {
-		if inner, err := unwrapPacket(reply); err == nil {
-			msg = inner
-		}
+	// Unframed Google replies have no VER, including in unknown extensions.
+	msg, err := unwrapPacket(reply)
+	if err != nil {
+		return 0, false
 	}
-	resp, err := Decode(msg)
+	resp, err := decodeMessage(msg, true)
 	if err != nil {
 		return 0, false
 	}
 	var srep map[uint32][]byte
 	if srepBytes, ok := resp[TagSREP]; ok {
-		if s, derr := Decode(srepBytes); derr == nil {
+		if s, derr := decodeMessage(srepBytes, true); derr == nil {
 			srep = s
 		}
 	}
@@ -280,7 +294,7 @@ func verifyReplySigs(resp map[uint32][]byte, rootPK []byte, g wireGroup) ([]byte
 
 	switch scheme {
 	case schemeEd25519:
-		if !verifyEd25519(ed25519.PublicKey(onlinePK), srepBytes, responseCtx, srepSig) {
+		if !verifyEd25519(ed25519.PublicKey(onlinePK), srepBytes, responseContext(g), srepSig) {
 			return nil, nil, nil, errors.New("protocol: SREP signature verification failed")
 		}
 	case schemeMLDSA44:
@@ -288,7 +302,7 @@ func verifyReplySigs(resp map[uint32][]byte, rootPK []byte, g wireGroup) ([]byte
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("protocol: decode online PUBK: %w", err)
 		}
-		if !verifyMLDSA44(pk, srepBytes, responseCtx, srepSig) {
+		if !verifyMLDSA44(pk, srepBytes, responseContext(g), srepSig) {
 			return nil, nil, nil, errors.New("protocol: SREP signature verification failed")
 		}
 	default:
@@ -304,6 +318,11 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	if srep == nil {
 		return time.Time{}, 0, errors.New("protocol: missing SREP")
 	}
+	if usesMJDMicroseconds(g) {
+		if err := validateOptionalTimeFields(srep); err != nil {
+			return time.Time{}, 0, err
+		}
+	}
 	midpBytes, ok := srep[TagMIDP]
 	if !ok {
 		return time.Time{}, 0, errors.New("protocol: missing MIDP")
@@ -317,9 +336,8 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 		return time.Time{}, 0, errors.New("protocol: missing or invalid ROOT")
 	}
 
-	// Drafts 01-02 bind NONC through SREP. Later responses commonly echo NONC
-	// at top level. Validate it when present. Some deployed historical servers
-	// omit that redundant echo, so absence remains accepted for compatibility.
+	// RFC and ML-DSA-44 responses require a top-level NONC. Drafts 01-02 put it
+	// in SREP. Flex verification allows other draft peers to omit the echo.
 	if noncInSREP(g) {
 		srepNonce, ok := srep[TagNONC]
 		if !ok {
@@ -329,6 +347,11 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 			return time.Time{}, 0, errors.New("protocol: NONC in SREP does not match request nonce")
 		}
 	} else if hasResponseNONC(g) {
+		if usesRFCFormat(g) {
+			if echoed, ok := resp[TagNONC]; !ok || len(echoed) != 32 {
+				return time.Time{}, 0, errors.New("protocol: missing or invalid response NONC")
+			}
+		}
 		if echoed, ok := resp[TagNONC]; ok && !bytes.Equal(echoed, nonce) {
 			return time.Time{}, 0, errors.New("protocol: response NONC does not match request nonce")
 		}
@@ -337,7 +360,7 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 	leafData := nonce
 	if usesFullPacketLeaf(g) {
 		if len(requestBytes) == 0 {
-			return time.Time{}, 0, errors.New("protocol: requestBytes required for drafts 12+")
+			return time.Time{}, 0, errors.New("protocol: requestBytes required for full-packet Merkle proof")
 		}
 		leafData = requestBytes
 	}
@@ -350,35 +373,72 @@ func verifyReplySREP(srep, resp map[uint32][]byte, nonce, requestBytes []byte, g
 		return time.Time{}, 0, fmt.Errorf("protocol: decode MIDP: %w", err)
 	}
 	// Reject implausible dates, including epoch misdecodes.
-	if midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint) {
+	if !usesRFCFormat(g) && (midpoint.Before(minPlausibleMidpoint) || midpoint.After(maxPlausibleMidpoint)) {
 		return time.Time{}, 0, errors.New("protocol: midpoint outside plausible calendar range")
 	}
 	radius, err := decodeRadius(radiBytes, g)
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("protocol: decode RADI: %w", err)
 	}
-	// Deployed draft-11 servers advertise sub-three-second radii despite the
-	// draft's lower bound, so compatibility requires rejecting only zero.
+	// RFC and flex second-based profiles require a positive radius.
 	if g >= groupD10 && radius == 0 {
 		return time.Time{}, 0, errors.New("protocol: RADI must not be zero")
 	}
 	return midpoint, radius, nil
 }
 
-// validateDelegationWindow checks the midpoint falls within MINT..MAXT.
-func validateDelegationWindow(midpoint time.Time, radius time.Duration, mintBuf, maxtBuf []byte, g wireGroup) (time.Time, time.Duration, error) {
-	mintTime, err := decodeTimestamp(mintBuf, g)
-	if err != nil {
-		return time.Time{}, 0, fmt.Errorf("protocol: decode MINT: %w", err)
+// validateOptionalTimeFields checks the sign-magnitude fields of drafts 01-07.
+func validateOptionalTimeFields(srep map[uint32][]byte) error {
+	for _, tag := range []uint32{tagDUT1, tagDTAI, tagLEAP} {
+		value, ok := srep[tag]
+		if !ok {
+			continue
+		}
+		if len(value)%4 != 0 || tag != tagLEAP && len(value) != 4 {
+			return fmt.Errorf("protocol: invalid time field 0x%08x length", tag)
+		}
+		previous := uint32(0x7fffffff)
+		for i := 0; i < len(value); i += 4 {
+			n := binary.LittleEndian.Uint32(value[i:])
+			if n == 0x80000000 {
+				return errors.New("protocol: negative zero in optional time field")
+			}
+			magnitude := n & 0x7fffffff
+			if tag == tagLEAP && magnitude > previous {
+				return errors.New("protocol: LEAP events not reverse chronological")
+			}
+			previous = magnitude
+		}
 	}
-	maxtTime, err := decodeTimestamp(maxtBuf, g)
-	if err != nil {
-		return time.Time{}, 0, fmt.Errorf("protocol: decode MAXT: %w", err)
+	return nil
+}
+
+// validateDelegationWindow checks native delegation bounds and returns a
+// conservative Go time interval for leap-second timestamps.
+func validateDelegationWindow(midpoint time.Time, radius time.Duration, midpBuf, mintBuf, maxtBuf []byte, g wireGroup) (time.Time, time.Duration, error) {
+	// Bounds are unsigned wire values and need not fit Go time. Only MIDP and
+	// its returned uncertainty window need that conversion.
+	if usesMJDMicroseconds(g) {
+		if _, err := decodeTimestamp(mintBuf, g); err != nil {
+			return time.Time{}, 0, fmt.Errorf("protocol: decode MINT: %w", err)
+		}
+		if _, err := decodeTimestamp(maxtBuf, g); err != nil {
+			return time.Time{}, 0, fmt.Errorf("protocol: decode MAXT: %w", err)
+		}
 	}
-	if midpoint.Before(mintTime) || midpoint.After(maxtTime) {
-		return time.Time{}, 0, fmt.Errorf("%w (MIDP=%s, MINT=%s, MAXT=%s)",
-			ErrDelegationWindow,
-			midpoint.Format(time.RFC3339), mintTime.Format(time.RFC3339), maxtTime.Format(time.RFC3339))
+	value := binary.LittleEndian.Uint64(midpBuf)
+	minimum := binary.LittleEndian.Uint64(mintBuf)
+	maximum := binary.LittleEndian.Uint64(maxtBuf)
+	if value < minimum || value > maximum {
+		return time.Time{}, 0, fmt.Errorf("%w (MIDP=%d, MINT=%d, MAXT=%d)",
+			ErrDelegationWindow, value, minimum, maximum)
+	}
+	if usesMJDMicroseconds(g) && value&0xffffffffff >= 86_400_000_000 {
+		// Go cannot represent second 60. Cover both sides of its normalization.
+		radius += time.Second
+	}
+	if midpoint.Add(radius).Sub(midpoint) != radius || midpoint.Sub(midpoint.Add(-radius)) != radius {
+		return time.Time{}, 0, errors.New("protocol: time window outside Go time range")
 	}
 	return midpoint, radius, nil
 }
@@ -387,7 +447,7 @@ func validateDelegationWindow(midpoint time.Time, radius time.Duration, mintBuf,
 // raw MINT/MAXT bytes.
 func verifyCert(certBytes []byte, rootPK []byte, g wireGroup) ([]byte, []byte, []byte, error) {
 	scheme := schemeOfGroup(g)
-	certMsg, err := Decode(certBytes)
+	certMsg, err := decodeProfile(certBytes, g)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("protocol: decode CERT: %w", err)
 	}
@@ -418,7 +478,7 @@ func verifyCert(certBytes []byte, rootPK []byte, g wireGroup) ([]byte, []byte, [
 		return nil, nil, nil, errSchemeNotSupported
 	}
 
-	dele, err := Decode(deleBytes)
+	dele, err := decodeProfile(deleBytes, g)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("protocol: decode DELE: %w", err)
 	}

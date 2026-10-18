@@ -50,10 +50,10 @@ var reqBufPool = sync.Pool{
 // listen starts one SO_REUSEPORT worker per GOMAXPROCS (cgroup-aware, unlike
 // NumCPU, so it won't oversubscribe in CPU-limited containers), each on its own
 // recvmmsg/sendmmsg loop.
-func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
+func listen(ctx context.Context, state *atomic.Pointer[certState], listenPort int) error {
 	listenLog := logger.Named("listener")
 	numWorkers := max(1, runtime.GOMAXPROCS(0))
-	addr := serverListenAddr()
+	addr := serverListenAddr(listenPort)
 	maxSize := batchMaxSize
 	maxLatency := batchMaxLatency
 
@@ -89,7 +89,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 			wlog := listenLog.With(zap.Int("worker", i))
 			// restart on panic so the SO_REUSEPORT pool doesn't shrink
 			superviseLoop(ctx, wlog, "udp worker", func() {
-				worker(ctx, wlog, state, c, maxSize, maxLatency)
+				worker(ctx, wlog, state, c, maxSize, maxLatency, isFlexPort(listenPort))
 			})
 		})
 	}
@@ -113,7 +113,7 @@ func listen(ctx context.Context, state *atomic.Pointer[certState]) error {
 }
 
 // worker reads, validates, signs, and responds in batches until ctx is done.
-func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], conn net.PacketConn, maxSize int, maxLatency time.Duration) {
+func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certState], conn net.PacketConn, maxSize int, maxLatency time.Duration, allowDrafts bool) {
 	defer func() {
 		if ctx.Err() == nil {
 			statsWorkerExits.Add(1)
@@ -126,7 +126,7 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 	msgs := makeMessages(maxSize, maxPacketSize+1)
 
 	for ctx.Err() == nil {
-		batch, hardErr := collectBatch(log, conn, p, msgs, maxSize, maxLatency, state)
+		batch, hardErr := collectBatch(log, conn, p, msgs, maxSize, maxLatency, state, allowDrafts)
 		if len(batch) > 0 {
 			respond(ctx, log, conn, p, state, batch)
 		}
@@ -144,7 +144,7 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 
 // collectBatch reads up to maxSize datagrams. hardErr signals a non-deadline
 // error on the first read.
-func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs []ipv6.Message, maxSize int, maxLatency time.Duration, state *atomic.Pointer[certState]) (batch []validatedRequest, hardErr bool) {
+func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs []ipv6.Message, maxSize int, maxLatency time.Duration, state *atomic.Pointer[certState], allowDrafts bool) (batch []validatedRequest, hardErr bool) {
 	_ = conn.SetReadDeadline(time.Now().Add(idleReadTimeout))
 	n, err := p.ReadBatch(msgs, 0)
 	if err != nil {
@@ -156,7 +156,7 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 	}
 
 	batch = make([]validatedRequest, 0, maxSize)
-	harvest(log, msgs[:n], state.Load(), &batch)
+	harvest(log, msgs[:n], state.Load(), &batch, allowDrafts)
 	if len(batch) >= maxSize {
 		return batch, false
 	}
@@ -169,14 +169,14 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 		if err != nil {
 			break
 		}
-		harvest(log, msgs[:n], state.Load(), &batch)
+		harvest(log, msgs[:n], state.Load(), &batch, allowDrafts)
 	}
 	return batch, false
 }
 
 // harvest validates each datagram into pooled buffers, which respond returns to
 // the pool.
-func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]validatedRequest) {
+func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]validatedRequest, allowDrafts bool) {
 	for i := range msgs {
 		n := msgs[i].N
 		if msgs[i].Flags&unix.MSG_TRUNC != 0 || n > maxPacketSize {
@@ -202,7 +202,7 @@ func harvest(log *zap.Logger, msgs []ipv6.Message, st *certState, batch *[]valid
 		bufPtr := reqBufPool.Get().(*[]byte)
 		copy(*bufPtr, msgs[i].Buffers[0][:n])
 
-		vr, reason, ok := validateRequest(log, (*bufPtr)[:n], peer, n, bufPtr, st)
+		vr, reason, ok := validateRequest(log, (*bufPtr)[:n], peer, n, bufPtr, st, allowDrafts)
 		if !ok {
 			reqBufPool.Put(bufPtr)
 			incDropped(transportUDP, reason)
@@ -238,7 +238,7 @@ func respond(ctx context.Context, log *zap.Logger, conn net.PacketConn, p *ipv6.
 			groups = append(groups, &group{ver: v.version, items: []validatedRequest{v}})
 			continue
 		}
-		key := batchKey{version: v.version, hasType: v.req.HasType}
+		key := batchKey{version: v.version, hasType: v.req.HasType, rfcOnly: v.rfcOnly}
 		if i, ok := idx[key]; ok {
 			groups[i].items = append(groups[i].items, v)
 			continue

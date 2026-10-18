@@ -4,6 +4,7 @@
 package roughtime
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,10 +12,12 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/tannerryan/roughtime/protocol"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -26,7 +29,39 @@ const MaxEcosystemBytes = 4 * 1024 * 1024
 
 // ecosystemFile is the top-level JSON shape of a Roughtime ecosystem document.
 type ecosystemFile struct {
-	Servers []ecosystemServer `json:"servers"`
+	Servers ecosystemServers `json:"servers"`
+}
+
+// ecosystemServers enforces the entry cap while decoding the servers array.
+type ecosystemServers []ecosystemServer
+
+// UnmarshalJSON stops before allocating entries beyond MaxEcosystemServers.
+func (servers *ecosystemServers) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		*servers = nil
+		return nil
+	}
+	if token != json.Delim('[') {
+		return errors.New("roughtime: servers must be an array")
+	}
+	*servers = (*servers)[:0]
+	for decoder.More() {
+		if len(*servers) == MaxEcosystemServers {
+			return fmt.Errorf("roughtime: ecosystem has more than %d entries (max %d)", MaxEcosystemServers, MaxEcosystemServers)
+		}
+		var server ecosystemServer
+		if err := decoder.Decode(&server); err != nil {
+			return err
+		}
+		*servers = append(*servers, server)
+	}
+	_, err = decoder.Token()
+	return err
 }
 
 // ecosystemServer is one entry in an ecosystem document.
@@ -81,6 +116,14 @@ func (v flexString) MarshalJSON() ([]byte, error) {
 // fields containing characters removed by [SanitizeForDisplay] are rejected
 // rather than rewritten.
 func ParseEcosystem(data []byte) ([]Server, error) {
+	return ParseEcosystemWithMode(data, protocol.Strict)
+}
+
+// ParseEcosystemWithMode validates an RFC server list or flex ecosystem file.
+func ParseEcosystemWithMode(data []byte, mode protocol.Mode) ([]Server, error) {
+	if mode != protocol.Strict && mode != protocol.Flex {
+		return nil, errors.New("roughtime: invalid mode")
+	}
 	if len(data) > MaxEcosystemBytes {
 		return nil, fmt.Errorf("roughtime: ecosystem is %d bytes (max %d)", len(data), MaxEcosystemBytes)
 	}
@@ -90,6 +133,56 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 	var f ecosystemFile
 	if err := json.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("roughtime: parsing ecosystem: %w", err)
+	}
+	if mode == protocol.Strict {
+		// strict preserves RFC field types and distinguishes missing fields
+		// from zero values.
+		var strict struct {
+			Sources json.RawMessage `json:"sources"` // optional HTTPS source URLs
+			Reports json.RawMessage `json:"reports"` // optional HTTPS reporting URL
+			// Servers retains required RFC metadata before compatibility
+			// normalization.
+			Servers []struct {
+				Name          *string `json:"name"`          // required server name
+				Version       *uint32 `json:"version"`       // required integer version
+				PublicKeyType string  `json:"publicKeyType"` // signature scheme, required to be ed25519
+				PublicKey     string  `json:"publicKey"`     // base64 root public key
+			} `json:"servers"`
+		}
+		if err := json.Unmarshal(data, &strict); err != nil {
+			return nil, fmt.Errorf("roughtime: RFC server-list version must be an integer: %w", err)
+		}
+		if len(strict.Sources) != 0 {
+			var sources []string
+			if err := json.Unmarshal(strict.Sources, &sources); err != nil || sources == nil {
+				return nil, errors.New("roughtime: sources must be a list of HTTPS URLs")
+			}
+			for _, source := range sources {
+				if err := validateHTTPSURL(source); err != nil {
+					return nil, fmt.Errorf("roughtime: sources: %w", err)
+				}
+			}
+		}
+		if len(strict.Reports) != 0 {
+			var reports string
+			if err := json.Unmarshal(strict.Reports, &reports); err != nil {
+				return nil, errors.New("roughtime: reports must be an HTTPS URL")
+			}
+			if err := validateHTTPSURL(reports); err != nil {
+				return nil, fmt.Errorf("roughtime: reports: %w", err)
+			}
+		}
+		for i, s := range strict.Servers {
+			if s.Name == nil {
+				return nil, fmt.Errorf("roughtime: server %d requires a name", i)
+			}
+			if s.Version == nil || s.PublicKeyType != "ed25519" {
+				return nil, fmt.Errorf("roughtime: server %d requires an integer version and ed25519 publicKeyType", i)
+			}
+			if pk, err := base64.StdEncoding.DecodeString(s.PublicKey); err != nil || len(pk) != 32 {
+				return nil, fmt.Errorf("roughtime: server %d requires a base64 Ed25519 key", i)
+			}
+		}
 	}
 	if len(f.Servers) == 0 {
 		return nil, errors.New("roughtime: ecosystem has no servers")
@@ -129,10 +222,10 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 				return nil, fmt.Errorf("roughtime: server %d (%s): %w", i, SanitizeForDisplay(es.Name), err)
 			}
 			t := strings.ToLower(a.Protocol)
-			if t != "udp" && t != "tcp" {
+			if t != "udp" && t != "tcp" || mode == protocol.Strict && t != a.Protocol {
 				return nil, fmt.Errorf("roughtime: server %d (%s): unsupported transport %q", i, SanitizeForDisplay(es.Name), SanitizeForDisplay(a.Protocol))
 			}
-			if err := validateEndpoint(a.Address); err != nil {
+			if err := validateEndpoint(a.Address, mode); err != nil {
 				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(es.Name), SanitizeForDisplay(a.Address), err)
 			}
 			addrs = append(addrs, Address{Transport: t, Address: a.Address})
@@ -146,6 +239,15 @@ func ParseEcosystem(data []byte) ([]Server, error) {
 		out = append(out, s)
 	}
 	return out, nil
+}
+
+// validateHTTPSURL checks that an optional server-list URL uses HTTPS.
+func validateHTTPSURL(value string) error {
+	u, err := url.Parse(value)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		return errors.New("expected an absolute HTTPS URL")
+	}
+	return nil
 }
 
 // SampleByOperator returns up to n servers, at most one per [OperatorKey].
@@ -201,6 +303,15 @@ func OperatorKey(s Server) string {
 
 // MarshalEcosystem serializes servers as ecosystem JSON.
 func MarshalEcosystem(servers []Server) ([]byte, error) {
+	return MarshalEcosystemWithMode(servers, protocol.Strict)
+}
+
+// MarshalEcosystemWithMode serializes servers under the selected compatibility
+// mode.
+func MarshalEcosystemWithMode(servers []Server, mode protocol.Mode) ([]byte, error) {
+	if mode != protocol.Strict && mode != protocol.Flex {
+		return nil, errors.New("roughtime: invalid mode")
+	}
 	if len(servers) == 0 {
 		return nil, errors.New("roughtime: ecosystem has no servers")
 	}
@@ -209,6 +320,14 @@ func MarshalEcosystem(servers []Server) ([]byte, error) {
 	}
 	out := ecosystemFile{Servers: make([]ecosystemServer, 0, len(servers))}
 	for i, s := range servers {
+		version := s.Version
+		if mode == protocol.Strict {
+			n, err := strconv.ParseUint(s.Version, 10, 32)
+			if err != nil || len(s.PublicKey) != 32 {
+				return nil, fmt.Errorf("roughtime: server %d requires a numeric version and Ed25519 key", i)
+			}
+			version = strconv.FormatUint(n, 10)
+		}
 		if err := validateSemanticField("name", s.Name); err != nil {
 			return nil, fmt.Errorf("roughtime: server %d: %w", i, err)
 		}
@@ -231,14 +350,14 @@ func MarshalEcosystem(servers []Server) ([]byte, error) {
 			if t != "udp" && t != "tcp" {
 				return nil, fmt.Errorf("roughtime: server %d (%s): unsupported transport %q", i, SanitizeForDisplay(s.Name), SanitizeForDisplay(a.Transport))
 			}
-			if err := validateEndpoint(a.Address); err != nil {
+			if err := validateEndpoint(a.Address, mode); err != nil {
 				return nil, fmt.Errorf("roughtime: server %d (%s): bad address %q: %w", i, SanitizeForDisplay(s.Name), SanitizeForDisplay(a.Address), err)
 			}
 			addrs = append(addrs, ecosystemAddress{Protocol: t, Address: a.Address})
 		}
 		out.Servers = append(out.Servers, ecosystemServer{
 			Name:          s.Name,
-			Version:       flexString(s.Version),
+			Version:       flexString(version),
 			PublicKeyType: publicKeyTypeFor(sch),
 			PublicKey:     base64.StdEncoding.EncodeToString(s.PublicKey),
 			Addresses:     addrs,
@@ -266,8 +385,8 @@ func validateSemanticField(name, value string) error {
 	return nil
 }
 
-// validateEndpoint accepts a host and numeric TCP/UDP port.
-func validateEndpoint(endpoint string) error {
+// validateEndpoint checks a host and port under the selected mode.
+func validateEndpoint(endpoint string, mode protocol.Mode) error {
 	if err := validateSemanticField("address", endpoint); err != nil {
 		return err
 	}
@@ -286,6 +405,33 @@ func validateEndpoint(endpoint string) error {
 	}
 	if port == "" {
 		return errors.New("empty port")
+	}
+	if mode == protocol.Strict {
+		if _, err := netip.ParseAddr(host); err != nil {
+			name := strings.TrimSuffix(host, ".")
+			if len(name) == 0 || len(name) > 253 {
+				return errors.New("invalid DNS name length")
+			}
+			for _, label := range strings.Split(name, ".") {
+				if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+					return errors.New("invalid DNS label")
+				}
+				for _, c := range []byte(label) {
+					if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+						return errors.New("invalid DNS name character")
+					}
+				}
+			}
+		}
+		if port[0] < '0' || port[0] > '9' {
+			return errors.New("port must contain decimal digits")
+		}
+		if strings.HasPrefix(endpoint, "[") {
+			ip, err := netip.ParseAddr(host)
+			if err != nil || !ip.Is6() {
+				return errors.New("brackets require an IPv6 address")
+			}
+		}
 	}
 	p, err := strconv.Atoi(port)
 	if err != nil || p < 0 || p > 65535 {

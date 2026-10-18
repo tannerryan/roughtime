@@ -12,7 +12,7 @@ import (
 
 // BenchmarkParseRequest measures request parsing.
 func BenchmarkParseRequest(b *testing.B) {
-	_, raw, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	_, raw, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func BenchmarkParseRequest(b *testing.B) {
 	b.SetBytes(int64(len(raw)))
 	b.ResetTimer()
 	for b.Loop() {
-		if _, err := ParseRequest(raw); err != nil {
+		if _, err := ParseRequestWithMode(raw, Flex); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -34,11 +34,11 @@ func BenchmarkCreateReplies(b *testing.B) {
 		b.Run(fmt.Sprintf("batch-%d", size), func(b *testing.B) {
 			requests := make([]Request, size)
 			for i := range requests {
-				_, raw, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+				_, raw, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 				if err != nil {
 					b.Fatal(err)
 				}
-				req, err := ParseRequest(raw)
+				req, err := ParseRequestWithMode(raw, Flex)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -47,7 +47,7 @@ func BenchmarkCreateReplies(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := CreateReplies(VersionDraft12, requests, now, time.Second, cert); err != nil {
+				if _, err := CreateRepliesWithOptions(VersionDraft12, requests, now, time.Second, cert, ReplyOptions{Mode: Flex}); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -59,15 +59,15 @@ func BenchmarkCreateReplies(b *testing.B) {
 func BenchmarkVerifyReply(b *testing.B) {
 	cert, _ := testCert(b)
 	now := time.Now().UTC().Truncate(time.Second)
-	nonce, raw, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	nonce, raw, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		b.Fatal(err)
 	}
-	req, err := ParseRequest(raw)
+	req, err := ParseRequestWithMode(raw, Flex)
 	if err != nil {
 		b.Fatal(err)
 	}
-	replies, err := CreateReplies(VersionDraft12, []Request{*req}, now, time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionDraft12, []Request{*req}, now, time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func BenchmarkVerifyReply(b *testing.B) {
 	b.SetBytes(int64(len(replies[0]) + len(raw)))
 	b.ResetTimer()
 	for b.Loop() {
-		if _, _, err := VerifyReply([]Version{VersionDraft12}, replies[0], cert.edRootPK, nonce, raw); err != nil {
+		if _, _, err := VerifyReplyWithOptions([]Version{VersionDraft12}, replies[0], cert.edRootPK, nonce, raw, VerifyOptions{Mode: Flex}); err != nil {
 			b.Fatal(err)
 		}
 	}

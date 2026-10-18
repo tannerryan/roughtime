@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -16,6 +17,25 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// TestReadPrivateKeyFileSizeLimit checks the key-file size boundary.
+func TestReadPrivateKeyFileSizeLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seed")
+	for _, size := range []int{maxPrivateKeyFileBytes, maxPrivateKeyFileBytes + 1} {
+		if err := os.WriteFile(path, bytes.Repeat([]byte{'x'}, size), 0600); err != nil {
+			t.Fatal(err)
+		}
+		data, err := readPrivateKeyFile(path, "root")
+		if size == maxPrivateKeyFileBytes {
+			if err != nil || len(data) != size {
+				t.Fatalf("size limit: read %d bytes, %v", len(data), err)
+			}
+			clear(data)
+		} else if err == nil || data != nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("oversized key file: read %d bytes, %v", len(data), err)
+		}
+	}
+}
 
 // TestReadPrivateKeyFile checks descriptor validation and preserves seed bytes.
 func TestReadPrivateKeyFile(t *testing.T) {

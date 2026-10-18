@@ -22,12 +22,12 @@ import (
 func TestValidateRequestAcceptsValidDraft12(t *testing.T) {
 	rootPK, st := newUnitCertState(t)
 	srv := protocol.ComputeSRV(rootPK)
-	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+	_, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	vr, reason, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st)
+	vr, reason, ok := validateRequest(zap.NewNop(), req, peer, len(req), nil, st, true)
 	if !ok {
 		t.Fatal("validateRequest rejected a well-formed request")
 	}
@@ -52,12 +52,12 @@ func TestValidateRequestRejectsSRVMismatch(t *testing.T) {
 	}
 	badSRV := protocol.ComputeSRV(otherPK)
 
-	_, req, err := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, badSRV)
+	_, req, err := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, badSRV, protocol.RequestOptions{Mode: protocol.Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
-	if _, reason, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st); ok || reason != dropSRV {
+	if _, reason, ok := validateRequest(zaptest.NewLogger(t), req, peer, len(req), nil, st, true); ok || reason != dropSRV {
 		t.Fatalf("validateRequest SRV mismatch: ok=%v reason=%q want ok=false reason=%q", ok, reason, dropSRV)
 	}
 }
@@ -111,22 +111,25 @@ func FuzzValidateRequest(f *testing.F) {
 	rootPK, rootSK, _ := ed25519.GenerateKey(rand.Reader)
 	_, onlineSK, _ := ed25519.GenerateKey(rand.Reader)
 	now := time.Now()
-	cert, _ := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, _ := protocol.NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, protocol.ServerPreferenceEd25519)
 	st := &certState{cert: cert, expiry: now.Add(time.Hour), srvHash: protocol.ComputeSRV(rootPK)}
 
 	srv := protocol.ComputeSRV(rootPK)
-	_, googleReq, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionGoogle}, rand.Reader, nil)
-	_, draft01Req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft01}, rand.Reader, srv)
-	_, draft12Req, _ := protocol.CreateRequest([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv)
+	_, googleReq, _ := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionGoogle}, rand.Reader, nil, protocol.RequestOptions{Mode: protocol.Flex})
+	_, draft01Req, _ := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft01}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
+	_, draft12Req, _ := protocol.CreateRequestWithOptions([]protocol.Version{protocol.VersionDraft12}, rand.Reader, srv, protocol.RequestOptions{Mode: protocol.Flex})
+	_, rfcReq, _ := protocol.CreateRequest([]protocol.Version{protocol.Version1}, rand.Reader, srv)
 	f.Add(googleReq)
 	f.Add(draft01Req)
 	f.Add(draft12Req)
+	f.Add(rfcReq)
 	f.Add([]byte{})
 	f.Add([]byte{0})
 	f.Add(make([]byte, 1024))
 
 	peer := &net.UDPAddr{IP: net.IPv6loopback, Port: 0}
 	f.Fuzz(func(_ *testing.T, data []byte) {
-		validateRequest(zap.NewNop(), data, peer, len(data), nil, st)
+		_, _ = protocol.ParseRequest(data)
+		validateRequest(zap.NewNop(), data, peer, len(data), nil, st, true)
 	})
 }

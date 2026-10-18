@@ -42,18 +42,28 @@ func SchemeOfKey(pk []byte) (Scheme, error) {
 	}
 }
 
-// VersionsForScheme returns the ML-DSA-44 extension for [SchemeMLDSA44] and
-// IETF drafts 05 and later for other values.
+// VersionsForScheme returns RFC version 1 for Ed25519 and nil for other suites.
 func VersionsForScheme(sch Scheme) []protocol.Version {
+	return VersionsForSchemeWithMode(sch, protocol.Strict)
+}
+
+// VersionsForSchemeWithMode returns versions compatible with the key and mode.
+func VersionsForSchemeWithMode(sch Scheme, mode protocol.Mode) []protocol.Version {
+	if mode != protocol.Flex {
+		if sch == SchemeEd25519 {
+			return []protocol.Version{protocol.Version1}
+		}
+		return nil
+	}
 	if sch == SchemeMLDSA44 {
 		return []protocol.Version{protocol.VersionMLDSA44}
 	}
 	out := make([]protocol.Version, 0)
-	for _, v := range protocol.Supported() {
+	for _, v := range protocol.SupportedWithMode(mode) {
 		if v == protocol.VersionGoogle || v == protocol.VersionMLDSA44 {
 			continue
 		}
-		if v < protocol.VersionDraft05 {
+		if v != protocol.Version1 && v < protocol.VersionDraft05 {
 			continue
 		}
 		out = append(out, v)

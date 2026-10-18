@@ -24,7 +24,7 @@ func TestHarvestRejectsMSGTRUNC(t *testing.T) {
 		Buffers: [][]byte{make([]byte, maxPacketSize)},
 	}}
 	var batch []validatedRequest
-	harvest(zap.NewNop(), msgs, nil, &batch)
+	harvest(zap.NewNop(), msgs, nil, &batch, true)
 	if len(batch) != 0 {
 		t.Fatalf("harvest accepted %d truncated requests", len(batch))
 	}
@@ -42,7 +42,7 @@ func TestHarvestRejectsReportedLengthBeyondBuffer(t *testing.T) {
 		Buffers: [][]byte{make([]byte, maxPacketSize+1)},
 	}}
 	var batch []validatedRequest
-	harvest(zap.NewNop(), msgs, nil, &batch)
+	harvest(zap.NewNop(), msgs, nil, &batch, true)
 	if len(batch) != 0 {
 		t.Fatalf("harvest accepted %d oversize requests", len(batch))
 	}

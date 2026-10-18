@@ -34,7 +34,13 @@ deps: deps-ci
 
 deps-ci:
 	go install golang.org/x/tools/cmd/goimports@latest
-	go install honnef.co/go/tools/cmd/staticcheck@latest
+	# Staticcheck needs a package reader that supports Go 1.27 export data.
+	@tmp=$$(mktemp -d) || exit 1; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	cd "$$tmp" && \
+	go mod init roughtime-lint-tools && \
+	go get honnef.co/go/tools/cmd/staticcheck@v0.8.1 golang.org/x/tools@v0.50.0 && \
+	go install honnef.co/go/tools/cmd/staticcheck
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 
 build:

@@ -31,7 +31,7 @@ func TestCertificateRotationWaitsForActiveSigner(t *testing.T) {
 		if err != nil {
 			t.Fatalf("online key: %v", err)
 		}
-		cert, err := protocol.NewCertificate(base.Add(-time.Hour), expiry, onlineSK, rootSK)
+		cert, err := protocol.NewCertificateWithVersions(base.Add(-time.Hour), expiry, onlineSK, rootSK, protocol.ServerPreferenceEd25519)
 		if err != nil {
 			t.Fatalf("NewCertificate: %v", err)
 		}
@@ -87,22 +87,25 @@ func TestCertificateRotationWaitsForActiveSigner(t *testing.T) {
 		t.Fatal("rotation did not publish replacement state")
 	}
 
-	nonce, request, err := protocol.CreateRequest(
-		[]protocol.Version{protocol.VersionDraft12}, rand.Reader, oldState.srvHash)
+	nonce, request, err := protocol.CreateRequestWithOptions(
+		[]protocol.Version{protocol.VersionDraft12}, rand.Reader, oldState.srvHash, protocol.RequestOptions{Mode: protocol.Flex},
+	)
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	parsed, err := protocol.ParseRequest(request)
+	parsed, err := protocol.ParseRequestWithMode(request, protocol.Flex)
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
-	replies, err := protocol.CreateReplies(protocol.VersionDraft12,
-		[]protocol.Request{*parsed}, base, time.Second, oldState.cert)
+	replies, err := protocol.CreateRepliesWithOptions(protocol.VersionDraft12,
+		[]protocol.Request{*parsed}, base, time.Second, oldState.cert, protocol.ReplyOptions{Mode: protocol.Flex},
+	)
 	if err != nil {
 		t.Fatalf("sign with retained certificate: %v", err)
 	}
-	if _, _, err := protocol.VerifyReply([]protocol.Version{protocol.VersionDraft12},
-		replies[0], rootPK, nonce, request); err != nil {
+	if _, _, err := protocol.VerifyReplyWithOptions([]protocol.Version{protocol.VersionDraft12},
+		replies[0], rootPK, nonce, request, protocol.VerifyOptions{Mode: protocol.Flex},
+	); err != nil {
 		t.Fatalf("VerifyReply: %v", err)
 	}
 	if got := acquireCurrent(&current); got != newState {

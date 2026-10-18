@@ -16,7 +16,7 @@ import (
 func TestParseRequestGoogle(t *testing.T) {
 	nonce := randBytes(t, 64)
 	raw := buildGoogleRequest(nonce)
-	req, err := ParseRequest(raw)
+	req, err := ParseRequestWithMode(raw, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func TestParseRequestGoogle(t *testing.T) {
 // TestParseRequestIETF covers framed IETF requests.
 func TestParseRequestIETF(t *testing.T) {
 	nonce := randBytes(t, 32)
-	req, err := ParseRequest(buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft12}, false))
+	req, err := ParseRequestWithMode(buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft12}, false), Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +40,7 @@ func TestParseRequestIETF(t *testing.T) {
 // TestParseRequestWithTYPE covers typed requests.
 func TestParseRequestWithTYPE(t *testing.T) {
 	nonce := randBytes(t, 32)
-	req, err := ParseRequest(buildIETFRequest(nonce, []Version{VersionDraft12}, true))
+	req, err := ParseRequestWithMode(buildIETFRequest(nonce, []Version{VersionDraft12}, true), Flex)
 	if err != nil || !req.HasType {
 		t.Fatal("TYPE=0 should set HasType")
 	}
@@ -54,7 +54,7 @@ func TestParseRequestSRV(t *testing.T) {
 		TagNONC: nonce, TagVER: {0x0c, 0x00, 0x00, 0x80},
 		TagSRV: srv, TagZZZZ: make([]byte, 900),
 	})
-	req, err := ParseRequest(wrapPacket(msg))
+	req, err := ParseRequestWithMode(wrapPacket(msg), Flex)
 	if err != nil || !bytes.Equal(req.SRV, srv) {
 		t.Fatal("SRV mismatch")
 	}
@@ -62,14 +62,14 @@ func TestParseRequestSRV(t *testing.T) {
 
 // TestCreateRequestGoogle covers Google request construction.
 func TestCreateRequestGoogle(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionGoogle}, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionGoogle}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(nonce) != 64 || len(req) != 1024 {
 		t.Fatalf("nonce=%d req=%d, want 64/1024", len(nonce), len(req))
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,14 +80,14 @@ func TestCreateRequestGoogle(t *testing.T) {
 
 // TestCreateRequestDraft01 covers draft-01 request construction.
 func TestCreateRequestDraft01(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionDraft01}, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionDraft01}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(nonce) != 64 || len(req) != 1036 {
 		t.Fatalf("nonce=%d req=%d, want 64/1036", len(nonce), len(req))
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,14 +98,14 @@ func TestCreateRequestDraft01(t *testing.T) {
 
 // TestCreateRequestDraft12 covers shared-version request construction.
 func TestCreateRequestDraft12(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(nonce) != 32 || len(req) != 1036 {
 		t.Fatalf("nonce=%d req=%d, want 32/1036", len(nonce), len(req))
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,11 +118,11 @@ func TestCreateRequestDraft12(t *testing.T) {
 func TestParseRequestVERVersionRules(t *testing.T) {
 	nonce := randBytes(t, 32)
 	raw := buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft05}, false)
-	if _, err := ParseRequest(raw); err != nil {
+	if _, err := ParseRequestWithMode(raw, Flex); err != nil {
 		t.Fatalf("drafts 10-11 unsorted VER list should be accepted: %v", err)
 	}
 	raw = buildIETFRequest(nonce, []Version{VersionDraft10, VersionDraft10}, false)
-	if _, err := ParseRequest(raw); err == nil {
+	if _, err := ParseRequestWithMode(raw, Flex); err == nil {
 		t.Fatal("drafts 10-11 duplicate VER list should be rejected")
 	}
 }
@@ -148,7 +148,7 @@ func TestParseRequestVersionListCompatibility(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			nonce := randBytes(t, nonceSize(wireGroupOf(tc.version, false)))
 			raw := buildIETFRequest(nonce, longVersionList(tc.version, tc.count), tc.withType)
-			parsed, err := ParseRequest(raw)
+			parsed, err := ParseRequestWithMode(raw, Flex)
 			if tc.wantReject {
 				if err == nil || !strings.Contains(err.Error(), "max 32") {
 					t.Fatalf("ParseRequest error = %v, want 32-entry limit", err)
@@ -199,7 +199,7 @@ func TestParseRequestPaddingStrictness(t *testing.T) {
 			if tc.version != VersionGoogle {
 				pkt = wrapPacket(msg)
 			}
-			_, err = ParseRequest(pkt)
+			_, err = ParseRequestWithMode(pkt, Flex)
 			if tc.wantReject && err == nil {
 				t.Fatal("expected error for non-zero padding byte")
 			}
@@ -216,7 +216,7 @@ func TestCreateRequestWithNonceWithSRV(t *testing.T) {
 	srv := ComputeSRV(pk)
 	nonce := randBytes(t, 32)
 
-	req, err := CreateRequestWithNonce([]Version{VersionDraft12}, nonce, srv)
+	req, err := CreateRequestWithNonceOptions([]Version{VersionDraft12}, nonce, srv, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,14 +251,14 @@ func TestPQComputeSRV(t *testing.T) {
 
 // TestCreateRequestMLDSA44PadsToAmplificationBudget covers PQ request sizing.
 func TestCreateRequestMLDSA44PadsToAmplificationBudget(t *testing.T) {
-	nonce, req, err := CreateRequest([]Version{VersionMLDSA44}, rand.Reader, nil)
+	nonce, req, err := CreateRequestWithOptions([]Version{VersionMLDSA44}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(nonce) != 32 || len(req) != 8204 {
 		t.Fatalf("nonce=%d req=%d, want 32/8204", len(nonce), len(req))
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,6 +270,7 @@ func TestCreateRequestMLDSA44PadsToAmplificationBudget(t *testing.T) {
 // FuzzParseRequest exercises arbitrary request packets.
 func FuzzParseRequest(f *testing.F) {
 	for _, ver := range []Version{
+		Version1,
 		VersionGoogle,
 		VersionDraft01,
 		VersionDraft02,
@@ -281,14 +282,14 @@ func FuzzParseRequest(f *testing.F) {
 		VersionDraft12,
 		VersionMLDSA44,
 	} {
-		_, req, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+		_, req, err := CreateRequestWithOptions([]Version{ver}, rand.Reader, nil, RequestOptions{Mode: Flex})
 		if err != nil {
 			f.Fatal(err)
 		}
 		f.Add(req)
 	}
 	_, untyped, err := CreateRequestWithOptions(
-		[]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{OmitTYPE: true})
+		[]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex, OmitTYPE: true})
 	if err != nil {
 		f.Fatal(err)
 	}
@@ -298,7 +299,8 @@ func FuzzParseRequest(f *testing.F) {
 	f.Add([]byte{0x00})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		parsed, err := ParseRequest(data)
+		_, _ = ParseRequest(data)
+		parsed, err := ParseRequestWithMode(data, Flex)
 		if err != nil {
 			return
 		}

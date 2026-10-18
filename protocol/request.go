@@ -20,33 +20,41 @@ import (
 type Request struct {
 	// Nonce is the request nonce.
 	Nonce []byte
-	// Versions lists the client's offered versions. It is empty for Google and
-	// may be omitted on caller-built pre-draft-12 Request values passed
-	// directly to CreateReplies for backward compatibility.
+	// Versions lists the client's offered versions. Flex mode allows it to be
+	// empty for Google and caller-built nonce-leaf draft requests.
 	Versions []Version
-	// SRV is the optional 32-byte server identifier (drafts 10+ and ML-DSA-44).
+	// SRV is the optional 32-byte root-key identifier.
 	SRV []byte
 	// HasType reports whether the request carries TYPE=0.
 	HasType bool
-	// RawPacket is the framed or unframed request. CreateReplies requires it
-	// for drafts 12+ and ML-DSA-44. Earlier nonce-leaf versions retain support
-	// for caller-built values.
+	// RawPacket is the complete request packet. RFC, drafts 12+, and ML-DSA-44
+	// replies authenticate it. Flex nonce-leaf variants allow it to be nil.
 	RawPacket []byte
 }
 
 // RequestOptions controls request encoding and legacy packet sizing.
 type RequestOptions struct {
-	// OmitTYPE emits the draft-12/13 request form without TYPE. The default
-	// includes TYPE=0 for draft-14+ compatibility.
+	// Mode selects strict or flex protocol support.
+	Mode Mode
+	// OmitTYPE emits an untyped draft-12/13 request in flex mode.
 	OmitTYPE bool
-	// LegacyPacketSize pads framed requests to a historical total size: 1024
-	// bytes, or 8192 for ML-DSA-44. The default pads the body to that size. Use
-	// this only for deployed legacy interoperability.
+	// LegacyPacketSize pads framed requests to 1024 total bytes, or 8192 for
+	// ML-DSA-44. It requires flex mode. The default pads the body to that size
+	// and adds the framing header.
 	LegacyPacketSize bool
 }
 
-// ParseRequest auto-detects Google vs IETF framing and extracts request fields.
+// ParseRequest validates and extracts the fields of an RFC version-1 request.
 func ParseRequest(raw []byte) (*Request, error) {
+	return ParseRequestWithMode(raw, Strict)
+}
+
+// ParseRequestWithMode validates a request under the selected compatibility
+// mode.
+func ParseRequestWithMode(raw []byte, mode Mode) (*Request, error) {
+	if mode != Strict && mode != Flex {
+		return nil, errors.New("protocol: invalid mode")
+	}
 	framed := len(raw) >= 12 && bytes.Equal(raw[:8], packetMagic[:])
 	req := &Request{RawPacket: raw}
 
@@ -55,7 +63,7 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, err
 	}
 
-	msg, err := Decode(msgBytes)
+	msg, err := decodeMessage(msgBytes, mode == Flex)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: decode request: %w", err)
 	}
@@ -68,6 +76,13 @@ func ParseRequest(raw []byte) (*Request, error) {
 		return nil, fmt.Errorf("protocol: bad nonce length %d", len(nonce))
 	}
 	req.Nonce = nonce
+	if !framed && mode == Flex && len(nonce) == 64 {
+		// Google defines only NONC. Later-profile extensions are opaque here.
+		if err := validateMessage(msgBytes, msg, groupGoogle); err != nil {
+			return nil, err
+		}
+		return req, nil
+	}
 	if err := parseOptionalTags(req, msg); err != nil {
 		return nil, err
 	}
@@ -79,6 +94,36 @@ func ParseRequest(raw []byte) (*Request, error) {
 	}
 	if !framed && len(req.Versions) > 0 {
 		return nil, errors.New("protocol: unframed request contains VER tag")
+	}
+	// RFC version 1 and the ML-DSA-44 extension share request rules.
+	if mode == Strict || slices.Contains(req.Versions, Version1) || pqOffered(req.Versions) {
+		if err := validateMessage(msgBytes, msg, groupRFC); err != nil {
+			return nil, err
+		}
+		if !framed || mode == Strict && !slices.Contains(req.Versions, Version1) {
+			return nil, errors.New("protocol: request does not offer RFC 10049")
+		}
+		if len(nonce) != 32 || len(req.Versions) > maxVersionList {
+			return nil, errors.New("protocol: request requires a 32-byte NONC and at most 32 versions")
+		}
+		for i := 1; i < len(req.Versions); i++ {
+			if req.Versions[i] <= req.Versions[i-1] {
+				return nil, errors.New("protocol: VER list not strictly ascending")
+			}
+		}
+		if tb := msg[TagTYPE]; len(tb) != 4 || binary.LittleEndian.Uint32(tb) != 0 {
+			return nil, errors.New("protocol: request requires TYPE=0")
+		}
+		req.HasType = true
+		if req.SRV != nil && len(req.SRV) != 32 {
+			return nil, errors.New("protocol: SRV must be 32 bytes")
+		}
+		for _, b := range msg[TagZZZZ] {
+			if b != 0 {
+				return nil, errors.New("protocol: ZZZZ padding contains non-zero byte")
+			}
+		}
+		return req, nil
 	}
 	if slices.Contains(req.Versions, VersionGoogle) {
 		return nil, errors.New("protocol: VER list contains VersionGoogle (0)")
@@ -93,6 +138,9 @@ func ParseRequest(raw []byte) (*Request, error) {
 		}
 	}
 	maxGroup := wireGroupOf(maxVer, false)
+	if err := validateMessage(msgBytes, msg, maxGroup); err != nil {
+		return nil, err
+	}
 
 	// drafts 10-11 forbid duplicates, drafts 12+ require strictly ascending
 	if hasKnownVersion && maxGroup >= groupD12 {
@@ -159,9 +207,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 		}
 	}
 
-	// Draft 14 introduced TYPE under the shared draft-12 wire version. Ignore
-	// it for older and unknown versions.
-	if slices.Contains(req.Versions, VersionDraft12) || slices.Contains(req.Versions, VersionMLDSA44) {
+	// TYPE is optional for the shared draft-12 version.
+	if slices.Contains(req.Versions, VersionDraft12) {
 		if tb, ok := msg[TagTYPE]; ok {
 			if len(tb) != 4 {
 				return nil, errors.New("protocol: TYPE tag must be 4 bytes")
@@ -172,9 +219,8 @@ func ParseRequest(raw []byte) (*Request, error) {
 			req.HasType = true
 		}
 	}
-	// Draft 13 introduced the 32-entry limit, but shares its untyped wire
-	// identifier with draft 12. Accept longer untyped lists for historical
-	// interoperability. TYPE identifies modern input where the limit applies.
+	// Untyped draft-12/13 input accepts longer version lists for compatibility.
+	// Typed input has a 32-entry limit.
 	if req.HasType && len(req.Versions) > maxVersionList {
 		return nil, fmt.Errorf("protocol: VER tag has %d entries (max %d)", len(req.Versions), maxVersionList)
 	}
@@ -222,6 +268,12 @@ func CreateRequest(versions []Version, entropy io.Reader, srv []byte) (nonce, re
 
 // CreateRequestWithOptions builds a request using opts.
 func CreateRequestWithOptions(versions []Version, entropy io.Reader, srv []byte, opts RequestOptions) (nonce, request []byte, err error) {
+	if err := checkVersions(opts.Mode, versions); err != nil {
+		return nil, nil, err
+	}
+	if opts.Mode != Flex && (opts.OmitTYPE || opts.LegacyPacketSize) {
+		return nil, nil, errors.New("protocol: legacy request options require flex mode")
+	}
 	best, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, nil, err
@@ -251,6 +303,12 @@ func CreateRequestWithNonce(versions []Version, nonce []byte, srv []byte) ([]byt
 
 // CreateRequestWithNonceOptions builds a caller-nonce request using opts.
 func CreateRequestWithNonceOptions(versions []Version, nonce []byte, srv []byte, opts RequestOptions) ([]byte, error) {
+	if err := checkVersions(opts.Mode, versions); err != nil {
+		return nil, err
+	}
+	if opts.Mode != Flex && (opts.OmitTYPE || opts.LegacyPacketSize) {
+		return nil, errors.New("protocol: legacy request options require flex mode")
+	}
 	best, g, err := clientVersionPreference(versions)
 	if err != nil {
 		return nil, err

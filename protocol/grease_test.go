@@ -79,7 +79,7 @@ func TestGreaseTransforms(t *testing.T) {
 					if len(out) == 0 || bytes.Equal(out, reply) {
 						t.Fatal("transformation did not change reply")
 					}
-					_, _, err := VerifyReply(versions, out, rootPK, nonce, request)
+					_, _, err := VerifyReplyWithOptions(versions, out, rootPK, nonce, request, VerifyOptions{Mode: Flex})
 					if (err == nil) != tc.valid {
 						t.Fatalf("verification error = %v, want valid=%v", err, tc.valid)
 					}
@@ -89,7 +89,7 @@ func TestGreaseTransforms(t *testing.T) {
 			if !greaseCorruptSig(corrupt, ver) {
 				t.Fatal("signature corruption failed")
 			}
-			if _, _, err := VerifyReply(versions, corrupt, rootPK, nonce, request); err == nil {
+			if _, _, err := VerifyReplyWithOptions(versions, corrupt, rootPK, nonce, request, VerifyOptions{Mode: Flex}); err == nil {
 				t.Fatal("corrupted signature verified")
 			}
 			out := greaseWrongVersion(bytes.Clone(reply), ver)
@@ -97,7 +97,7 @@ func TestGreaseTransforms(t *testing.T) {
 				if out != nil {
 					t.Fatal("changed a reply without a top-level VER")
 				}
-			} else if _, _, err := VerifyReply(versions, out, rootPK, nonce, request); err == nil {
+			} else if _, _, err := VerifyReplyWithOptions(versions, out, rootPK, nonce, request, VerifyOptions{Mode: Flex}); err == nil {
 				t.Fatal("unsupported version verified")
 			}
 		})
@@ -120,15 +120,15 @@ func TestGreaseDoesNotPanicMLDSA44(t *testing.T) {
 	cert, rootPK := testPQCert(t)
 	versions := []Version{VersionMLDSA44}
 	srv := ComputeSRV(rootPK)
-	_, request, err := CreateRequest(versions, rand.Reader, srv)
+	_, request, err := CreateRequestWithOptions(versions, rand.Reader, srv, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateRequest: %v", err)
 	}
-	parsed, err := ParseRequest(request)
+	parsed, err := ParseRequestWithMode(request, Flex)
 	if err != nil {
 		t.Fatalf("ParseRequest: %v", err)
 	}
-	replies, err := CreateReplies(VersionMLDSA44, []Request{*parsed}, time.Now(), 3*time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionMLDSA44, []Request{*parsed}, time.Now(), 3*time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}

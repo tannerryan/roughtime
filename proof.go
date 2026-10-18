@@ -66,6 +66,11 @@ func (l ProofLink) Window() (lower, upper time.Time) {
 // It validates bounds and syntax only. Callers must use [Proof.Verify] and
 // [Proof.Trust] before relying on its contents.
 func ParseProof(data []byte) (*Proof, error) {
+	return ParseProofWithMode(data, protocol.Strict)
+}
+
+// ParseProofWithMode loads a proof under the selected compatibility mode.
+func ParseProofWithMode(data []byte, mode protocol.Mode) (*Proof, error) {
 	if len(data) > MaxProofBytes {
 		return nil, fmt.Errorf("roughtime: proof is %d bytes (max %d)", len(data), MaxProofBytes)
 	}
@@ -84,15 +89,15 @@ func ParseProof(data []byte) (*Proof, error) {
 		}
 		data = inflated
 	}
-	chain, err := protocol.ParseMalfeasanceReport(data)
+	chain, err := protocol.ParseMalfeasanceReportWithMode(data, mode)
 	if err != nil {
 		return nil, fmt.Errorf("roughtime: %w", err)
 	}
 	return &Proof{chain: chain}, nil
 }
 
-// MarshalGzip returns the proof as gzipped malfeasance JSON that round-trips
-// through [ParseProof].
+// MarshalGzip returns gzipped malfeasance JSON. Parse it with the proof's mode
+// using [ParseProofWithMode].
 func (p *Proof) MarshalGzip() ([]byte, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("roughtime: nil proof")
@@ -118,8 +123,7 @@ func (p *Proof) MarshalJSON() ([]byte, error) {
 	return p.modernReport()
 }
 
-// modernReport serializes every link with request and public-key bytes so
-// ParseProof can verify the result offline for every supported version.
+// modernReport includes request and public-key bytes for offline verification.
 func (p *Proof) modernReport() ([]byte, error) {
 	if p == nil || p.chain == nil {
 		return nil, errors.New("nil proof")
@@ -183,11 +187,11 @@ func (p *Proof) Links() ([]ProofLink, error) {
 	}
 	out := make([]ProofLink, len(p.chain.Links))
 	for i, link := range p.chain.Links {
-		req, err := protocol.ParseRequest(link.Request)
+		req, err := protocol.ParseRequestWithMode(link.Request, p.chain.Mode)
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: link %d: parse request: %w", i, err)
 		}
-		midpoint, radius, err := protocol.VerifyReply(linkVersions(req), link.Response, link.PublicKey, req.Nonce, link.Request)
+		midpoint, radius, err := protocol.VerifyReplyWithOptions(knownVersions(linkVersions(req), p.chain.Mode), link.Response, link.PublicKey, req.Nonce, link.Request, protocol.VerifyOptions{Mode: p.chain.Mode})
 		if err != nil {
 			return nil, fmt.Errorf("roughtime: link %d: %w", i, err)
 		}
@@ -240,7 +244,7 @@ func (p *Proof) SeedNonce() ([]byte, error) {
 	if len(p.chain.Links) == 0 {
 		return nil, errors.New("roughtime: empty proof")
 	}
-	req, err := protocol.ParseRequest(p.chain.Links[0].Request)
+	req, err := protocol.ParseRequestWithMode(p.chain.Links[0].Request, p.chain.Mode)
 	if err != nil {
 		return nil, fmt.Errorf("roughtime: parse seed link: %w", err)
 	}

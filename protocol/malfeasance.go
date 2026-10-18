@@ -9,14 +9,47 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 // maxMalfeasanceReportBytes caps accepted and emitted JSON at 4 MiB.
 const maxMalfeasanceReportBytes = 4 * 1024 * 1024
 
+// boundedReportArray caps each report array before decoding too many entries.
+type boundedReportArray[T any] []T
+
+// UnmarshalJSON preserves array decoding while enforcing MaxChainLinks early.
+func (entries *boundedReportArray[T]) UnmarshalJSON(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token == nil {
+		*entries = nil
+		return nil
+	}
+	if token != json.Delim('[') {
+		return errors.New("protocol: report field must be an array")
+	}
+	*entries = (*entries)[:0]
+	for decoder.More() {
+		if len(*entries) == MaxChainLinks {
+			return fmt.Errorf("protocol: malfeasance report has more than %d links (max %d)", MaxChainLinks, MaxChainLinks)
+		}
+		var entry T
+		if err := decoder.Decode(&entry); err != nil {
+			return err
+		}
+		*entries = append(*entries, entry)
+	}
+	_, err = decoder.Token()
+	return err
+}
+
 // malfeasanceReport is the modern JSON report shape.
 type malfeasanceReport struct {
-	Responses []malfeasanceLink `json:"responses"`
+	Responses boundedReportArray[malfeasanceLink] `json:"responses"`
 }
 
 // malfeasanceLink is one modern report entry.
@@ -29,8 +62,8 @@ type malfeasanceLink struct {
 
 // malfeasanceReportLegacy is the drafts 08-11 parallel-array format.
 type malfeasanceReportLegacy struct {
-	Nonces    []string `json:"nonces"`
-	Responses []string `json:"responses"`
+	Nonces    boundedReportArray[string] `json:"nonces"`
+	Responses boundedReportArray[string] `json:"responses"`
 }
 
 // malfeasanceLinkEarly is the drafts 01-03 array-entry format. Blind belongs to
@@ -52,17 +85,25 @@ const (
 	malfeasanceFormatModern
 )
 
-// MalfeasanceReport serializes the chain using the drafts 01-03 array format,
-// drafts 08-11 parallel-array format, or drafts 12+ object format as
-// applicable. Drafts 04-07 use the modern self-contained representation.
+// MalfeasanceReport serializes an RFC report in strict mode. Flex mode selects
+// the draft-01/03 array or draft-08/11 parallel arrays when applicable. Other
+// chains use self-contained response objects.
 func (c *Chain) MalfeasanceReport() ([]byte, error) {
+	if c.Mode != Strict && c.Mode != Flex {
+		return nil, errors.New("protocol: invalid mode")
+	}
 	if len(c.Links) == 0 {
 		return nil, errors.New("protocol: empty chain")
 	}
 	if len(c.Links) > MaxChainLinks {
 		return nil, fmt.Errorf("protocol: chain has %d links (max %d)", len(c.Links), MaxChainLinks)
 	}
-	format := c.inferMalfeasanceFormat()
+	format := malfeasanceFormatModern
+	if c.Mode == Flex {
+		format = c.inferMalfeasanceFormat()
+	} else if err := validateRFCReportLinks(c.Links); err != nil {
+		return nil, err
+	}
 	if err := validateMalfeasanceLinks(c.Links, format); err != nil {
 		return nil, err
 	}
@@ -120,9 +161,8 @@ func validateMalfeasanceLinks(links []ChainLink, format malfeasanceFormat) error
 	return nil
 }
 
-// inferMalfeasanceFormat picks a historical format only when every response
-// belongs to the same format family. Drafts 04-07 did not specify a report
-// representation, so those and mixed chains use the modern self-contained form.
+// inferMalfeasanceFormat selects a draft format for homogeneous chains. Mixed
+// chains and drafts 04-07 use self-contained response objects.
 func (c *Chain) inferMalfeasanceFormat() malfeasanceFormat {
 	early, legacy := len(c.Links) > 0, len(c.Links) > 0
 	for _, link := range c.Links {
@@ -183,23 +223,73 @@ func marshalMalfeasanceJSON(report any) ([]byte, error) {
 	return data, nil
 }
 
-// ParseMalfeasanceReport parses the early, legacy, or modern JSON report
-// formats into a Chain.
+// ParseMalfeasanceReport parses RFC report structure into a strict Chain. Call
+// [Chain.Verify] to authenticate the evidence.
 func ParseMalfeasanceReport(data []byte) (*Chain, error) {
+	return ParseMalfeasanceReportWithMode(data, Strict)
+}
+
+// ParseMalfeasanceReportWithMode parses a report without authenticating its
+// evidence.
+func ParseMalfeasanceReportWithMode(data []byte, mode Mode) (*Chain, error) {
+	if mode != Strict && mode != Flex {
+		return nil, errors.New("protocol: invalid mode")
+	}
+	chain, err := parseMalfeasanceReport(data, mode)
+	if err != nil {
+		return nil, err
+	}
+	chain.Mode = mode
+	if mode == Strict {
+		if err := validateRFCReportLinks(chain.Links); err != nil {
+			return nil, err
+		}
+	}
+	return chain, nil
+}
+
+// validateRFCReportLinks checks RFC key sizes, blinding values, and packet
+// forms.
+func validateRFCReportLinks(links []ChainLink) error {
+	for i, link := range links {
+		if len(link.PublicKey) != 32 || (len(link.Rand) != 32 && (i > 0 || len(link.Rand) != 0)) {
+			return fmt.Errorf("protocol: report link %d has invalid key or rand", i)
+		}
+		if _, err := ParseRequest(link.Request); err != nil {
+			return fmt.Errorf("protocol: report link %d: %w", i, err)
+		}
+		if _, err := unwrapPacket(link.Response); err != nil {
+			return fmt.Errorf("protocol: report link %d: %w", i, err)
+		}
+		if version, ok := ExtractVersion(link.Response); !ok || version != Version1 {
+			return fmt.Errorf("protocol: report link %d does not contain an RFC response", i)
+		}
+	}
+	return nil
+}
+
+// parseMalfeasanceReport decodes RFC reports and flex legacy formats.
+func parseMalfeasanceReport(data []byte, mode Mode) (*Chain, error) {
 	if len(data) > maxMalfeasanceReportBytes {
 		return nil, fmt.Errorf("protocol: malfeasance report is %d bytes (max %d)", len(data), maxMalfeasanceReportBytes)
+	}
+	if mode == Strict && !utf8.Valid(data) {
+		return nil, errors.New("protocol: malfeasance report is not valid UTF-8")
 	}
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
 		return nil, errors.New("protocol: empty malfeasance report")
 	}
 	if trimmed[0] == '[' {
+		if mode != Flex {
+			return nil, errors.New("protocol: array reports require flex mode")
+		}
 		return parseEarlyMalfeasanceReport(trimmed)
 	}
 	// probe distinguishes legacy string arrays from modern object entries.
 	var probe struct {
-		Nonces    json.RawMessage   `json:"nonces"`
-		Responses []json.RawMessage `json:"responses"`
+		Nonces    json.RawMessage                     `json:"nonces"`
+		Responses boundedReportArray[json.RawMessage] `json:"responses"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return nil, fmt.Errorf("protocol: parse malfeasance report: %w", err)
@@ -213,6 +303,9 @@ func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 	legacy := len(probe.Nonces) > 0 && len(probe.Responses[0]) > 0 && probe.Responses[0][0] == '"'
 
 	if legacy {
+		if mode != Flex {
+			return nil, errors.New("protocol: parallel-array reports require flex mode")
+		}
 		var report malfeasanceReportLegacy
 		if err := json.Unmarshal(data, &report); err != nil {
 			return nil, fmt.Errorf("protocol: parse legacy malfeasance report: %w", err)
@@ -296,7 +389,7 @@ func ParseMalfeasanceReport(data []byte) (*Chain, error) {
 // parseEarlyMalfeasanceReport parses the drafts 01-03 array format and shifts
 // each blind onto the following ChainLink.Rand field.
 func parseEarlyMalfeasanceReport(data []byte) (*Chain, error) {
-	var report []malfeasanceLinkEarly
+	var report boundedReportArray[malfeasanceLinkEarly]
 	if err := json.Unmarshal(data, &report); err != nil {
 		return nil, fmt.Errorf("protocol: parse early malfeasance report: %w", err)
 	}

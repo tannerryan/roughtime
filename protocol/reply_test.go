@@ -4,12 +4,70 @@
 package protocol
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestDraftRepliesRejectInconsistentMetadata checks both draft full-packet
+// forms, preserving valid single and batched replies.
+func TestDraftRepliesRejectInconsistentMetadata(t *testing.T) {
+	cert, _ := testCert(t)
+	for _, omitTYPE := range []bool{false, true} {
+		for _, count := range []int{1, 2} {
+			t.Run(fmt.Sprintf("untyped=%t/batch=%d", omitTYPE, count), func(t *testing.T) {
+				requests := make([]Request, count)
+				for i := range requests {
+					_, raw, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, ComputeSRV(cert.edRootPK), RequestOptions{Mode: Flex, OmitTYPE: omitTYPE})
+					if err != nil {
+						t.Fatal(err)
+					}
+					req, err := ParseRequestWithMode(raw, Flex)
+					if err != nil {
+						t.Fatal(err)
+					}
+					requests[i] = *req
+				}
+				replies, err := CreateRepliesWithOptions(VersionDraft12, requests, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i, reply := range replies {
+					req := requests[i]
+					if _, _, err := VerifyReplyWithOptions(req.Versions, reply, cert.edRootPK, req.Nonce, req.RawPacket, VerifyOptions{Mode: Flex}); err != nil {
+						t.Fatalf("valid request %d: %v", i, err)
+					}
+				}
+				for _, field := range []string{"Nonce", "Versions", "SRV", "HasType"} {
+					t.Run(field, func(t *testing.T) {
+						changed := append([]Request(nil), requests...)
+						req := &changed[len(changed)-1]
+						switch field {
+						case "Nonce":
+							req.Nonce = bytes.Clone(req.Nonce)
+							req.Nonce[0] ^= 1
+						case "Versions":
+							req.Versions = []Version{Version1, VersionDraft12}
+						case "SRV":
+							req.SRV = bytes.Clone(req.SRV)
+							req.SRV[0] ^= 1
+						case "HasType":
+							req.HasType = !req.HasType
+						}
+						_, err := CreateRepliesWithOptions(VersionDraft12, changed, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
+						if err == nil || !strings.Contains(err.Error(), "fields do not match packet") {
+							t.Fatalf("inconsistent %s: %v", field, err)
+						}
+					})
+				}
+			})
+		}
+	}
+}
 
 // TestValidateRequestForReply covers version offers, root binding, and the
 // historical nonce-only Request API.
@@ -46,11 +104,11 @@ func TestValidateRequestForReply(t *testing.T) {
 	}
 	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
 		t.Run("parsed "+ver.ShortString(), func(t *testing.T) {
-			_, raw, err := CreateRequest([]Version{ver}, rand.Reader, nil)
+			_, raw, err := CreateRequestWithOptions([]Version{ver}, rand.Reader, nil, RequestOptions{Mode: Flex})
 			if err != nil {
 				t.Fatal(err)
 			}
-			req, err := ParseRequest(raw)
+			req, err := ParseRequestWithMode(raw, Flex)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -83,22 +141,22 @@ func TestCreateRepliesBatch(t *testing.T) {
 			raw := make([][]byte, tc.size)
 			for i := range requests {
 				var err error
-				nonces[i], raw[i], err = CreateRequest([]Version{tc.version}, rand.Reader, nil)
+				nonces[i], raw[i], err = CreateRequestWithOptions([]Version{tc.version}, rand.Reader, nil, RequestOptions{Mode: Flex})
 				if err != nil {
 					t.Fatal(err)
 				}
-				parsed, err := ParseRequest(raw[i])
+				parsed, err := ParseRequestWithMode(raw[i], Flex)
 				if err != nil {
 					t.Fatal(err)
 				}
 				requests[i] = *parsed
 			}
-			replies, err := CreateReplies(tc.version, requests, time.Now(), time.Second, cert)
+			replies, err := CreateRepliesWithOptions(tc.version, requests, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 			if err != nil {
 				t.Fatal(err)
 			}
 			for i := range replies {
-				if _, _, err := VerifyReply([]Version{tc.version}, replies[i], cert.edRootPK, nonces[i], raw[i]); err != nil {
+				if _, _, err := VerifyReplyWithOptions([]Version{tc.version}, replies[i], cert.edRootPK, nonces[i], raw[i], VerifyOptions{Mode: Flex}); err != nil {
 					t.Fatalf("reply %d: %v", i, err)
 				}
 			}
@@ -109,15 +167,15 @@ func TestCreateRepliesBatch(t *testing.T) {
 // TestSREPContainsVERSForDraft12 covers signed version advertisement.
 func TestSREPContainsVERSForDraft12(t *testing.T) {
 	cert, _ := testCert(t)
-	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	_, req, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	replies, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,9 +224,9 @@ func TestSREPContainsVERSForDraft12(t *testing.T) {
 // TestDraft12NoTopLevelVER covers the shared-version response layout.
 func TestDraft12NoTopLevelVER(t *testing.T) {
 	cert, _ := testCert(t)
-	nonce, req, _ := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
-	parsed, _ := ParseRequest(req)
-	replies, _ := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert)
+	nonce, req, _ := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
+	parsed, _ := ParseRequestWithMode(req, Flex)
+	replies, _ := CreateRepliesWithOptions(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex})
 	inner, err := unwrapPacket(replies[0])
 	if err != nil {
 		t.Fatal(err)
@@ -198,20 +256,20 @@ func TestPQBatch(t *testing.T) {
 	rawReqs := make([][]byte, batch)
 
 	for i := range batch {
-		nonce, req, err := CreateRequest(versions, rand.Reader, nil)
+		nonce, req, err := CreateRequestWithOptions(versions, rand.Reader, nil, RequestOptions{Mode: Flex})
 		if err != nil {
 			t.Fatalf("CreateRequest %d: %v", i, err)
 		}
 		nonces[i] = nonce
 		rawReqs[i] = req
-		parsed, err := ParseRequest(req)
+		parsed, err := ParseRequestWithMode(req, Flex)
 		if err != nil {
 			t.Fatalf("ParseRequest %d: %v", i, err)
 		}
 		reqs[i] = *parsed
 	}
 
-	replies, err := CreateReplies(VersionMLDSA44, reqs, time.Now(), 3*time.Second, cert)
+	replies, err := CreateRepliesWithOptions(VersionMLDSA44, reqs, time.Now(), 3*time.Second, cert, ReplyOptions{Mode: Flex})
 	if err != nil {
 		t.Fatalf("CreateReplies: %v", err)
 	}
@@ -219,7 +277,7 @@ func TestPQBatch(t *testing.T) {
 		if len(replies[i]) > len(rawReqs[i]) {
 			t.Fatalf("reply %d length %d exceeds request length %d", i, len(replies[i]), len(rawReqs[i]))
 		}
-		if _, _, err := VerifyReply(versions, replies[i], rootPK, nonces[i], rawReqs[i]); err != nil {
+		if _, _, err := VerifyReplyWithOptions(versions, replies[i], rootPK, nonces[i], rawReqs[i], VerifyOptions{Mode: Flex}); err != nil {
 			t.Fatalf("VerifyReply %d: %v", i, err)
 		}
 	}
@@ -227,20 +285,20 @@ func TestPQBatch(t *testing.T) {
 
 // TestCreateRepliesRejectsNilAndWipedCertificate covers unusable certificates.
 func TestCreateRepliesRejectsNilAndWipedCertificate(t *testing.T) {
-	_, req, err := CreateRequest([]Version{VersionDraft12}, rand.Reader, nil)
+	_, req, err := CreateRequestWithOptions([]Version{VersionDraft12}, rand.Reader, nil, RequestOptions{Mode: Flex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsed, err := ParseRequest(req)
+	parsed, err := ParseRequestWithMode(req, Flex)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, nil); err == nil {
+	if _, err := CreateRepliesWithOptions(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, nil, ReplyOptions{Mode: Flex}); err == nil {
 		t.Fatal("CreateReplies accepted nil certificate")
 	}
 	cert, _ := testCert(t)
 	cert.Wipe()
-	if _, err := CreateReplies(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert); err == nil {
+	if _, err := CreateRepliesWithOptions(VersionDraft12, []Request{*parsed}, time.Now(), time.Second, cert, ReplyOptions{Mode: Flex}); err == nil {
 		t.Fatal("CreateReplies accepted wiped certificate")
 	}
 }

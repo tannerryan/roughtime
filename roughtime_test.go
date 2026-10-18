@@ -33,9 +33,10 @@ type fakeServer struct {
 	tcpLis    net.Listener
 	wg        sync.WaitGroup
 	mu        sync.Mutex
-	dropCount int           // >0 drops the next N requests
-	hook      func()        // optional pre-handle hook
-	radius    time.Duration // signed time-uncertainty radius
+	dropCount int                // >0 drops the next N requests
+	hook      func()             // optional pre-handle hook
+	radius    time.Duration      // signed time-uncertainty radius
+	versions  []protocol.Version // versions accepted by the fake server
 }
 
 // fakeMLServer is a minimal TCP-only ML-DSA-44 responder.
@@ -115,7 +116,7 @@ func (f *fakeMLServer) serveTCPConn(conn net.Conn) {
 	if _, err := io.ReadFull(conn, raw[protocol.PacketHeaderSize:]); err != nil {
 		return
 	}
-	req, err := protocol.ParseRequest(raw)
+	req, err := protocol.ParseRequestWithMode(raw, protocol.Flex)
 	if err != nil {
 		return
 	}
@@ -123,7 +124,7 @@ func (f *fakeMLServer) serveTCPConn(conn net.Conn) {
 	if err != nil {
 		return
 	}
-	replies, err := protocol.CreateReplies(ver, []protocol.Request{*req}, time.Now(), time.Second, f.cert)
+	replies, err := protocol.CreateRepliesWithOptions(ver, []protocol.Request{*req}, time.Now(), time.Second, f.cert, protocol.ReplyOptions{Mode: protocol.Flex})
 	if err != nil {
 		return
 	}
@@ -164,7 +165,7 @@ func newFakeServerOpts(t *testing.T, hook func(), radius time.Duration) *fakeSer
 		t.Fatalf("ed25519 online: %v", err)
 	}
 	now := time.Now()
-	cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	cert, err := protocol.NewCertificateWithVersions(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK, protocol.ServerPreferenceEd25519)
 	if err != nil {
 		t.Fatalf("NewCertificate: %v", err)
 	}
@@ -205,6 +206,13 @@ func (f *fakeServer) Close() {
 func (f *fakeServer) dropNext(n int) {
 	f.mu.Lock()
 	f.dropCount = n
+	f.mu.Unlock()
+}
+
+// setVersions selects the versions accepted by the fake server.
+func (f *fakeServer) setVersions(versions ...protocol.Version) {
+	f.mu.Lock()
+	f.versions = versions
 	f.mu.Unlock()
 }
 
@@ -290,16 +298,21 @@ func (f *fakeServer) serveTCPConn(conn net.Conn) {
 
 // handle parses a request, negotiates a version, and returns a signed reply.
 func (f *fakeServer) handle(raw []byte) ([]byte, error) {
-	req, err := protocol.ParseRequest(raw)
+	req, err := protocol.ParseRequestWithMode(raw, protocol.Flex)
 	if err != nil {
 		return nil, err
 	}
-	prefs := []protocol.Version{protocol.VersionDraft12, protocol.VersionDraft11, protocol.VersionDraft10}
+	f.mu.Lock()
+	prefs := f.versions
+	f.mu.Unlock()
+	if len(prefs) == 0 {
+		prefs = []protocol.Version{protocol.Version1, protocol.VersionDraft12, protocol.VersionDraft11, protocol.VersionDraft10}
+	}
 	ver, err := protocol.SelectVersion(req.Versions, len(req.Nonce), prefs)
 	if err != nil {
 		return nil, err
 	}
-	replies, err := protocol.CreateReplies(ver, []protocol.Request{*req}, time.Now(), f.radius, f.cert)
+	replies, err := protocol.CreateRepliesWithOptions(ver, []protocol.Request{*req}, time.Now(), f.radius, f.cert, protocol.ReplyOptions{Mode: protocol.Flex})
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +325,7 @@ func (f *fakeServer) server() roughtime.Server {
 	th, tp, _ := net.SplitHostPort(f.tcpAddr)
 	return roughtime.Server{
 		Name:      "fake",
-		Version:   "draft-ietf-ntp-roughtime-12",
+		Version:   "1",
 		PublicKey: f.rootPK,
 		Addresses: []roughtime.Address{
 			{Transport: "udp", Address: net.JoinHostPort(uh, up)},
@@ -340,8 +353,8 @@ func TestClientQueryUDP(t *testing.T) {
 	if resp.Radius <= 0 {
 		t.Fatalf("Radius = %s, want > 0", resp.Radius)
 	}
-	if len(resp.Request) != 1024 {
-		t.Fatalf("request length = %d, want 1024", len(resp.Request))
+	if len(resp.Request) != 1036 {
+		t.Fatalf("request length = %d, want 1036", len(resp.Request))
 	}
 	if _, _, err := roughtime.Verify(f.rootPK, resp.Request, resp.Reply); err != nil {
 		t.Fatalf("Verify: %v", err)
@@ -382,7 +395,7 @@ func TestAddressString(t *testing.T) {
 }
 
 // TestClientPacketSizing covers all three high-level request-construction paths
-// in both legacy-default and standard-body modes.
+// in strict mode and both flex padding modes.
 func TestClientPacketSizing(t *testing.T) {
 	f := newFakeServer(t)
 	defer f.Close()
@@ -394,8 +407,9 @@ func TestClientPacketSizing(t *testing.T) {
 		c    roughtime.Client
 		want int
 	}{
-		{"legacy default", roughtime.Client{}, 1024},
-		{"standard body", roughtime.Client{StandardPacketSize: true}, 1024 + protocol.PacketHeaderSize},
+		{"strict default", roughtime.Client{}, 1036},
+		{"flex packet", roughtime.Client{Mode: protocol.Flex}, 1024},
+		{"standard body", roughtime.Client{Mode: protocol.Flex, StandardPacketSize: true}, 1024 + protocol.PacketHeaderSize},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp, err := tc.c.Query(context.Background(), s)
@@ -434,8 +448,8 @@ func TestPackageQueryWrappers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if len(resp.Request) != 1024 {
-		t.Fatalf("Query request length = %d, want legacy default 1024", len(resp.Request))
+	if len(resp.Request) != 1036 {
+		t.Fatalf("Query request length = %d, want 1036", len(resp.Request))
 	}
 	nonce := bytes.Repeat([]byte{0x6b}, 32)
 	resp, err = roughtime.QueryWithNonce(context.Background(), s, nonce)
@@ -464,7 +478,7 @@ func TestNormalizeServer(t *testing.T) {
 			{Transport: "udp", Address: "udp2.example:2002"},
 		},
 	}
-	got, err := roughtime.NormalizeServer(in)
+	got, err := roughtime.NormalizeServerWithMode(in, protocol.Flex)
 	if err != nil {
 		t.Fatalf("NormalizeServer: %v", err)
 	}
@@ -484,21 +498,21 @@ func TestNormalizeServer(t *testing.T) {
 			{Transport: "tcp", Address: "pq.example:2003"},
 		},
 	}
-	got, err = roughtime.NormalizeServer(pq)
+	got, err = roughtime.NormalizeServerWithMode(pq, protocol.Flex)
 	if err != nil || len(got.Addresses) != 1 || got.Addresses[0].Transport != "tcp" {
 		t.Fatalf("NormalizeServer(ML) = %+v, %v", got, err)
 	}
 
 	google := in
 	google.Version = "google-roughtime"
-	got, err = roughtime.NormalizeServer(google)
+	got, err = roughtime.NormalizeServerWithMode(google, protocol.Flex)
 	if err != nil || len(got.Addresses) != 2 || !strings.EqualFold(got.Addresses[0].Transport, "udp") {
 		t.Fatalf("NormalizeServer(Google) = %+v, %v", got, err)
 	}
 
 	tooOld := in
-	tooOld.Version = "1"
-	if _, err := roughtime.NormalizeServer(tooOld); err == nil || !strings.Contains(err.Error(), "no supported") {
+	tooOld.Version = "0"
+	if _, err := roughtime.NormalizeServerWithMode(tooOld, protocol.Flex); err == nil || !strings.Contains(err.Error(), "no supported") {
 		t.Fatalf("NormalizeServer(old version) = %v, want compatibility error", err)
 	}
 }
@@ -511,7 +525,7 @@ func TestClientMLDSAAndMixedProof(t *testing.T) {
 	pq := newFakeMLServer(t)
 	defer pq.Close()
 
-	c := roughtime.Client{StandardPacketSize: true}
+	c := roughtime.Client{Mode: protocol.Flex, StandardPacketSize: true}
 	pqResponse, err := c.Query(context.Background(), pq.server())
 	if err != nil {
 		t.Fatalf("ML-DSA Query: %v", err)
@@ -523,42 +537,47 @@ func TestClientMLDSAAndMixedProof(t *testing.T) {
 		t.Fatalf("ML-DSA request length = %d, want %d", got, want)
 	}
 
-	servers := []roughtime.Server{ed.server(), pq.server(), ed.server()}
-	chain, err := c.QueryChain(context.Background(), servers)
-	if err != nil {
-		t.Fatalf("mixed QueryChain: %v", err)
-	}
-	for i, result := range chain.Results {
-		if result.Err != nil || result.Response == nil {
-			t.Fatalf("result[%d] = %+v", i, result)
+	for _, edVersion := range []protocol.Version{protocol.Version1, protocol.VersionDraft12} {
+		ed.setVersions(edVersion)
+		edServer := ed.server()
+		edServer.Version = "IETF"
+		servers := []roughtime.Server{edServer, pq.server(), edServer}
+		chain, err := c.QueryChain(context.Background(), servers)
+		if err != nil {
+			t.Fatalf("mixed QueryChain: %v", err)
 		}
-	}
-	proof, err := chain.Proof()
-	if err != nil {
-		t.Fatalf("Proof: %v", err)
-	}
-	data, err := proof.MarshalGzip()
-	if err != nil {
-		t.Fatalf("MarshalGzip: %v", err)
-	}
-	parsed, err := roughtime.ParseProof(data)
-	if err != nil {
-		t.Fatalf("ParseProof: %v", err)
-	}
-	if err := parsed.Verify(); err != nil {
-		t.Fatalf("parsed mixed proof Verify: %v", err)
-	}
-	if err := parsed.Trust(servers); err != nil {
-		t.Fatalf("parsed mixed proof Trust: %v", err)
-	}
-	links, err := parsed.Links()
-	if err != nil {
-		t.Fatalf("Links: %v", err)
-	}
-	wantVersions := []protocol.Version{protocol.VersionDraft12, protocol.VersionMLDSA44, protocol.VersionDraft12}
-	for i, want := range wantVersions {
-		if links[i].Version != want {
-			t.Errorf("link[%d] version = %v, want %v", i, links[i].Version, want)
+		for i, result := range chain.Results {
+			if result.Err != nil || result.Response == nil {
+				t.Fatalf("result[%d] = %+v", i, result)
+			}
+		}
+		proof, err := chain.Proof()
+		if err != nil {
+			t.Fatalf("Proof: %v", err)
+		}
+		data, err := proof.MarshalGzip()
+		if err != nil {
+			t.Fatalf("MarshalGzip: %v", err)
+		}
+		parsed, err := roughtime.ParseProofWithMode(data, protocol.Flex)
+		if err != nil {
+			t.Fatalf("ParseProof: %v", err)
+		}
+		if err := parsed.Verify(); err != nil {
+			t.Fatalf("parsed mixed proof Verify: %v", err)
+		}
+		if err := parsed.Trust(servers); err != nil {
+			t.Fatalf("parsed mixed proof Trust: %v", err)
+		}
+		links, err := parsed.Links()
+		if err != nil {
+			t.Fatalf("Links: %v", err)
+		}
+		wantVersions := []protocol.Version{edVersion, protocol.VersionMLDSA44, edVersion}
+		for i, want := range wantVersions {
+			if links[i].Version != want {
+				t.Errorf("link[%d] version = %v, want %v", i, links[i].Version, want)
+			}
 		}
 	}
 }
@@ -647,7 +666,7 @@ func TestPickAddressMLDSARequiresTCP(t *testing.T) {
 		PublicKey: pk,
 		Addresses: []roughtime.Address{{Transport: "udp", Address: "example.com:2002"}},
 	}
-	var c roughtime.Client
+	c := roughtime.Client{Mode: protocol.Flex}
 	_, err := c.Query(context.Background(), s)
 	if err == nil || !strings.Contains(err.Error(), "tcp address") {
 		t.Fatalf("Query: %v, want 'no tcp address'", err)
@@ -663,7 +682,7 @@ func TestPickAddressGoogleRequiresUDP(t *testing.T) {
 			PublicKey: make([]byte, ed25519.PublicKeySize),
 			Addresses: []roughtime.Address{{Transport: "tcp", Address: "example.com:2002"}},
 		}
-		var c roughtime.Client
+		c := roughtime.Client{Mode: protocol.Flex}
 		_, err := c.Query(context.Background(), s)
 		if err == nil || !strings.Contains(err.Error(), "udp address") {
 			t.Fatalf("Query with version %q: %v, want 'no udp address' error", version, err)

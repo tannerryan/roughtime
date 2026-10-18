@@ -24,9 +24,12 @@ import (
 	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/internal/fileutil"
 	"github.com/tannerryan/roughtime/internal/version"
+	"github.com/tannerryan/roughtime/protocol"
 )
 
 var (
+	// flex enables draft and experimental timestamp proofs.
+	flex = flag.Bool("flex", false, "also support implemented drafts and ML-DSA-44 proofs")
 	// mode selects receipt creation or verification.
 	mode = flag.String("mode", "stamp", "stamp or verify")
 	// docPath is the document path flag.
@@ -43,7 +46,7 @@ var (
 	retries = flag.Int("retries", 3, "max attempts per server")
 	// standardSize selects message-sized rather than legacy packet-sized
 	// padding.
-	standardSize = flag.Bool("standard-size", false, "use standard message-sized request padding (stamp mode)")
+	standardSize = flag.Bool("standard-size", false, "use full-body padding in flex stamp mode (strict mode always uses it)")
 	// showVersion requests version output and exit.
 	showVersion = flag.Bool("version", false, "print version and exit")
 )
@@ -134,7 +137,7 @@ func stamp(ctx context.Context) error {
 		return err
 	}
 
-	client := roughtime.Client{Timeout: *timeout, MaxAttempts: *retries, StandardPacketSize: *standardSize}
+	client := roughtime.Client{Mode: protocolMode(), Timeout: *timeout, MaxAttempts: *retries, StandardPacketSize: *standardSize}
 	chain, err := client.QueryChainWithNonce(ctx, twoPassOrder(witnesses), digest)
 	if err != nil {
 		return fmt.Errorf("query chain: %w", err)
@@ -152,7 +155,7 @@ func stamp(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("serializing proof: %w", err)
 	}
-	parsed, err := roughtime.ParseProof(data)
+	parsed, err := roughtime.ParseProofWithMode(data, protocolMode())
 	if err != nil {
 		return fmt.Errorf("checking serialized proof: %w", err)
 	}
@@ -206,7 +209,7 @@ func verify(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	proof, err := roughtime.ParseProof(raw)
+	proof, err := roughtime.ParseProofWithMode(raw, protocolMode())
 	if err != nil {
 		return fmt.Errorf("parsing proof: %w", err)
 	}
@@ -234,7 +237,11 @@ func verify(ctx context.Context) error {
 	if distinctKeys(links) < 2 {
 		return errors.New("proof requires at least two distinct witnesses")
 	}
-	printVerification(*docPath, size, digest, *inPath, len(raw), links, analyzeProof(links, servers))
+	profile := analyzeProof(links, servers)
+	if !*flex && !profile.twoPass {
+		return errors.New("strict receipts require two same-order passes across at least three endpoint-domain groups")
+	}
+	printVerification(*docPath, size, digest, *inPath, len(raw), links, profile)
 	return nil
 }
 
@@ -362,7 +369,7 @@ func analyzeProof(links []roughtime.ProofLink, servers []roughtime.Server) proof
 func endpointGroupsByRoot(servers []roughtime.Server) map[string]string {
 	endpointGroups := make(map[string]string, len(servers))
 	for _, server := range servers {
-		server, err := roughtime.NormalizeServer(server)
+		server, err := roughtime.NormalizeServerWithMode(server, protocolMode())
 		if err != nil {
 			continue
 		}
@@ -383,7 +390,8 @@ func loadServers(path string) ([]roughtime.Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return roughtime.ParseEcosystem(data)
+	// List syntax is independent of the protocol mode used for queries.
+	return roughtime.ParseEcosystemWithMode(data, protocol.Flex)
 }
 
 // readBoundedFile accepts files up to maxFileBytes.
@@ -488,7 +496,7 @@ func filterCompatible(servers []roughtime.Server) []roughtime.Server {
 		if strings.EqualFold(server.Version, roughtime.VersionLabelGoogle) || server.Version == "3000600613" {
 			continue
 		}
-		server, err := roughtime.NormalizeServer(server)
+		server, err := roughtime.NormalizeServerWithMode(server, protocolMode())
 		if err != nil {
 			continue
 		}
@@ -507,6 +515,14 @@ func filterCompatible(servers []roughtime.Server) []roughtime.Server {
 
 // display sanitizes untrusted terminal text.
 func display(value string) string { return roughtime.SanitizeForDisplay(value) }
+
+// protocolMode returns the mode selected by -flex.
+func protocolMode() protocol.Mode {
+	if *flex {
+		return protocol.Flex
+	}
+	return protocol.Strict
+}
 
 // printFailures prints failed witness queries.
 func printFailures(results []roughtime.Result) {

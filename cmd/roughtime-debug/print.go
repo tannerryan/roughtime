@@ -17,14 +17,14 @@ import (
 // printDiagnostic prints one probe's request, response, and verified timing.
 func printDiagnostic(r probeResult) {
 	fmt.Printf("=== Request ===\nSize: %d bytes\n", len(r.request))
-	printTags(decode(msgBody(r.request)))
+	printTags(decode(msgBody(r.request), r.plan.version))
 
 	fmt.Printf("\n=== Response ===\nSize: %d bytes\n", len(r.reply))
 	if len(r.reply) == 0 {
 		fmt.Println("No response captured.")
 		return
 	}
-	tags := decode(msgBody(r.reply))
+	tags := decode(msgBody(r.reply), r.plan.version)
 	printTags(tags)
 	if r.transport == "udp" {
 		status := "ok"
@@ -95,7 +95,7 @@ func printSREP(tags map[uint32][]byte, version protocol.Version) {
 	if srepBytes == nil {
 		return
 	}
-	srep := decode(srepBytes)
+	srep := decode(srepBytes, version)
 	if srep == nil {
 		return
 	}
@@ -117,11 +117,11 @@ func printSREP(tags map[uint32][]byte, version protocol.Version) {
 
 // printCertificate prints delegation key and validity fields.
 func printCertificate(tags map[uint32][]byte, version protocol.Version, midpoint time.Time) {
-	cert := decode(tags[protocol.TagCERT])
+	cert := decode(tags[protocol.TagCERT], version)
 	if cert == nil {
 		return
 	}
-	delegation := decode(cert[protocol.TagDELE])
+	delegation := decode(cert[protocol.TagDELE], version)
 	if delegation == nil {
 		return
 	}

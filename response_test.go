@@ -27,9 +27,8 @@ func TestResponseDrift(t *testing.T) {
 	}
 }
 
-// TestResponseInSyncStrictPointEstimate documents the compatibility-preserved
-// semantics: the RTT-center estimate, not the whole exchange interval, is
-// compared with the signed server interval.
+// TestResponseInSyncStrictPointEstimate compares the RTT-center estimate with
+// the signed server interval.
 func TestResponseInSyncStrictPointEstimate(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	cases := []struct {

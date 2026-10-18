@@ -4,14 +4,18 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/tannerryan/roughtime"
+	"github.com/tannerryan/roughtime/protocol"
 )
 
 // TestResponseInSync covers closed boundaries, asymmetric delay uncertainty,
@@ -117,6 +121,7 @@ func TestDurationSpreadSaturates(t *testing.T) {
 	}
 }
 
+// successfulResult returns a fixed response for output tests.
 func successfulResult() roughtime.Result {
 	server := roughtime.Server{
 		Name:      "success",
@@ -135,6 +140,7 @@ func successfulResult() roughtime.Result {
 	return roughtime.Result{Server: server, Address: address, Response: response}
 }
 
+// captureStdout returns the text printed by fn.
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	reader, writer, err := os.Pipe()
@@ -156,4 +162,81 @@ func captureStdout(t *testing.T, fn func()) string {
 	out := <-done
 	_ = reader.Close()
 	return out
+}
+
+// TestCausalEvidenceSaved checks that saved evidence retains an authenticated
+// contradiction.
+func TestCausalEvidenceSaved(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	rootPK, rootSK, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, onlineSK, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Second)
+	cert, err := protocol.NewCertificate(now.Add(-time.Hour), now.Add(time.Hour), onlineSK, rootSK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cert.Wipe()
+	chain := &protocol.Chain{}
+	for _, mid := range []time.Time{now, now.Add(-time.Minute)} {
+		link, err := chain.NextRequest([]protocol.Version{protocol.Version1}, rootPK, rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := protocol.ParseRequest(link.Request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replies, err := protocol.CreateReplies(protocol.Version1, []protocol.Request{*req}, mid, time.Second, cert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		link.Response = replies[0]
+		chain.Append(link)
+	}
+	report, err := chain.MalfeasanceReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := roughtime.ParseProof(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := captureStdout(t, func() {
+		if err := printChainStatus(proof); !errors.Is(err, protocol.ErrCausalOrder) {
+			t.Fatalf("missing causal error: %v", err)
+		}
+	})
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("evidence files: %v %v", files, err)
+	}
+	if !strings.Contains(output, files[0].Name()) {
+		t.Fatal("saved evidence path not printed")
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := roughtime.ParseProof(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parsed.Verify(); !errors.Is(err, protocol.ErrCausalOrder) {
+		t.Fatalf("saved evidence did not preserve authenticated contradiction: %v", err)
+	}
+	output = captureStdout(t, func() { _ = printChainStatus(&roughtime.Proof{}) })
+	files, err = os.ReadDir(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatal("malformed input created evidence")
+	}
+	if strings.Contains(output, "Evidence saved") {
+		t.Fatal("reported evidence for malformed proof")
+	}
 }
