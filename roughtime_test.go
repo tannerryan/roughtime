@@ -618,6 +618,34 @@ func TestClientRetryOnDrop(t *testing.T) {
 	}
 }
 
+// TestFlexUDPOnlyRetryBudget preserves all configured UDP attempts for legacy
+// peers when the same-port TCP service cannot answer Roughtime requests.
+func TestFlexUDPOnlyRetryBudget(t *testing.T) {
+	f := newFakeServer(t)
+	defer f.Close()
+	f.setVersions(protocol.VersionDraft07)
+	f.dropNext(2)
+	// Reserve the TCP port without answering so an inferred TCP attempt fails.
+	silentTCP, err := net.Listen("tcp", f.udpAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silentTCP.Close()
+	server := f.server()
+	server.Version = "IETF-Roughtime"
+	server.Addresses = []roughtime.Address{{Transport: "udp", Address: f.udpAddr}}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	client := &roughtime.Client{Mode: protocol.Flex, Timeout: 200 * time.Millisecond, MaxAttempts: 3}
+	response, err := client.Query(ctx, server)
+	if err != nil {
+		t.Fatalf("third UDP attempt: %v", err)
+	}
+	if response.Address.Transport != "udp" || response.Version != protocol.VersionDraft07 {
+		t.Fatalf("transport=%s version=%s", response.Address.Transport, response.Version)
+	}
+}
+
 // TestClientQueryChainWithNonceBindsSeed covers caller-supplied chain seeds.
 func TestClientQueryChainWithNonceBindsSeed(t *testing.T) {
 	f := newFakeServer(t)

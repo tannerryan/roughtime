@@ -18,6 +18,13 @@
       "addresses": [{ "protocol": "tcp", "address": "time.txryan.com:5319" }]
     },
     {
+      "name": "TimeNL-Roughtime",
+      "version": 1,
+      "publicKeyType": "ed25519",
+      "publicKey": "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY=",
+      "addresses": [{ "protocol": "udp", "address": "rough.time.nl:5319" }]
+    },
+    {
       "name": "Cloudflare-Roughtime-2",
       "version": "IETF-Roughtime",
       "publicKeyType": "ed25519",
@@ -66,13 +73,6 @@
       "addresses": [
         { "protocol": "udp", "address": "roughtime.sturdystatistics.com:2002" }
       ]
-    },
-    {
-      "name": "TimeNL-Roughtime",
-      "version": "IETF-Roughtime",
-      "publicKeyType": "ed25519",
-      "publicKey": "v2CievhgKsxzlWPwIkYFUXeA51Akhkv5uhJCj1/kbiY=",
-      "addresses": [{ "protocol": "udp", "address": "rough.time.nl:2002" }]
     },
     {
       "name": "Inutile-Roughtime-FR",

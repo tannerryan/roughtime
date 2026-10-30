@@ -39,7 +39,7 @@ deps-ci:
 	trap 'rm -rf "$$tmp"' EXIT; \
 	cd "$$tmp" && \
 	go mod init roughtime-lint-tools && \
-	go get honnef.co/go/tools/cmd/staticcheck@v0.8.1 golang.org/x/tools@v0.50.0 && \
+	go get honnef.co/go/tools/cmd/staticcheck@v0.8.2 golang.org/x/tools@v0.52.0 && \
 	go install honnef.co/go/tools/cmd/staticcheck
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 
