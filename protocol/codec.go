@@ -206,7 +206,8 @@ func validateHeader(tags, offsets []uint32, n uint32, allowUnsorted bool) error 
 	return nil
 }
 
-// validateMessage applies the selected profile's rules to an already decoded map.
+// validateMessage applies the selected profile's rules to an already decoded
+// map.
 func validateMessage(data []byte, msg map[uint32][]byte, g wireGroup) error {
 	n := len(msg)
 	if g != groupD01 {
@@ -235,7 +236,8 @@ func validateMessage(data []byte, msg map[uint32][]byte, g wireGroup) error {
 	return nil
 }
 
-// decodeProfile decodes a message and enforces the selected profile's tag rules.
+// decodeProfile decodes a message and enforces the selected profile's tag
+// rules.
 func decodeProfile(data []byte, g wireGroup) (map[uint32][]byte, error) {
 	msg, err := decodeMessage(data, g == groupD01)
 	if err == nil {
@@ -268,6 +270,9 @@ func unwrapPacket(pkt []byte) ([]byte, error) {
 	if len(pkt) < PacketHeaderSize {
 		return nil, errors.New("protocol: packet too short")
 	}
+	if len(pkt)-PacketHeaderSize > maxMessageSize {
+		return nil, fmt.Errorf("protocol: message exceeds %d bytes", maxMessageSize)
+	}
 	if !bytes.Equal(pkt[:len(packetMagic)], packetMagic[:]) {
 		return nil, errors.New("protocol: bad magic")
 	}
@@ -279,7 +284,7 @@ func unwrapPacket(pkt []byte) ([]byte, error) {
 	if bodyLen > uint64(mlen) {
 		return nil, errors.New("protocol: trailing data after framed message")
 	}
-	return pkt[PacketHeaderSize : PacketHeaderSize+mlen], nil
+	return pkt[PacketHeaderSize:], nil
 }
 
 // unwrapRequest strips the ROUGHTIM header if present, else returns raw.
@@ -313,7 +318,7 @@ func NonceOffsetInRequest(request []byte) (int, error) {
 // findTagRange locates the [lo, hi) byte range of a tag's value within a raw
 // message.
 func findTagRange(msg []byte, tag uint32) (lo, hi uint32, ok bool) {
-	if len(msg) < 4 {
+	if len(msg) < 4 || len(msg) > maxMessageSize {
 		return 0, 0, false
 	}
 	n := binary.LittleEndian.Uint32(msg[:4])

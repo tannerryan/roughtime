@@ -152,6 +152,11 @@ func writeSeedFile(path, header string, seed []byte) error {
 	defer clear(encoded)
 
 	path = filepath.Clean(path)
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return fmt.Errorf("opening seed directory: %w", err)
+	}
+	defer func() { _ = dir.Close() }()
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -176,6 +181,9 @@ func writeSeedFile(path, header string, seed []byte) error {
 		return fmt.Errorf("closing seed file %s: %w", path, err)
 	}
 	failed = false
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("seed file %s was created, but directory sync failed; crash durability is unknown: %w", path, err)
+	}
 	return nil
 }
 

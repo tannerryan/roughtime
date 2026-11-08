@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -514,6 +515,41 @@ func TestNormalizeServer(t *testing.T) {
 	tooOld.Version = "0"
 	if _, err := roughtime.NormalizeServerWithMode(tooOld, protocol.Flex); err == nil || !strings.Contains(err.Error(), "no supported") {
 		t.Fatalf("NormalizeServer(old version) = %v, want compatibility error", err)
+	}
+}
+
+// TestNormalizeServerFallbacks preserves order and avoids duplicate fallbacks,
+// including repeated UDP entries and case-insensitive transport names.
+func TestNormalizeServerFallbacks(t *testing.T) {
+	in := roughtime.Server{
+		PublicKey: make([]byte, ed25519.PublicKeySize),
+		Addresses: []roughtime.Address{
+			{Transport: "TCP", Address: "existing.example:5319"},
+			{Transport: "udp", Address: "new.example:5319"},
+			{Transport: "UDP", Address: "existing.example:5319"},
+			{Transport: "udp", Address: "new.example:5319"},
+			{Transport: "udp", Address: "last.example:5319"},
+		},
+	}
+	original := slices.Clone(in.Addresses)
+	got, err := roughtime.NormalizeServer(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []roughtime.Address{
+		original[1], original[2], original[3], original[4], original[0],
+		{Transport: "tcp", Address: "new.example:5319"},
+		{Transport: "tcp", Address: "last.example:5319"},
+	}
+	if !slices.Equal(got.Addresses, want) {
+		t.Fatalf("addresses = %+v, want %+v", got.Addresses, want)
+	}
+	if !slices.Equal(in.Addresses, original) {
+		t.Fatal("normalization changed the input")
+	}
+	again, err := roughtime.NormalizeServer(got)
+	if err != nil || !slices.Equal(again.Addresses, want) {
+		t.Fatalf("normalization is not idempotent: %+v, %v", again.Addresses, err)
 	}
 }
 

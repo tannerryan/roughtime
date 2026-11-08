@@ -8,6 +8,12 @@ README.md
 # Locally generated private root keys
 /keys/
 
+# Local credentials at any depth
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+
 # Built binaries (from `make build`)
 /roughtime
 /roughtime-client

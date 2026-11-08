@@ -195,6 +195,11 @@ concurrent queries, or `QueryChain` and `QueryChainWithNonce` for causal chains.
 Chain methods query the supplied order once. Complete RFC measurements require
 independent operators and both passes supplied by the caller.
 
+Applications that change trust roots can call `client.ForgetServer(publicKey)`
+to release a retired root's retry state. It returns false while that root has an
+active or waiting query. Use it only for roots no longer queried; package-level
+`ForgetServer` manages the shared client's state.
+
 ```go
 client := &roughtime.Client{}
 response, err := client.Query(ctx, roughtime.Server{

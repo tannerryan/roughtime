@@ -5,8 +5,10 @@ package roughtime
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -217,6 +219,64 @@ func TestWaitForRetryContext(t *testing.T) {
 	if _, ok := c.waitForRetry(ctx, "server"); ok {
 		t.Fatal("waitForRetry ignored canceled context")
 	}
+}
+
+// TestForgetServer removes only an unused root and affects initialized copies.
+func TestForgetServer(t *testing.T) {
+	c := failedClient("retired", time.Now().Add(time.Hour))
+	copyClient := c
+	active, ok := c.waitForRetry(context.Background(), "active")
+	if !ok {
+		t.Fatal("could not reserve active root")
+	}
+	defer c.releaseRetry(active)
+	if c.ForgetServer([]byte("active")) {
+		t.Fatal("forgot an active exchange")
+	}
+	if !copyClient.ForgetServer([]byte("retired")) {
+		t.Fatal("could not forget retired root")
+	}
+	if _, exists := c.retry.retries["retired"]; exists {
+		t.Fatal("initialized copy did not remove shared retry state")
+	}
+	if c.retry.retries["active"] != active.state {
+		t.Fatal("forgetting one root changed another root")
+	}
+	if !c.ForgetServer([]byte("retired")) {
+		t.Fatal("forgetting an absent root must succeed")
+	}
+}
+
+// TestForgetServerPendingRetry keeps a query's backoff intact while it waits,
+// then allows its retained failure state to be released after cancellation.
+func TestForgetServerPendingRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := failedClient("server", time.Now().Add(time.Hour))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			var request []byte
+			_, _, _, _, _, _, err := c.sendWithRetry(ctx,
+				Server{PublicKey: []byte("server")}, serverPlan{addresses: []Address{{Transport: "unused"}}},
+				&request, nil, nil)
+			done <- err
+		}()
+		synctest.Wait()
+		if c.ForgetServer([]byte("server")) {
+			t.Fatal("forgot a root with a query waiting for backoff")
+		}
+		cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("query error = %v, want cancellation", err)
+		}
+		if c.retry.retries["server"].interval != retryBackoffInitial {
+			t.Fatal("cancellation changed the retained backoff")
+		}
+		if !c.ForgetServer([]byte("server")) || len(c.retry.retries) != 0 {
+			t.Fatal("retired root remained after its query stopped")
+		}
+	})
 }
 
 // TestNextBackoff covers the exact progression and cap.

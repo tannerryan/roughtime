@@ -136,6 +136,35 @@ func TestUnwrapPacketBoundary(t *testing.T) {
 	}
 }
 
+// TestMessageSizeLimits checks both framed and raw nonce lookup at the limit.
+func TestMessageSizeLimits(t *testing.T) {
+	nonce := bytes.Repeat([]byte{0x42}, 32)
+	body, err := encode(map[uint32][]byte{
+		TagNONC: nonce,
+		TagZZZZ: make([]byte, maxMessageSize-16-len(nonce)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{maxMessageSize, maxMessageSize + 1} {
+		msg := append(bytes.Clone(body), make([]byte, size-len(body))...)
+		packet := wrapPacket(msg)
+		wantErr := size > maxMessageSize
+		if _, err := unwrapPacket(packet); (err != nil) != wantErr {
+			t.Fatalf("unwrap size %d: %v", size, err)
+		}
+		for _, input := range [][]byte{msg, packet} {
+			offset, err := NonceOffsetInRequest(input)
+			if (err != nil) != wantErr {
+				t.Fatalf("nonce lookup size %d: %v", len(input), err)
+			}
+			if err == nil && !bytes.Equal(input[offset:offset+len(nonce)], nonce) {
+				t.Fatal("nonce lookup returned the wrong range")
+			}
+		}
+	}
+}
+
 // FuzzDecode exercises arbitrary tag-value messages.
 func FuzzDecode(f *testing.F) {
 	valid, _ := encode(map[uint32][]byte{TagNONC: make([]byte, 32)})

@@ -128,6 +128,7 @@ type retryState struct {
 	probing    bool
 	generation uint64
 	active     int
+	queries    int // includes exchanges, retries, and cooldown waits
 	changed    chan struct{}
 }
 
@@ -145,6 +146,17 @@ type retryAttempt struct {
 type retryTracker struct {
 	mu      sync.Mutex
 	retries map[string]*retryState
+}
+
+// stateLocked returns the root's state. t.mu must be held.
+func (t *retryTracker) stateLocked(key string) *retryState {
+	if t.retries == nil {
+		t.retries = make(map[string]*retryState)
+	}
+	if t.retries[key] == nil {
+		t.retries[key] = &retryState{changed: make(chan struct{})}
+	}
+	return t.retries[key]
 }
 
 // Error sentinels re-exported from the protocol package for use with
@@ -262,6 +274,27 @@ func Query(ctx context.Context, s Server) (*Response, error) {
 // client.
 func QueryWithNonce(ctx context.Context, s Server, nonce []byte) (*Response, error) {
 	return defaultClient.QueryWithNonce(ctx, s, nonce)
+}
+
+// ForgetServer is [Client.ForgetServer] for the shared package-level client.
+func ForgetServer(publicKey []byte) bool {
+	return defaultClient.ForgetServer(publicKey)
+}
+
+// ForgetServer discards retry state for a root the caller no longer uses. It
+// returns false while a query for that root is active or waiting to retry. Call
+// only when retiring a root, since a later query starts without its old
+// backoff. Copies of an initialized Client share this state.
+func (c *Client) ForgetServer(publicKey []byte) bool {
+	tracker := c.retryTracker()
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	key := string(publicKey)
+	if state := tracker.retries[key]; state != nil && (state.queries != 0 || state.active != 0) {
+		return false
+	}
+	delete(tracker.retries, key)
+	return true
 }
 
 // requestOptions selects request encoding for the client's mode.
@@ -440,6 +473,17 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 		attempts = 1
 	}
 	key := string(s.PublicKey)
+	tracker := c.retryTracker()
+	tracker.mu.Lock()
+	state := tracker.stateLocked(key)
+	state.queries++
+	tracker.mu.Unlock()
+	defer func() {
+		tracker.mu.Lock()
+		defer tracker.mu.Unlock()
+		state.queries--
+		c.cleanupRetryLocked(tracker, key, state)
+	}()
 	var firstAttempt time.Time
 	for i := range attempts {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -496,14 +540,7 @@ func (c *Client) waitForRetry(ctx context.Context, key string) (retryAttempt, bo
 	tracker := c.retryTracker()
 	for {
 		tracker.mu.Lock()
-		if tracker.retries == nil {
-			tracker.retries = make(map[string]*retryState)
-		}
-		state := tracker.retries[key]
-		if state == nil {
-			state = &retryState{changed: make(chan struct{})}
-			tracker.retries[key] = state
-		}
+		state := tracker.stateLocked(key)
 		if state.interval == 0 {
 			state.active++
 			attempt := retryAttempt{key: key, state: state, generation: state.generation}
@@ -606,7 +643,7 @@ func (c *Client) releaseRetry(attempt retryAttempt) {
 
 // cleanupRetryLocked drops idle healthy entries while retaining failed roots.
 func (c *Client) cleanupRetryLocked(tracker *retryTracker, key string, state *retryState) {
-	if state.active == 0 && state.interval == 0 {
+	if state.active == 0 && state.queries == 0 && state.interval == 0 {
 		delete(tracker.retries, key)
 	}
 }
@@ -694,15 +731,19 @@ func resolveServerWithMode(s Server, mode protocol.Mode) (serverPlan, error) {
 		return serverPlan{}, err
 	}
 	if mode == protocol.Strict {
-		for _, a := range slices.Clone(addrs) {
+		tcpEndpoints := make(map[string]struct{}, len(addrs))
+		for _, a := range addrs {
+			if strings.EqualFold(a.Transport, "tcp") {
+				tcpEndpoints[a.Address] = struct{}{}
+			}
+		}
+		for _, a := range addrs {
 			if !strings.EqualFold(a.Transport, "udp") {
 				continue
 			}
-			tcp := Address{Transport: "tcp", Address: a.Address}
-			if !slices.ContainsFunc(addrs, func(existing Address) bool {
-				return strings.EqualFold(existing.Transport, "tcp") && existing.Address == a.Address
-			}) {
-				addrs = append(addrs, tcp)
+			if _, ok := tcpEndpoints[a.Address]; !ok {
+				addrs = append(addrs, Address{Transport: "tcp", Address: a.Address})
+				tcpEndpoints[a.Address] = struct{}{}
 			}
 		}
 	}
