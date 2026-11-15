@@ -5,7 +5,7 @@
 package version
 
 // Version is the current release of the roughtime module.
-const Version = "v1.28.2"
+const Version = "v1.28.3"
 
 // Commit is the source commit the binary was built from, set via -ldflags -X.
 var Commit = ""
