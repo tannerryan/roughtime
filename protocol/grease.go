@@ -165,18 +165,24 @@ func dropOneTag(msg map[uint32][]byte, candidates []uint32) bool {
 	return false
 }
 
-// greaseWrongVersion overwrites top-level VER with an unsupported version.
+// greaseWrongVersion overwrites the reply's VER with an unsupported version.
 func greaseWrongVersion(reply []byte, ver Version) []byte {
 	_, body := greaseSplit(reply, ver)
 	if body == nil {
 		return nil
 	}
+	if srepLo, srepHi, ok := findTagRange(body, TagSREP); ok {
+		srep := body[srepLo:srepHi]
+		if lo, hi, ok := findTagRange(srep, TagVER); ok && hi-lo == 4 {
+			binary.LittleEndian.PutUint32(srep[lo:hi], 0xFFFFFFFF)
+			return reply
+		}
+	}
 	lo, hi, ok := findTagRange(body, TagVER)
 	if !ok || hi-lo != 4 {
 		return nil
 	}
-	base := uint32(len(reply) - len(body))
-	binary.LittleEndian.PutUint32(reply[base+lo:], 0xFFFFFFFF)
+	binary.LittleEndian.PutUint32(body[lo:hi], 0xFFFFFFFF)
 	return reply
 }
 

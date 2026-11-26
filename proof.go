@@ -251,10 +251,10 @@ func (p *Proof) SeedNonce() ([]byte, error) {
 	return append([]byte(nil), req.Nonce...), nil
 }
 
-// AttestationBound verifies the full chain. latest proves that the seed existed
-// by that time. earliest is the start of link 0's window, not a proven lower
-// bound on when the seed existed. Callers must also check witness trust with
-// [Proof.Trust] before accepting the result.
+// AttestationBound verifies the full chain. latest is the earliest upper bound
+// reported by any link. It establishes that the seed existed by that time if
+// the witness reporting it gave an accurate time. Callers must check witness
+// trust with [Proof.Trust]. earliest is the start of the first link's window.
 func (p *Proof) AttestationBound() (earliest, latest time.Time, err error) {
 	if p == nil || p.chain == nil {
 		return time.Time{}, time.Time{}, errors.New("roughtime: nil proof")

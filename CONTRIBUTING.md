@@ -8,8 +8,8 @@ an implementation.
 
 ## Development setup
 
-The project requires Go 1.27 or newer and Make. Install the tools once, then run
-the tests:
+The project requires Go 1.27.4 or newer and Make. Install the tools once, then
+run the tests:
 
 ```sh
 make deps

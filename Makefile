@@ -9,6 +9,7 @@ FUZZ_TARGETS = \
 	FuzzParseMalfeasanceReport:./protocol/ \
 	FuzzValidateRequest:./cmd/roughtime/
 FUZZ_TIME ?= 30s
+override export FUZZ_TIME := $(value FUZZ_TIME)
 
 COMMIT      ?= $(shell \
 	commit=$$(git rev-parse --short HEAD 2>/dev/null); \
@@ -33,15 +34,15 @@ all: fmt vet build test
 deps: deps-ci
 
 deps-ci:
-	go install golang.org/x/tools/cmd/goimports@latest
+	go install golang.org/x/tools/cmd/goimports@v0.53.0
 	# Staticcheck needs a package reader that supports Go 1.27 export data.
 	@tmp=$$(mktemp -d) || exit 1; \
 	trap 'rm -rf "$$tmp"' EXIT; \
 	cd "$$tmp" && \
 	go mod init roughtime-lint-tools && \
-	go get honnef.co/go/tools/cmd/staticcheck@v0.8.2 golang.org/x/tools@v0.52.0 && \
+	go get honnef.co/go/tools/cmd/staticcheck@v0.8.2 golang.org/x/tools@v0.53.0 && \
 	go install honnef.co/go/tools/cmd/staticcheck
-	go install golang.org/x/vuln/cmd/govulncheck@latest
+	go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o roughtime ./cmd/roughtime
@@ -60,8 +61,8 @@ test-race:
 fuzz:
 	@for entry in $(FUZZ_TARGETS); do \
 		name=$${entry%%:*}; pkg=$${entry#*:}; \
-		echo "=== fuzzing $$name ($$pkg, $(FUZZ_TIME)) ==="; \
-		go test -run='^$$' -fuzz="^$${name}$$" -fuzztime="$(FUZZ_TIME)" "$$pkg" || exit 1; \
+		echo "=== fuzzing $$name ($$pkg, $$FUZZ_TIME) ==="; \
+		go test -run='^$$' -fuzz="^$${name}$$" -fuzztime="$$FUZZ_TIME" "$$pkg" || exit 1; \
 	done
 
 fmt:

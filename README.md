@@ -15,7 +15,7 @@ Earlier drafts are available through the protocol package and debug command.
 
 ## Build
 
-Requires Go 1.27 or newer.
+Requires Go 1.27.4 or newer.
 
 ```sh
 make build
@@ -45,7 +45,9 @@ additional listener. `-listen-address` applies to all listeners. The server
 requires Unix.
 
 Seed files must be regular files of at most 4 KiB, without group or other
-permissions. Symlinks and key-file overwrites are rejected. Delegations refresh
+permissions. Store them in a private directory and restrict access through any
+filesystem ACLs. Key generation requires hard-link support in that directory.
+Symlinks and key-file overwrites are rejected. Delegations refresh
 automatically. With `-offline-delegation`, keys are read once and the server
 stops when the delegation leaves its validity window.
 
@@ -102,9 +104,9 @@ and `-name` to select an entry.
 roughtime-client -addr localhost:5319 -pubkey <key>
 ```
 
-Strict server-list measurements require at least three endpoint-domain groups
-and three distinct roots, queried twice in the same random order through one
-causal chain. The default samples up to five groups. `-all` queries every
+Strict server-list measurements require at least three witnesses with distinct
+roots and endpoint-domain groups, queried twice in the same random order through
+one causal chain. The default samples up to five witnesses. `-all` queries every
 compatible entry. Domain grouping is a heuristic. Choose independent operators.
 Use `-name` for a single entry. Unfiltered strict list queries require both
 passes even with `-two-pass=false`.
@@ -115,8 +117,9 @@ complete RFC measurements.
 
 Strict requests have a 1024-byte body plus a 12-byte frame. Flex mode uses
 1024-byte total packets unless `-standard-size` is set. Strict clients fall back
-from UDP to TCP at the same endpoint. Retries use fresh nonces. Caller-supplied
-nonces stay fixed, with delay limits covering all attempts and backoff.
+from UDP to TCP at the same endpoint. Retries use fresh nonces. A
+caller-supplied nonce stays fixed and shares one timeout across attempts and
+retry backoff.
 
 Authenticated causal contradictions are saved locally to a private temporary
 JSON file. The client prints its path.
@@ -131,10 +134,11 @@ roughtime-client -flex -servers ecosystem.json -all
 ```
 
 RFC server lists use integer versions, `publicKeyType: "ed25519"`, base64 keys,
-and UDP or TCP endpoints. Optional `sources` and `reports` URLs require HTTPS.
-Client and stamp commands also read textual versions, hex keys, and ML-DSA-44
-entries without `-flex`. That flag controls wire compatibility. Direct flex
-queries offer RFC and drafts. Select Google through a server list.
+and UDP or TCP endpoints. Strict Go parsing requires HTTPS for optional
+`sources` and `reports` URLs. The commands use local server lists and save
+reports locally. Client and stamp commands also read textual versions, hex keys,
+and ML-DSA-44 entries without `-flex`. That flag controls wire compatibility.
+Direct flex queries offer RFC and drafts. Select Google through a server list.
 
 ### roughtime-debug
 
@@ -178,9 +182,14 @@ roughtime-stamp -mode verify -doc document.pdf -servers servers.json \
 ```
 
 The document is hashed before querying and saving the proof. Verification checks
-document binding, the causal chain, and witness trust. Retain a trusted server
-list with the document and proof. Key revocation policy is the caller's
+document binding, the causal chain, and witness trust. The command displays the
+earliest upper bound attested by a majority of distinct roots. That bound
+assumes a majority of roots give accurate times. Retain a trusted server list
+with the document and proof. Key revocation policy is the caller's
 responsibility.
+
+The proof file is synced before replacement. On Unix the command also syncs the
+parent directory.
 
 The first witness and network observers see the document's SHA-256 digest, which
 can reveal repeat stamps or known contents. Input must be a regular file,
@@ -217,8 +226,8 @@ completeness.
 
 See the [protocol
 API](https://pkg.go.dev/github.com/tannerryan/roughtime/protocol) for legacy
-encoding options. Flex verification accepts both draft Merkle conventions. RFC
-paths always use RFC ordering.
+encoding options. Flex verification accepts both Merkle orders for draft 07 and
+typed drafts 14-19. RFC paths use RFC ordering.
 
 Google chains use the reference's double-hash nonce derivation. Flex mode also
 verifies older single-hash proofs. MJD leap seconds add one second of
@@ -227,6 +236,8 @@ uncertainty when converted to Go time.
 `NewCertificate` advertises version 1. Use `NewCertificateWithVersions` for
 other version sets. Flex mode accepts draft signature contexts in version-1
 packets, including RFC Appendix B. Strict mode requires RFC protocol contexts.
+[Erratum 9238](https://errata.rfc-editor.org/search/?rfc_number=10049) proposes
+a corrected Appendix B example.
 
 ## Development
 

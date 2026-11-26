@@ -141,6 +141,10 @@ func ed25519VersionsForPort(allowDrafts bool) []protocol.Version {
 // main parses flags and dispatches to the appropriate subcommand or to serve.
 func main() {
 	flag.Parse()
+	if flag.NArg() != 0 {
+		fmt.Fprintf(os.Stderr, "unexpected positional args: %q\n", flag.Args())
+		os.Exit(2)
+	}
 	if err := dispatch(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

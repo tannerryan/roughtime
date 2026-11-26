@@ -1,28 +1,9 @@
-.git
-.gitignore
-.github
-.dockerignore
-Dockerfile
-README.md
-
-# Locally generated private root keys
-/keys/
-
-# Local credentials at any depth
-**/.env
-**/.env.*
-**/*.key
-**/*.pem
-
-# Built binaries (from `make build`)
-/roughtime
-/roughtime-client
-/roughtime-debug
-/roughtime-bench
-/roughtime-stamp
-
-# Editor / OS cruft
-.idea
-.vscode
-.DS_Store
-*.swp
+**
+!Dockerfile
+!LICENSE
+!go.mod
+!go.sum
+!cmd/roughtime/*.go
+!internal/version/*.go
+!protocol/*.go
+!vendor/**

@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -37,11 +38,11 @@ var (
 	// serversFile is the trust-store ecosystem path.
 	serversFile = flag.String("servers", "ecosystem.json", "ecosystem JSON")
 	// outPath is the created proof path.
-	outPath = flag.String("out", "", "proof output path, replaced atomically if it exists (stamp mode)")
+	outPath = flag.String("out", "", "proof output path, replaces the existing file (stamp mode)")
 	// inPath is the proof path to verify.
 	inPath = flag.String("in", "", "proof input path (verify mode)")
 	// timeout bounds each exchange attempt.
-	timeout = flag.Duration("timeout", 2*time.Second, "timeout per attempt")
+	timeout = flag.Duration("timeout", 2*time.Second, "timeout per attempt, or total retry budget for the first witness nonce")
 	// retries caps attempts per server.
 	retries = flag.Int("retries", 3, "max attempts per server")
 	// standardSize selects message-sized rather than legacy packet-sized
@@ -411,7 +412,7 @@ func readBoundedFile(path string) ([]byte, error) {
 	return data, nil
 }
 
-// writeProofAtomic durably replaces path without exposing partial contents.
+// writeProofAtomic writes and syncs the proof before replacing path.
 func writeProofAtomic(ctx context.Context, path string, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -449,7 +450,7 @@ func writeProofAtomic(ctx context.Context, path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("renaming proof: %w", err)
 	}
-	if err := dir.Sync(); err != nil {
+	if err := syncProofDirectory(dir); err != nil {
 		return fmt.Errorf("proof was replaced, but directory sync failed. Crash durability is unknown: %w", err)
 	}
 	return nil
@@ -480,10 +481,18 @@ func writeMalfeasance(path string, data []byte) (string, error) {
 		_ = os.Remove(name)
 		return "", err
 	}
-	if err := dir.Sync(); err != nil {
+	if err := syncProofDirectory(dir); err != nil {
 		return name, fmt.Errorf("evidence was written to %s, but directory sync failed. Crash durability is unknown: %w", display(name), err)
 	}
 	return name, nil
+}
+
+func syncProofDirectory(dir *os.File) error {
+	// Windows does not support flushing a directory handle this way.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	return dir.Sync()
 }
 
 // filterCompatible retains non-Google witness roots that map to one

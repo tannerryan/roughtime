@@ -18,6 +18,10 @@ LABEL org.opencontainers.image.title="roughtime" \
     org.opencontainers.image.licenses="BSD-2-Clause"
 COPY --from=build /roughtime /roughtime
 COPY --from=build /src/LICENSE /licenses/roughtime/LICENSE
+COPY --from=build /src/vendor/go.uber.org/zap/LICENSE /licenses/zap/LICENSE
+COPY --from=build /src/vendor/go.uber.org/multierr/LICENSE.txt /licenses/multierr/LICENSE.txt
+COPY --from=build /src/vendor/golang.org/x/net/LICENSE /src/vendor/golang.org/x/net/PATENTS /licenses/x-net/
+COPY --from=build /src/vendor/golang.org/x/sys/LICENSE /src/vendor/golang.org/x/sys/PATENTS /licenses/x-sys/
 EXPOSE 5319/udp
 EXPOSE 5319/tcp
 EXPOSE 2002/udp

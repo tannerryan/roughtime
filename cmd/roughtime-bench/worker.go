@@ -78,9 +78,12 @@ func contextStopped(ctx context.Context) bool {
 	return ok && !time.Now().Before(deadline)
 }
 
-// randomizeNonce fills n with non-cryptographic bytes for per-request
-// variation.
-func randomizeNonce(n []byte) {
+// randomizeNonce uses cryptographic randomness for authenticated exchanges.
+func randomizeNonce(n []byte, verify bool) {
+	if verify {
+		_, _ = rand.Read(n)
+		return
+	}
 	full := len(n) - len(n)%8
 	for i := 0; i < full; i += 8 {
 		binary.LittleEndian.PutUint64(n[i:], mrand.Uint64())
@@ -126,7 +129,8 @@ func worker(ctx context.Context, cfg benchConfig, out *workerResult, collectAfte
 	return workerUDP(ctx, cfg, out, collectAfter)
 }
 
-// workerStrict uses the shared client to authenticate replies and retain backoff.
+// workerStrict uses the shared client to authenticate replies and retain
+// backoff.
 func workerStrict(ctx context.Context, cfg benchConfig, out *workerResult, collectAfter time.Time) error {
 	server := roughtime.Server{PublicKey: cfg.rootPK, Addresses: []roughtime.Address{{Transport: cfg.transport, Address: cfg.addr}}}
 	for !contextStopped(ctx) {
@@ -202,7 +206,7 @@ func workerUDP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	// discarded by UDP semantics.
 	buf := make([]byte, len(req)+1)
 	for !contextStopped(ctx) {
-		randomizeNonce(nonce)
+		randomizeNonce(nonce, verify)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
 		// absolute deadline set before timing, so SetDeadline stays out of the
@@ -300,8 +304,8 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 	}
 
 	// reconnect detaches the old connection's cancellation callback before
-	// closing it, then installs a callback that captures the replacement.
-	// Flex load generation reconnects without backoff.
+	// closing it, then installs a callback that captures the replacement. Flex
+	// load generation reconnects without backoff.
 	reconnect := func() error {
 		stopClose()
 		_ = conn.Close()
@@ -320,7 +324,7 @@ func workerTCP(ctx context.Context, cfg benchConfig, out *workerResult, collectA
 
 	replyBuf := make([]byte, protocol.PacketHeaderSize+protocol.MaxTCPReplyBody)
 	for !contextStopped(ctx) {
-		randomizeNonce(nonce)
+		randomizeNonce(nonce, verify)
 		copy(req[nonceOff:nonceOff+len(nonce)], nonce)
 
 		// one absolute deadline covers both reads and stays out of the measured

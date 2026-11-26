@@ -6,17 +6,138 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/protocol"
-	"golang.org/x/sys/unix"
 )
+
+// TestVerifyReceipt checks document binding and witness trust.
+func TestVerifyReceipt(t *testing.T) {
+	document := []byte("example document")
+	digest := sha256.Sum256(document)
+	midpoint := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	versions := []protocol.Version{protocol.Version1}
+	var servers [stampWitnesses]roughtime.Server
+	var certs [stampWitnesses]*protocol.Certificate
+	for i := range servers {
+		root := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{byte(i + 1)}, ed25519.SeedSize))
+		online := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{byte(i + 4)}, ed25519.SeedSize))
+		name := fmt.Sprintf("witness-%d", i+1)
+		servers[i] = roughtime.Server{
+			Name: name, Version: "1", PublicKey: root.Public().(ed25519.PublicKey),
+			Addresses: []roughtime.Address{{Transport: "udp", Address: name + ".example:5319"}},
+		}
+		cert, err := protocol.NewCertificate(midpoint.Add(-time.Hour), midpoint.Add(time.Hour), online, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		certs[i] = cert
+	}
+	var chain protocol.Chain
+	for i := range 2 * len(servers) {
+		witness := i % len(servers)
+		entropy := bytes.Repeat([]byte{byte(i)}, len(digest))
+		if i == 0 {
+			entropy = digest[:]
+		}
+		link, err := chain.NextRequest(versions, servers[witness].PublicKey, bytes.NewReader(entropy))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, err := protocol.ParseRequest(link.Request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replies, err := protocol.CreateReplies(protocol.Version1, []protocol.Request{*request}, midpoint, time.Second, certs[witness])
+		if err != nil {
+			t.Fatal(err)
+		}
+		link.Response = replies[0]
+		chain.Append(link)
+	}
+	report, err := chain.MalfeasanceReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof, err := roughtime.ParseProof(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := proof.MarshalGzip()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	documentPath := write("document", document)
+	otherPath := write("other", []byte("different document"))
+	trustList := func(name string, witnesses []roughtime.Server) string {
+		t.Helper()
+		data, err := roughtime.MarshalEcosystem(witnesses)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return write(name, data)
+	}
+	trusted := trustList("trusted.json", servers[:])
+	untrusted := trustList("partial.json", servers[:2])
+	oldFlex, oldIn, oldDoc, oldServers := *flex, *inPath, *docPath, *serversFile
+	t.Cleanup(func() { *flex, *inPath, *docPath, *serversFile = oldFlex, oldIn, oldDoc, oldServers })
+	*flex, *inPath = false, write("receipt", receipt)
+	for _, tc := range []struct{ name, document, trust, wantErr string }{
+		{"valid", documentPath, trusted, ""},
+		{"wrong document", otherPath, trusted, "does not cover document"},
+		{"untrusted witness", documentPath, untrusted, "untrusted key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			*docPath, *serversFile = tc.document, tc.trust
+			err := verify(context.Background())
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("verify returned %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestWitnessUpperBoundCountsDistinctRoots checks repeated replies.
+func TestWitnessUpperBoundCountsDistinctRoots(t *testing.T) {
+	mid := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	links := []roughtime.ProofLink{
+		{PublicKey: []byte("a"), Midpoint: mid.Add(-time.Hour), Radius: time.Second},
+		{PublicKey: []byte("a"), Midpoint: mid, Radius: time.Second},
+		{PublicKey: []byte("b"), Midpoint: mid, Radius: 2 * time.Second},
+		{PublicKey: []byte("c"), Midpoint: mid, Radius: 3 * time.Second},
+	}
+	want := mid.Add(2 * time.Second)
+	if got := witnessUpperBound(links); !got.Equal(want) {
+		t.Fatalf("bound = %v, want %v", got, want)
+	}
+	if got := witnessUpperBound(links[:3]); !got.Equal(want) {
+		t.Fatalf("two-witness bound = %v, want %v", got, want)
+	}
+}
 
 // TestPrintFailuresUsesStderr keeps failed witness diagnostics off stdout.
 func TestPrintFailuresUsesStderr(t *testing.T) {
@@ -59,10 +180,16 @@ func TestStampFileInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := filepath.Join(dir, "link")
+	inputs := []string{path}
 	if err := os.Symlink(path, link); err != nil {
-		t.Fatal(err)
+		const privilegeNotHeld = syscall.Errno(1314)
+		if runtime.GOOS != "windows" || !errors.Is(err, privilegeNotHeld) {
+			t.Fatal(err)
+		}
+	} else {
+		inputs = append(inputs, link)
 	}
-	for _, input := range []string{path, link} {
+	for _, input := range inputs {
 		digest, size, err := hashDocument(context.Background(), input)
 		want := sha256.Sum256(data)
 		if err != nil || size != int64(len(data)) || !bytes.Equal(digest, want[:]) {
@@ -73,17 +200,11 @@ func TestStampFileInputs(t *testing.T) {
 			t.Fatalf("readBoundedFile(%s) = %q, %v", input, got, err)
 		}
 	}
-	fifo := filepath.Join(dir, "fifo")
-	if err := unix.Mkfifo(fifo, 0600); err != nil {
-		t.Fatal(err)
+	if _, _, err := hashDocument(context.Background(), dir); err == nil {
+		t.Fatal("hashDocument accepted a directory")
 	}
-	for _, input := range []string{dir, fifo} {
-		if _, _, err := hashDocument(context.Background(), input); err == nil {
-			t.Fatalf("hashDocument accepted %s", input)
-		}
-		if _, err := readBoundedFile(input); err == nil {
-			t.Fatalf("readBoundedFile accepted %s", input)
-		}
+	if _, err := readBoundedFile(dir); err == nil {
+		t.Fatal("readBoundedFile accepted a directory")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -159,7 +280,7 @@ func TestWriteMalfeasance(t *testing.T) {
 			t.Fatalf("evidence = %q, %v", got, err)
 		}
 		info, err := os.Stat(path)
-		if err != nil || info.Mode().Perm() != 0600 {
+		if err != nil || runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 			t.Fatalf("evidence permissions: %v, %v", info, err)
 		}
 	}

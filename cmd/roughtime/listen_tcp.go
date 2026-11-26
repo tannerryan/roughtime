@@ -318,7 +318,7 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 	// submit
 	replyCh := make(chan tcpBatchReply, 1)
 
-	for {
+	for ctx.Err() == nil {
 		// idle timeout covers both initial wait and between-request wait
 		_ = conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
 		hdr := reqBuf[:protocol.PacketHeaderSize]
@@ -358,6 +358,9 @@ func handleTCPConn(ctx context.Context, log *zap.Logger, conn net.Conn, edState,
 			if ce := log.Check(zap.DebugLevel, "TCP short read"); ce != nil {
 				ce.Write(zap.Stringer("peer", conn.RemoteAddr()), zap.Error(err))
 			}
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 

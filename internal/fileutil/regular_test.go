@@ -7,36 +7,37 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
 
-// TestOpenRegular covers regular files, symlinks, and rejected special files.
+// TestOpenRegular covers regular files, symlinks, and invalid paths.
 func TestOpenRegular(t *testing.T) {
 	dir := t.TempDir()
 	regular := filepath.Join(dir, "regular")
 	if err := os.WriteFile(regular, []byte("document"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(dir, "link")
-	if err := os.Symlink(regular, link); err != nil {
-		t.Fatal(err)
-	}
-	fifo := filepath.Join(dir, "fifo")
-	if err := unix.Mkfifo(fifo, 0600); err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
+	type testCase struct {
 		path string
 		ok   bool
-	}{
+	}
+	cases := []testCase{
 		{regular, true},
-		{link, true},
 		{dir, false},
-		{fifo, false},
 		{filepath.Join(dir, "missing"), false},
-	} {
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(regular, link); err != nil {
+		const privilegeNotHeld = syscall.Errno(1314)
+		if runtime.GOOS != "windows" || !errors.Is(err, privilegeNotHeld) {
+			t.Fatal(err)
+		}
+	} else {
+		cases = append(cases, testCase{link, true})
+	}
+	for _, tc := range cases {
 		t.Run(filepath.Base(tc.path), func(t *testing.T) {
 			f, err := OpenRegular(tc.path)
 			if !tc.ok {

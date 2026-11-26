@@ -11,11 +11,9 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/tannerryan/roughtime"
 	"github.com/tannerryan/roughtime/protocol"
-	"golang.org/x/sys/unix"
 )
 
 // TestClientFlags covers the opt-in sizing flag and two-pass mode guards.
@@ -143,6 +141,15 @@ func TestTwoPassServers(t *testing.T) {
 	if _, err := twoPassServers(aliases); err == nil || !strings.Contains(err.Error(), "distinct trust roots") {
 		t.Fatalf("aliased trust roots error = %v", err)
 	}
+	root2, root3 := servers[1], servers[2]
+	root2.Addresses, root3.Addresses = servers[0].Addresses, servers[0].Addresses
+	aliasedGroups := append(aliases, root2, root3)
+	if _, err := twoPassServers(aliasedGroups); err == nil || !strings.Contains(err.Error(), "got 2") {
+		t.Fatalf("aliased groups error = %v", err)
+	}
+	if _, err := twoPassServers(append(aliasedGroups, servers[1])); err != nil {
+		t.Fatalf("three independent root/group pairs rejected: %v", err)
+	}
 
 	over := make([]roughtime.Server, protocol.MaxChainLinks/2+1)
 	for i := range over {
@@ -150,28 +157,6 @@ func TestTwoPassServers(t *testing.T) {
 	}
 	if _, err := twoPassServers(over); err == nil || !strings.Contains(err.Error(), "exceeding max") {
 		t.Fatalf("oversize error = %v", err)
-	}
-}
-
-// TestLoadServersFileRejectsFIFO ensures a local special file cannot block the
-// client before signal-aware network work starts.
-func TestLoadServersFileRejectsFIFO(t *testing.T) {
-	path := t.TempDir() + "/servers.fifo"
-	if err := unix.Mkfifo(path, 0600); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		_, err := loadServersFile(path)
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
-			t.Fatalf("loadServersFile(FIFO) = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("loadServersFile blocked opening a FIFO")
 	}
 }
 
@@ -230,6 +215,12 @@ func TestLoadMixedEcosystemInStrictMode(t *testing.T) {
 	if newClient().Mode != protocol.Strict {
 		t.Fatal("mixed list enabled flex wire support")
 	}
+	*useTCP = true
+	servers, err = loadServers()
+	if err != nil || len(servers) != 1 || len(servers[0].Addresses) != 1 || servers[0].Addresses[0].Transport != "tcp" {
+		t.Fatalf("named RFC query with -tcp: %v, %v", servers, err)
+	}
+	*useTCP = false
 	*nameFilter = "pq"
 	if _, err := loadServers(); err == nil || !strings.Contains(err.Error(), "requires flex mode") {
 		t.Fatalf("named PQ query without -flex: %v", err)

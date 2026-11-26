@@ -463,7 +463,7 @@ func TestListenTCPIdleTimeoutClosesConn(t *testing.T) {
 	conn := dialTCP(t, p)
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	var scratch [1]byte
-	if _, err := conn.Read(scratch[:]); err == nil {
+	if _, err := conn.Read(scratch[:]); !errors.Is(err, io.EOF) {
 		t.Fatalf("expected EOF after idle, got err=%v", err)
 	}
 	_ = conn.Close()

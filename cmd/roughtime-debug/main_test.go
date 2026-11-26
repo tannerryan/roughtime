@@ -90,7 +90,7 @@ func TestDefaultScanBudget(t *testing.T) {
 					t.Fatal("nonresponsive peer marked supported")
 				}
 			}
-			wantAttempts := 81
+			wantAttempts := 84
 			if transport == "tcp" {
 				wantAttempts = 42
 			}
@@ -113,8 +113,8 @@ func TestDefaultScanBudget(t *testing.T) {
 	}
 }
 
-// TestProbeFallsBackToStandardSizedUDP checks flex UDP padding fallback.
-func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
+// TestProbeUDPPaddingFallback checks both draft UDP packet sizes.
+func TestProbeUDPPaddingFallback(t *testing.T) {
 	restoreProbeGlobals(t)
 	*retries = 1
 	*timeout = time.Second
@@ -128,53 +128,55 @@ func TestProbeFallsBackToStandardSizedUDP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var sizes []int
-	probeRoundTrip = func(_ context.Context, request []byte, _ time.Duration, transport string) ([]byte, time.Duration, time.Time, error) {
-		if transport != "udp" {
-			t.Fatalf("transport = %q, want udp", transport)
-		}
-		sizes = append(sizes, len(request))
-		if len(request) == 1024 {
-			return nil, 0, time.Time{}, errors.New("strict peer ignored legacy-sized request")
-		}
-		parsed, err := protocol.ParseRequestWithMode(request, protocol.Flex)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if want := []protocol.Version{protocol.VersionDraft11}; !slices.Equal(parsed.Versions, want) {
-			t.Fatalf("versions = %v, want %v", parsed.Versions, want)
-		}
-		if want := protocol.ComputeSRV(rootPK); !bytes.Equal(parsed.SRV, want) {
-			t.Fatalf("SRV = %x, want %x", parsed.SRV, want)
-		}
-		replies, err := protocol.CreateRepliesWithOptions(protocol.VersionDraft11, []protocol.Request{*parsed}, now, time.Second, cert, protocol.ReplyOptions{Mode: protocol.Flex})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return replies[0], 20 * time.Millisecond, now, nil
-	}
-
-	var waits []time.Duration
-	state := &debugRetryState{wait: func(_ context.Context, delay time.Duration) error {
-		waits = append(waits, delay)
-		return nil
-	}}
-	plan := probePlan{version: protocol.VersionDraft11, label: "draft-11", short: "draft-11"}
-	result := probe(context.Background(), rootPK, plan, "udp", state)
-	if result.err != nil {
-		t.Fatalf("probe failed: %v", resultError(result))
-	}
-	if want := []int{1024, 1036}; !slices.Equal(sizes, want) {
-		t.Fatalf("request sizes = %v, want %v", sizes, want)
-	}
-	if want := []time.Duration{time.Second}; !slices.Equal(waits, want) {
-		t.Fatalf("waits = %v, want %v", waits, want)
-	}
-	if len(result.request) != 1036 {
-		t.Fatalf("verified request size = %d, want 1036", len(result.request))
-	}
-	if state.delay != 0 {
-		t.Fatalf("verified probe did not reset retry state: %+v", state)
+	for _, tc := range []struct {
+		version protocol.Version
+		sizes   []int
+	}{
+		{protocol.VersionDraft11, []int{1024, 1036}},
+		{protocol.VersionDraft12, []int{1036, 1024}},
+	} {
+		t.Run(tc.version.ShortString(), func(t *testing.T) {
+			var sizes []int
+			probeRoundTrip = func(_ context.Context, request []byte, _ time.Duration, transport string) ([]byte, time.Duration, time.Time, error) {
+				if transport != "udp" {
+					t.Fatalf("transport = %q, want udp", transport)
+				}
+				sizes = append(sizes, len(request))
+				if len(request) != tc.sizes[1] {
+					return nil, 0, time.Time{}, errors.New("peer ignored request with different padding")
+				}
+				parsed, err := protocol.ParseRequestWithMode(request, protocol.Flex)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := []protocol.Version{tc.version}; !slices.Equal(parsed.Versions, want) {
+					t.Fatalf("versions = %v, want %v", parsed.Versions, want)
+				}
+				if want := protocol.ComputeSRV(rootPK); !bytes.Equal(parsed.SRV, want) {
+					t.Fatalf("SRV = %x, want %x", parsed.SRV, want)
+				}
+				replies, err := protocol.CreateRepliesWithOptions(tc.version, []protocol.Request{*parsed}, now, time.Second, cert, protocol.ReplyOptions{Mode: protocol.Flex})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return replies[0], 20 * time.Millisecond, now, nil
+			}
+			var waits []time.Duration
+			state := &debugRetryState{wait: func(_ context.Context, delay time.Duration) error {
+				waits = append(waits, delay)
+				return nil
+			}}
+			result := probe(context.Background(), rootPK, probePlan{version: tc.version}, "udp", state)
+			if result.err != nil {
+				t.Fatalf("probe failed: %v", resultError(result))
+			}
+			if !slices.Equal(sizes, tc.sizes) || len(result.request) != tc.sizes[1] {
+				t.Fatalf("request sizes = %v, verified size = %d, want %v", sizes, len(result.request), tc.sizes)
+			}
+			if !slices.Equal(waits, []time.Duration{time.Second}) || state.delay != 0 {
+				t.Fatalf("waits = %v, final delay = %s", waits, state.delay)
+			}
+		})
 	}
 }
 
@@ -193,7 +195,7 @@ func TestProbeSharesBackoffAcrossForms(t *testing.T) {
 		return nil
 	}}
 	rootPK := make([]byte, ed25519.PublicKeySize)
-	first := probePlan{version: protocol.VersionDraft12, label: "draft-14+", short: "draft-14+"}
+	first := probePlan{version: protocol.Version1, label: "RFC v1", short: "1"}
 	second := probePlan{version: protocol.VersionGoogle, label: "Google", short: "Google"}
 	if result := probe(context.Background(), rootPK, first, "udp", state); result.err == nil {
 		t.Fatal("first form unexpectedly succeeded")

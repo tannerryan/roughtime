@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/tannerryan/roughtime"
@@ -34,16 +35,28 @@ func printVerification(document string, size int64, digest []byte, proofPath str
 	printBound(links)
 }
 
-// printBound prints the tightest attested upper bound.
+// printBound prints the earliest bound attested by a majority of witnesses.
 func printBound(links []roughtime.ProofLink) {
 	if len(links) == 0 {
 		return
 	}
-	upper := links[0].Midpoint.Add(links[0].Radius)
-	for _, link := range links[1:] {
-		if candidate := link.Midpoint.Add(link.Radius); candidate.Before(upper) {
-			upper = candidate
+	upper := witnessUpperBound(links)
+	fmt.Printf("Upper bound:  %s\n", upper.UTC().Format(time.RFC3339Nano))
+}
+
+func witnessUpperBound(links []roughtime.ProofLink) time.Time {
+	byRoot := make(map[string]time.Time, len(links))
+	for _, link := range links {
+		root := string(link.PublicKey)
+		upper := link.Midpoint.Add(link.Radius)
+		if previous, ok := byRoot[root]; !ok || upper.Before(previous) {
+			byRoot[root] = upper
 		}
 	}
-	fmt.Printf("Upper bound:  %s\n", upper.UTC().Format(time.RFC3339Nano))
+	bounds := make([]time.Time, 0, len(byRoot))
+	for _, bound := range byRoot {
+		bounds = append(bounds, bound)
+	}
+	slices.SortFunc(bounds, time.Time.Compare)
+	return bounds[len(bounds)/2]
 }

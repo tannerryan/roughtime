@@ -24,13 +24,14 @@ type Response struct {
 	Midpoint time.Time
 	// Radius is the half-width of the server's uncertainty window.
 	Radius time.Duration
-	// RTT is the measured round-trip time.
+	// RTT is the measured round-trip time. For a caller-supplied nonce it runs
+	// from the first attempt through receipt.
 	RTT time.Duration
 	// LocalNow is the local wall clock at reply receipt.
 	LocalNow time.Time
-	// Request is the verified request bytes, including the nonce.
+	// Request contains the exact bytes sent to the server.
 	Request []byte
-	// Reply is the verified reply bytes.
+	// Reply contains the exact bytes received from the server.
 	Reply []byte
 	// AmplificationOK reports that on UDP the reply fits within the request
 	// size. It is always true on TCP.
@@ -44,8 +45,8 @@ func (r *Response) Drift() time.Duration {
 	return r.Midpoint.Sub(ref)
 }
 
-// InSync reports whether the RTT-center estimate from [Drift] is within Radius
-// (inclusive). It does not account for network-delay uncertainty.
+// InSync reports whether the RTT-center estimate from [Response.Drift] is
+// within Radius (inclusive). It does not account for network-delay uncertainty.
 func (r *Response) InSync() bool {
 	if r == nil || r.Radius < 0 {
 		return false

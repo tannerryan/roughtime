@@ -96,8 +96,8 @@ func (cr *ChainResult) Proof() (*Proof, error) {
 	return &Proof{chain: cr.chain}, nil
 }
 
-// Client runs Roughtime queries and is safe for concurrent use with a usable
-// zero value.
+// Client runs Roughtime queries. The zero value is ready to use. Set the
+// configuration fields before concurrent use.
 type Client struct {
 	// Mode selects strict RFC 10049 or flex protocol support.
 	Mode protocol.Mode
@@ -314,8 +314,8 @@ func VerifyWithMode(pubkey, request, reply []byte, mode protocol.Mode) (midpoint
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("roughtime: parse request: %w", err)
 	}
-	// Pass the request's offered list so [protocol.VerifyReply] enforces
-	// versionOffered and (drafts 12+) the signed-VERS downgrade check.
+	// Pass the request's offered list so the verifier checks the version chosen
+	// by the server. RFC and drafts 12+ also check membership in signed VERS.
 	versions := parsed.Versions
 	if len(versions) == 0 {
 		versions = []protocol.Version{protocol.VersionGoogle}
@@ -324,8 +324,8 @@ func VerifyWithMode(pubkey, request, reply []byte, mode protocol.Mode) (midpoint
 	return protocol.VerifyReplyWithOptions(versions, reply, pubkey, parsed.Nonce, request, protocol.VerifyOptions{Mode: mode})
 }
 
-// QueryAll queries each server concurrently and returns slot-aligned Results
-// capped by [Client.Concurrency].
+// QueryAll returns one result per input server in the same order. The client
+// limits simultaneous queries using [Client.Concurrency].
 func (c *Client) QueryAll(ctx context.Context, servers []Server) []Result {
 	out := make([]Result, len(servers))
 	for i, s := range servers {
@@ -367,9 +367,10 @@ func (c *Client) QueryAll(ctx context.Context, servers []Server) []Result {
 	return out
 }
 
-// QueryChain queries servers once in the supplied order with causal nonce
-// chaining. Errors are stored in Results. For a complete RFC measurement,
-// supply two identical passes across at least three independent operators.
+// QueryChain makes one pass through the supplied order with causal nonce
+// chaining and per-server retries. Errors are stored in Results. For a complete
+// RFC measurement, supply two identical passes across at least three
+// independent operators.
 func (c *Client) QueryChain(ctx context.Context, servers []Server) (*ChainResult, error) {
 	return c.queryChain(ctx, servers, nil)
 }
@@ -484,14 +485,19 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 		state.queries--
 		c.cleanupRetryLocked(tracker, key, state)
 	}()
+	queryCtx := ctx
 	var firstAttempt time.Time
 	for i := range attempts {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := queryCtx.Err(); ctxErr != nil {
 			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
 		}
-		attempt, ok := c.waitForRetry(ctx, key)
+		attempt, ok := c.waitForRetry(queryCtx, key)
 		if !ok {
-			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctx.Err()
+			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, queryCtx.Err()
+		}
+		if ctxErr := queryCtx.Err(); ctxErr != nil {
+			c.releaseRetry(attempt)
+			return Address{}, nil, 0, time.Time{}, time.Time{}, 0, ctxErr
 		}
 		if i > 0 && refresh != nil {
 			if err := refresh(); err != nil {
@@ -499,13 +505,16 @@ func (c *Client) sendWithRetry(ctx context.Context, s Server, plan serverPlan, r
 				return Address{}, nil, 0, time.Time{}, time.Time{}, 0, fmt.Errorf("refreshing request: %w", err)
 			}
 		}
-		if i == 0 {
+		if i == 0 && refresh == nil {
 			firstAttempt = time.Now()
+			var cancel context.CancelFunc
+			queryCtx, cancel = context.WithDeadline(ctx, firstAttempt.Add(timeout))
+			defer cancel()
 		}
 		addr = plan.addresses[i%len(plan.addresses)]
-		reply, rtt, localNow, err = roundTrip(ctx, addr, *request, timeout)
-		if i > 0 && refresh == nil {
-			rtt = max(rtt, time.Since(firstAttempt))
+		reply, rtt, localNow, err = roundTrip(queryCtx, addr, *request, timeout)
+		if err == nil && refresh == nil {
+			rtt = max(rtt, localNow.Sub(firstAttempt))
 		}
 		if err == nil && rtt > timeout {
 			err = errors.New("roughtime: round-trip delay exceeds timeout")

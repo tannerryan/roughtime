@@ -43,7 +43,7 @@ var (
 	// useTCP forces TCP for Ed25519.
 	useTCP = commandLine.Bool("tcp", false, "force TCP for IETF Ed25519 servers (Google-Roughtime is UDP-only, ML-DSA-44 is TCP-only)")
 	// timeout bounds each exchange attempt.
-	timeout = commandLine.Duration("timeout", time.Second, "read/write timeout per attempt")
+	timeout = commandLine.Duration("timeout", time.Second, "timeout per attempt, including resolution, dialing and I/O")
 	// retries caps attempts per server.
 	retries = commandLine.Int("retries", 3, "max attempts per server (1 = no retries, backoff starts at 1s, grows by 1.5, caps at 24h)")
 	// chainMode enables causal ecosystem queries.
@@ -51,7 +51,7 @@ var (
 	// all disables default ecosystem sampling.
 	all = commandLine.Bool("all", false, "query every transport-compatible ecosystem server (default: up to 5 endpoint-domain groups)")
 	// twoPass requests a complete same-order two-pass measurement.
-	twoPass = commandLine.Bool("two-pass", false, "require two passes across at least 3 endpoint groups and roots (automatic for unfiltered RFC-only server lists)")
+	twoPass = commandLine.Bool("two-pass", false, "require two passes across at least 3 witnesses with distinct roots and endpoint groups (automatic for unfiltered RFC-only server lists)")
 	// standardSize selects full-body padding in flex mode.
 	standardSize = commandLine.Bool("standard-size", false, "use full-body padding in flex mode (strict mode always uses it)")
 	// showVersion requests version output and exit.
@@ -214,22 +214,26 @@ func loadServers() ([]roughtime.Server, error) {
 				if s.Name != *nameFilter {
 					continue
 				}
-				if *useTCP {
-					if isGoogleServerVersion(s.Version) {
-						return nil, fmt.Errorf("server %q is Google-Roughtime (UDP-only), incompatible with -tcp", roughtime.SanitizeForDisplay(*nameFilter))
-					}
-					s.Addresses = tcpAddresses(s.Addresses)
-					if len(s.Addresses) == 0 {
-						return nil, fmt.Errorf("server %q in %s has no tcp address", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
-					}
+				if *useTCP && isGoogleServerVersion(s.Version) {
+					return nil, fmt.Errorf("server %q is Google-Roughtime (UDP-only), incompatible with -tcp", roughtime.SanitizeForDisplay(*nameFilter))
 				}
 				s, err = roughtime.NormalizeServerWithMode(s, protocolMode())
 				if err != nil {
 					return nil, fmt.Errorf("server %q in %s is unusable: %w", roughtime.SanitizeForDisplay(*nameFilter), safeFile, err)
 				}
+				if *useTCP {
+					s.Addresses = tcpAddresses(s.Addresses)
+					if len(s.Addresses) == 0 {
+						return nil, fmt.Errorf("server %q in %s has no tcp address", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
+					}
+				}
 				return []roughtime.Server{s}, nil
 			}
 			return nil, fmt.Errorf("server %q not found in %s", roughtime.SanitizeForDisplay(*nameFilter), safeFile)
+		}
+		servers = normalizeServers(servers)
+		if len(servers) == 0 {
+			return nil, fmt.Errorf("no compatible servers in %s", safeFile)
 		}
 		if *useTCP {
 			servers = filterTCPOnly(servers)
@@ -237,14 +241,14 @@ func loadServers() ([]roughtime.Server, error) {
 				return nil, fmt.Errorf("no servers in %s have a tcp address", safeFile)
 			}
 		}
-		servers = normalizeServers(servers)
-		if len(servers) == 0 {
-			return nil, fmt.Errorf("no compatible servers in %s", safeFile)
-		}
-		if !*all {
-			servers = roughtime.SampleByOperator(servers, defaultSampleSize)
-		} else if !*flex {
+		if !*flex || *twoPass {
 			mrand.Shuffle(len(servers), func(i, j int) { servers[i], servers[j] = servers[j], servers[i] })
+			if !*all {
+				servers = independentWitnesses(servers, defaultSampleSize)
+				mrand.Shuffle(len(servers), func(i, j int) { servers[i], servers[j] = servers[j], servers[i] })
+			}
+		} else if !*all {
+			servers = roughtime.SampleByOperator(servers, defaultSampleSize)
 		}
 		return servers, nil
 	}
@@ -292,25 +296,62 @@ func normalizeServers(servers []roughtime.Server) []roughtime.Server {
 // twoPassServers validates and expands a strict two-pass measurement. The
 // second half repeats the exact normalized server order.
 func twoPassServers(servers []roughtime.Server) ([]roughtime.Server, error) {
-	groups := make(map[string]struct{}, len(servers))
-	roots := make(map[string]struct{}, len(servers))
-	for _, s := range servers {
-		groups[roughtime.OperatorKey(s)] = struct{}{}
-		roots[string(s.PublicKey)] = struct{}{}
-	}
-	if len(groups) < 3 {
-		return nil, fmt.Errorf("-two-pass requires at least 3 endpoint-domain groups (got %d)", len(groups))
-	}
-	if len(roots) < 3 {
-		return nil, fmt.Errorf("-two-pass requires at least 3 distinct trust roots (got %d)", len(roots))
-	}
 	if len(servers) > protocol.MaxChainLinks/2 {
 		return nil, fmt.Errorf("-two-pass requires %d chain links, exceeding max %d", 2*len(servers), protocol.MaxChainLinks)
+	}
+	if count := len(independentWitnesses(servers, 3)); count < 3 {
+		return nil, fmt.Errorf("-two-pass requires at least 3 witnesses with distinct trust roots and endpoint-domain groups (got %d)", count)
 	}
 	out := make([]roughtime.Server, 0, 2*len(servers))
 	out = append(out, servers...)
 	out = append(out, servers...)
 	return out, nil
+}
+
+// independentWitnesses picks up to limit servers with distinct roots and
+// endpoint-domain groups. A root with aliases can move to another group to make
+// room for a root that has fewer choices.
+func independentWitnesses(servers []roughtime.Server, limit int) []roughtime.Server {
+	type candidate struct {
+		server roughtime.Server
+		group  string
+	}
+	byRoot := make(map[string][]candidate)
+	var roots []string
+	for _, server := range servers {
+		root := string(server.PublicKey)
+		if len(byRoot[root]) == 0 {
+			roots = append(roots, root)
+		}
+		byRoot[root] = append(byRoot[root], candidate{server, roughtime.OperatorKey(server)})
+	}
+	matched := make(map[string]roughtime.Server, limit)
+	var match func(string, map[string]bool) bool
+	match = func(root string, seen map[string]bool) bool {
+		for _, witness := range byRoot[root] {
+			group := witness.group
+			if seen[group] {
+				continue
+			}
+			seen[group] = true
+			previous, ok := matched[group]
+			if !ok || match(string(previous.PublicKey), seen) {
+				matched[group] = witness.server
+				return true
+			}
+		}
+		return false
+	}
+	for _, root := range roots {
+		if match(root, make(map[string]bool, limit)) && len(matched) == limit {
+			break
+		}
+	}
+	selection := make([]roughtime.Server, 0, len(matched))
+	for _, server := range matched {
+		selection = append(selection, server)
+	}
+	return selection
 }
 
 // filterTCPOnly narrows each server's Addresses to TCP and drops servers with

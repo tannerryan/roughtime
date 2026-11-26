@@ -62,7 +62,7 @@ func TestDropOneTag(t *testing.T) {
 // TestGreaseTransforms checks each transformation without relying on Grease's
 // random mode selection. Unknown outer tags preserve authentication.
 func TestGreaseTransforms(t *testing.T) {
-	for _, ver := range []Version{VersionGoogle, VersionDraft08, VersionDraft12} {
+	for _, ver := range []Version{Version1, VersionGoogle, VersionDraft08, VersionDraft12} {
 		t.Run(ver.ShortString(), func(t *testing.T) {
 			versions := []Version{ver}
 			reply, rootPK, nonce, request := validReply(t, ver, versions)
@@ -93,12 +93,17 @@ func TestGreaseTransforms(t *testing.T) {
 				t.Fatal("corrupted signature verified")
 			}
 			out := greaseWrongVersion(bytes.Clone(reply), ver)
-			if ver != VersionDraft08 {
+			if ver == VersionGoogle {
 				if out != nil {
-					t.Fatal("changed a reply without a top-level VER")
+					t.Fatal("changed a reply without VER")
 				}
-			} else if _, _, err := VerifyReplyWithOptions(versions, out, rootPK, nonce, request, VerifyOptions{Mode: Flex}); err == nil {
-				t.Fatal("unsupported version verified")
+			} else {
+				if got, ok := ExtractVersion(out); !ok || got != 0xFFFFFFFF {
+					t.Fatalf("greased version = %s, present = %t", got, ok)
+				}
+				if _, _, err := VerifyReplyWithOptions(versions, out, rootPK, nonce, request, VerifyOptions{Mode: Flex}); err == nil {
+					t.Fatal("unsupported version verified")
+				}
 			}
 		})
 	}

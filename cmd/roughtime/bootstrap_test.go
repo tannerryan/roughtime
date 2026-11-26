@@ -175,6 +175,14 @@ func TestGenerateKeypairRefusesOverwrite(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "refusing to overwrite") {
 		t.Fatalf("generateKeypair want refusing-to-overwrite error, got %v", err)
 	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "placeholder" {
+		t.Fatalf("existing seed changed: %q, %v", contents, err)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("seed directory after rejected write: %v, %v", entries, err)
+	}
 }
 
 // TestGeneratePQKeypairSuccess covers ML-DSA-44 seed generation.

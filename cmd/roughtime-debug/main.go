@@ -359,8 +359,8 @@ func probe(ctx context.Context, rootPK []byte, plan probePlan, transport string,
 	}
 	legacySize := *flex && plan.version != protocol.Version1 && (plan.version != protocol.VersionDraft12 || plan.omitTYPE)
 	sizes := []bool{legacySize}
-	if transport == "udp" && legacySize && plan.version != protocol.VersionGoogle {
-		sizes = append(sizes, false)
+	if *flex && transport == "udp" && plan.version != protocol.VersionGoogle && plan.version != protocol.Version1 && plan.version != protocol.VersionMLDSA44 {
+		sizes = append(sizes, !legacySize)
 	}
 	for _, useLegacySize := range sizes {
 		options := protocol.RequestOptions{

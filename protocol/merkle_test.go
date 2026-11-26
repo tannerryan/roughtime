@@ -130,6 +130,18 @@ func TestMerkleDraft14AcceptsBothConventions(t *testing.T) {
 	}
 }
 
+// TestMerkleDraft07AcceptsPseudocodeOrder checks a hash-first proof.
+func TestMerkleDraft07AcceptsPseudocodeOrder(t *testing.T) {
+	leaf := bytes.Repeat([]byte{0x11}, 32)
+	left := sha512.Sum512_256(append([]byte{0}, leaf...))
+	right := sha512.Sum512_256(append([]byte{0}, bytes.Repeat([]byte{0x22}, 32)...))
+	root := sha512.Sum512_256(append(append([]byte{1}, left[:]...), right[:]...))
+	resp := map[uint32][]byte{TagINDX: make([]byte, 4), TagPATH: right[:]}
+	if err := verifyMerkle(resp, leaf, root[:], groupD07); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestVerifyMerkleRejectsTrailingINDXBits covers noncanonical indexes.
 func TestVerifyMerkleRejectsTrailingINDXBits(t *testing.T) {
 	// one PATH entry but INDX=4 leaves index>>1 = 2 (non-zero)

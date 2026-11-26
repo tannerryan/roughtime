@@ -103,9 +103,10 @@ func newMerkleTreeWithOrder(g wireGroup, leafInputs [][]byte, nodeFirst bool) *m
 	}
 
 	// pad to next power of two by repeating the last hash
-	size := 1
+	size, depth := 1, 0
 	for size < n {
 		size *= 2
+		depth++
 	}
 	level := make([][]byte, size)
 	copy(level, hashes)
@@ -113,17 +114,17 @@ func newMerkleTreeWithOrder(g wireGroup, leafInputs [][]byte, nodeFirst bool) *m
 		level[i] = hashes[n-1]
 	}
 
-	indices := make([]int, n)
 	paths := make([][][]byte, n)
-	for i := range indices {
-		indices[i] = i
+	pathNodes := make([][]byte, n*depth)
+	for i := range paths {
+		start := i * depth
+		paths[i] = pathNodes[start : start+depth : start+depth]
 	}
 
-	for len(level) > 1 {
+	for step := range depth {
 		for i := range n {
-			sib := indices[i] ^ 1
-			paths[i] = append(paths[i], level[sib])
-			indices[i] /= 2
+			sibling := (i >> step) ^ 1
+			paths[i][step] = level[sibling]
 		}
 		next := make([][]byte, len(level)/2)
 		for j := 0; j < len(level); j += 2 {
@@ -161,9 +162,9 @@ func verifyMerkle(resp map[uint32][]byte, leafInput, rootHash []byte, g wireGrou
 	}
 
 	err := verifyMerkleOrder(index, pathBytes, leafInput, rootHash, g, merkleNodeFirst(g))
-	if errors.Is(err, ErrMerkleMismatch) && g == groupD14 {
-		// Drafts 14-15 and 16-19 use opposite orders under the same wire
-		// identifiers, so a verifier must try the other convention.
+	if errors.Is(err, ErrMerkleMismatch) && (g == groupD07 || g == groupD14) {
+		// Draft 07 disagrees with its own pseudocode. Typed drafts 14-19 also
+		// use opposite orders under one wire identifier.
 		return verifyMerkleOrder(index, pathBytes, leafInput, rootHash, g, !merkleNodeFirst(g))
 	}
 	return err

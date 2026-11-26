@@ -124,11 +124,13 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 	// The extra byte makes oversize detection independent of MSG_TRUNC while
 	// still retaining the flag check for datagrams larger than this buffer.
 	msgs := makeMessages(maxSize, maxPacketSize+1)
+	batchBuf := make([]validatedRequest, 0, maxSize)
 
 	for ctx.Err() == nil {
-		batch, hardErr := collectBatch(log, conn, p, msgs, maxSize, maxLatency, state, allowDrafts)
+		batch, hardErr := collectBatch(log, conn, p, msgs, batchBuf[:0], maxLatency, state, allowDrafts)
 		if len(batch) > 0 {
 			respond(ctx, log, conn, p, state, batch)
+			clear(batch)
 		}
 		// throttle the loop on persistent non-deadline read errors so a wedged
 		// socket can't burn a core, ctx.Done preempts the sleep
@@ -142,9 +144,10 @@ func worker(ctx context.Context, log *zap.Logger, state *atomic.Pointer[certStat
 	}
 }
 
-// collectBatch reads up to maxSize datagrams. hardErr signals a non-deadline
-// error on the first read.
-func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs []ipv6.Message, maxSize int, maxLatency time.Duration, state *atomic.Pointer[certState], allowDrafts bool) (batch []validatedRequest, hardErr bool) {
+// collectBatch fills batch up to its capacity. A true second result means the
+// first read failed for a reason other than its deadline.
+func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs []ipv6.Message, batch []validatedRequest, maxLatency time.Duration, state *atomic.Pointer[certState], allowDrafts bool) ([]validatedRequest, bool) {
+	maxSize := cap(batch)
 	_ = conn.SetReadDeadline(time.Now().Add(idleReadTimeout))
 	n, err := p.ReadBatch(msgs, 0)
 	if err != nil {
@@ -155,7 +158,6 @@ func collectBatch(log *zap.Logger, conn net.PacketConn, p *ipv6.PacketConn, msgs
 		return nil, false
 	}
 
-	batch = make([]validatedRequest, 0, maxSize)
 	harvest(log, msgs[:n], state.Load(), &batch, allowDrafts)
 	if len(batch) >= maxSize {
 		return batch, false

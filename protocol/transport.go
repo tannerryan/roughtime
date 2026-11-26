@@ -4,17 +4,21 @@
 package protocol
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
 // MaxUDPReply is the maximum UDP datagram size accepted as a reply.
 const MaxUDPReply = 65535
+
+var udpReplyBuffers = sync.Pool{New: func() any { return new([MaxUDPReply]byte) }}
 
 // MaxTCPReplyBody caps the declared body length of a TCP reply.
 const MaxTCPReplyBody = 16 * 1024
@@ -104,15 +108,17 @@ func RoundTripUDP(ctx context.Context, address string, request []byte, timeout t
 		return nil, 0, time.Time{}, fmt.Errorf("sending: %w", err)
 	}
 
-	buf := make([]byte, MaxUDPReply)
-	n, err = conn.Read(buf)
+	buf := udpReplyBuffers.Get().(*[MaxUDPReply]byte)
+	defer udpReplyBuffers.Put(buf)
+	n, err = conn.Read(buf[:])
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, 0, time.Time{}, ctxErr
 		}
 		return nil, 0, time.Time{}, fmt.Errorf("reading: %w", err)
 	}
-	return buf[:n], time.Since(start), time.Now(), nil
+	received := time.Now()
+	return bytes.Clone(buf[:n]), received.Sub(start), received, nil
 }
 
 // RoundTripTCP sends one ROUGHTIM-framed request over TCP and returns the
@@ -176,5 +182,6 @@ func RoundTripTCP(ctx context.Context, address string, request []byte, timeout t
 		}
 		return nil, 0, time.Time{}, fmt.Errorf("reading body: %w", err)
 	}
-	return out, time.Since(start), time.Now(), nil
+	received := time.Now()
+	return out, received.Sub(start), received, nil
 }

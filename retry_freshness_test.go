@@ -6,6 +6,7 @@ package roughtime_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -39,13 +40,14 @@ func TestRetryResponseFreshness(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = listener.Close() }()
-			expected := 3
+			fixedNonce := kind == "caller nonce" || kind == "seeded first"
+			const proxyAttempts = 3
 			requests := make(chan [][]byte, 1)
 			go func() {
 				var seen [][]byte
 				defer func() { requests <- seen }()
 				var original []byte
-				for i := range expected {
+				for i := range proxyAttempts {
 					conn, err := listener.Accept()
 					if err != nil {
 						return
@@ -123,10 +125,13 @@ func TestRetryResponseFreshness(t *testing.T) {
 			default:
 				response, err = client.Query(ctx, server)
 			}
-			if kind == "caller nonce" || kind == "seeded first" {
-				if err == nil || response != nil {
-					t.Fatal("fixed nonce accepted a response after its delay limit")
+			wantRequests := proxyAttempts
+			if fixedNonce {
+				if !errors.Is(err, context.DeadlineExceeded) || response != nil {
+					t.Fatalf("fixed-nonce query returned response %v and error %v, want deadline exceeded", response, err)
 				}
+				wantRequests = 1
+				_ = listener.Close()
 			} else if err != nil {
 				t.Fatal(err)
 			}
@@ -136,14 +141,13 @@ func TestRetryResponseFreshness(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("proxy did not finish")
 			}
-			if len(seen) != expected {
-				t.Fatalf("got %d requests, want %d", len(seen), expected)
+			if len(seen) != wantRequests {
+				t.Fatalf("got %d requests, want %d", len(seen), wantRequests)
 			}
-			wantSame := kind == "caller nonce" || kind == "seeded first"
-			if bytes.Equal(seen[0], seen[1]) != wantSame {
-				t.Fatal("retry did not follow nonce policy")
+			if !fixedNonce && bytes.Equal(seen[0], seen[1]) {
+				t.Fatal("retry reused the first request")
 			}
-			if response != nil && !bytes.Equal(response.Request, seen[expected-1]) {
+			if response != nil && !bytes.Equal(response.Request, seen[wantRequests-1]) {
 				t.Fatal("response archived a different request")
 			}
 			if draftProfile && response != nil && response.Version != protocol.VersionDraft12 {

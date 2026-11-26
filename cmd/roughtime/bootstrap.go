@@ -152,24 +152,20 @@ func writeSeedFile(path, header string, seed []byte) error {
 	defer clear(encoded)
 
 	path = filepath.Clean(path)
-	dir, err := os.Open(filepath.Dir(path))
+	dirPath := filepath.Dir(path)
+	dir, err := os.Open(dirPath)
 	if err != nil {
 		return fmt.Errorf("opening seed directory: %w", err)
 	}
 	defer func() { _ = dir.Close() }()
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	f, err := os.CreateTemp(dirPath, ".roughtime-seed-*")
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("%s already exists (refusing to overwrite)", path)
-		}
 		return fmt.Errorf("creating seed file %s: %w", path, err)
 	}
-	failed := true
+	tmp := f.Name()
 	defer func() {
 		_ = f.Close()
-		if failed {
-			_ = os.Remove(path)
-		}
+		_ = os.Remove(tmp)
 	}()
 	if _, err := f.Write(encoded); err != nil {
 		return fmt.Errorf("writing seed file %s: %w", path, err)
@@ -180,9 +176,17 @@ func writeSeedFile(path, header string, seed []byte) error {
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("closing seed file %s: %w", path, err)
 	}
-	failed = false
+	if err := os.Link(tmp, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%s already exists (refusing to overwrite)", path)
+		}
+		return fmt.Errorf("publishing seed file %s: %w", path, err)
+	}
+	if err := os.Remove(tmp); err != nil {
+		return fmt.Errorf("seed file %s was created, but removing its temporary name failed: %w", path, err)
+	}
 	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("seed file %s was created, but directory sync failed; crash durability is unknown: %w", path, err)
+		return fmt.Errorf("seed file %s was created, but directory sync failed. Crash durability is unknown: %w", path, err)
 	}
 	return nil
 }
