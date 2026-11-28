@@ -110,6 +110,18 @@
       "addresses": [
         { "protocol": "udp", "address": "roughtime.alastyr.com:2002" }
       ]
+    },
+    {
+      "name": "roughtime.gnpk.zip",
+      "version": 1,
+      "publicKeyType": "ed25519",
+      "publicKey": "nfvS0Ds8q3bSIgwDmnNn+xPUj68K5W4upHuJIJ/QrSM=",
+      "addresses": [
+        { "protocol": "udp", "address": "roughtime.gnpk.zip:5319" },
+        { "protocol": "tcp", "address": "roughtime.gnpk.zip:5319" },
+        { "protocol": "udp", "address": "roughtime.gnpk.zip:2002" },
+        { "protocol": "tcp", "address": "roughtime.gnpk.zip:2002" }
+      ]
     }
   ]
 }
